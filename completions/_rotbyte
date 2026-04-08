@@ -1,0 +1,21 @@
+#compdef rotbyte
+
+_rotbyte() {
+    _arguments \
+        '--check[Force re-hash of every file]' \
+        '--report[Print status report and exit]' \
+        '--accept[Accept a file as correct]:file:_files' \
+        '--accept-all[Accept all current state as baseline]' \
+        '--import[Import .b2sum/.b2 hash files]' \
+        '--workers[Parallel hashing workers]:count:(1 2 4 8 16)' \
+        '(-q --quiet)'{-q,--quiet}'[Only output problems]' \
+        '--skip-missing[Do not check for removed files]' \
+        '--include-hidden[Include hidden files and directories]' \
+        '*--exclude[Exclude directories]:directory:_directories' \
+        '--db[Custom database path]:file:_files' \
+        '--version[Show version]' \
+        '--help[Show help]' \
+        '1:directory:_directories'
+}
+
+_rotbyte "$@"

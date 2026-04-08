@@ -1018,8 +1018,13 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     interrupted: List[bool] = [False]
 
     def handle_signal(signum, frame):
+        if interrupted[0]:
+            # Second interrupt — abort immediately
+            print("\n  Aborting immediately.\n", file=sys.stderr)
+            sys.exit(3)
         interrupted[0] = True
-        print("\n\n  Interrupt received — finishing current batch and saving progress...\n")
+        print("\n\n  Interrupt received — finishing current batch and saving progress...")
+        print("  Press Ctrl-C again to abort immediately.\n")
 
     prev_sigint = signal.getsignal(signal.SIGINT)
     prev_sigterm = signal.getsignal(signal.SIGTERM)

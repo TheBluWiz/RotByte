@@ -1,0 +1,146 @@
+.TH ROTBYTE 1 "2026-04-08" "rotbyte 1.0.0" "User Commands"
+.SH NAME
+rotbyte \- detect bit rot by tracking BLAKE2b checksums
+.SH SYNOPSIS
+.B rotbyte
+.RI [ OPTIONS ]
+.RI [ PATH ]
+.SH DESCRIPTION
+.B rotbyte
+computes BLAKE2b-512 checksums for every file in a directory tree and
+stores them in a local SQLite database. On subsequent runs it detects
+silent data corruption (bit rot) by comparing stored checksums against
+freshly computed ones.
+.PP
+By default, only files whose size or modification time have changed are
+re-hashed. Use
+.B \-\-check
+to force a full re-verify of every file, which is the only way to catch
+true bit rot (corruption without metadata change).
+.PP
+The database is created automatically as
+.BI . dirname _checksums.db
+inside the target directory on first run.
+.SH OPTIONS
+.TP
+.B \-\-check
+Force re-hash of every file regardless of modification time.
+.TP
+.B \-\-report
+Print an integrity status summary and exit.
+.TP
+.BI \-\-accept " FILE"
+Accept a single file's current state as correct. If the file is MISSING,
+its record is removed. If FAILED, it is re-hashed and the new checksum
+becomes the known-good baseline.
+.TP
+.B \-\-accept\-all
+Accept all current state as the new baseline. Clears all MISSING records
+and re-hashes all FAILED files.
+.TP
+.B \-\-import
+Import existing
+.I .b2sum
+and
+.I .b2
+hash files into the database. Verifies each hash matches the file on disk
+before importing, then deletes the hash file.
+.TP
+.BI \-\-workers " N"
+Number of parallel hashing workers. Defaults to the CPU count.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress normal output; only print problems. Suitable for cron jobs.
+.TP
+.B \-\-skip\-missing
+Do not check for files that have been removed from disk.
+.TP
+.B \-\-include\-hidden
+Include hidden files and directories (names starting with \fB.\fR),
+which are excluded by default.
+.TP
+.BI \-\-exclude " PATH" \fR...
+Exclude one or more directories. Paths may be relative to the target
+directory or absolute.
+.TP
+.BI \-\-db " PATH"
+Use a custom database path instead of the default location inside the
+target directory.
+.TP
+.B \-\-version
+Print the version number and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+All files verified OK.
+.TP
+.B 1
+Missing files detected.
+.TP
+.B 2
+Bit rot detected (checksum mismatch).
+.TP
+.B 3
+Run was interrupted (safe to re-run).
+.SH FILE STATUSES
+.TP
+.B OK
+Checksum verified; file is intact.
+.TP
+.B NEW
+File seen for the first time.
+.TP
+.B FAILED
+Bit rot detected \(em hash changed without any metadata change.
+.TP
+.B MISSING
+File was previously tracked but no longer exists on disk.
+.SH EXAMPLES
+Index all files in the current directory:
+.PP
+.RS
+.B rotbyte
+.RE
+.PP
+Full re-verify of an external drive:
+.PP
+.RS
+.B rotbyte \-\-check /Volumes/Media
+.RE
+.PP
+Weekly cron job (quiet mode, log errors):
+.PP
+.RS
+.B 0 2 * * 0 rotbyte \-\-check \-q /data >> /var/log/rotbyte.log 2>&1
+.RE
+.PP
+Accept a restored file:
+.PP
+.RS
+.B rotbyte \-\-accept restored_file.mkv
+.RE
+.SH FILES
+.TP
+.BI . dirname _checksums.db
+SQLite database storing checksums and metadata, created inside the
+target directory.
+.TP
+.BI . dirname _checksums.db.lock
+Lock file preventing concurrent runs.
+.SH NOTES
+.B rotbyte
+uses BLAKE2b-512 for hashing, which is faster than SHA-256 while
+providing equivalent collision resistance. Hashing is parallelized
+across multiple processes for maximum throughput on multi-core systems.
+.PP
+Symlinks are not followed to prevent infinite loops.
+.SH REQUIREMENTS
+Python 3.9 or later. macOS or Linux (uses
+.BR fcntl (2)
+for file locking).
+.SH AUTHORS
+Written for use with Homebrew.
+.SH SEE ALSO
+.BR b2sum (1),
+.BR sha256sum (1),
+.BR sqlite3 (1)
