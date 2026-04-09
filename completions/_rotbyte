@@ -13,6 +13,8 @@ _rotbyte() {
         '--include-hidden[Include hidden files and directories]' \
         '*--exclude[Exclude directories]:directory:_directories' \
         '--db[Custom database path]:file:_files' \
+        '--export[Export checksums manifest]:file:_files' \
+        '--json[Output results as JSON]' \
         '--version[Show version]' \
         '--help[Show help]' \
         '1:directory:_directories'

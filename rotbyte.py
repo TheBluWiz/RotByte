@@ -32,6 +32,7 @@ Requires Python 3.9+ and a POSIX system (macOS or Linux).
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import signal
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS checksums (
     file_size       INTEGER NOT NULL,
     file_mtime      TEXT    NOT NULL,
     checksum        TEXT    NOT NULL,
+    baseline_checksum TEXT,
     algorithm       TEXT    NOT NULL DEFAULT 'BLAKE2b',
     status          TEXT    NOT NULL DEFAULT 'NEW',
     first_seen      TEXT    NOT NULL,
@@ -76,7 +78,14 @@ CREATE TABLE IF NOT EXISTS last_run (
     target_dir  TEXT    NOT NULL,
     status      TEXT    NOT NULL DEFAULT 'RUNNING'
 );
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL DEFAULT 1
+);
 """
+
+SCHEMA_VERSION = 2
 
 VERSION = "1.0.0"
 DB_FILENAME_SUFFIX = "_checksums.db"
@@ -86,25 +95,32 @@ BATCH_SIZE = 200                # DB writes per transaction before committing
 
 # ── Hashing (runs in worker processes) ─────────────────────────────────────────
 
-def hash_file(file_path: str) -> Tuple[str, Optional[str]]:
+def hash_file(file_path: str) -> Tuple[str, Optional[str], Optional[int], Optional[str]]:
     """Compute BLAKE2b-512 hash of a file.
 
-    Returns (path, hex_digest) on success or (path, None) on read error.
+    Returns (path, hex_digest, size, mtime_iso) on success or
+    (path, None, None, None) on read error.
+
+    Metadata is captured via fstat() on the open file descriptor so that
+    the recorded size and mtime correspond to the exact bytes that were
+    hashed — no TOCTOU gap between stat() and read().
+
     This function runs in a worker process via ProcessPoolExecutor and
     must not access the database or any shared mutable state.
     """
     try:
         h = hashlib.blake2b()
         with open(file_path, "rb") as f:
+            st = os.fstat(f.fileno())
             while True:
                 chunk = f.read(HASH_BUFFER_SIZE)
                 if not chunk:
                     break
                 h.update(chunk)
-        return file_path, h.hexdigest()
+        return file_path, h.hexdigest(), st.st_size, _mtime_iso(st)
     except OSError as e:
         print(f"\n  ! Error reading {file_path}: {e}", file=sys.stderr)
-        return file_path, None
+        return file_path, None, None, None
 
 
 # ── Database ───────────────────────────────────────────────────────────────────
@@ -127,6 +143,57 @@ class ChecksumDB:
         self.conn.execute("PRAGMA busy_timeout=5000")    # wait up to 5s on lock
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
+        self._migrate()
+
+    def _migrate(self):
+        """Run any pending schema migrations.
+
+        Existing databases without a schema_version table are treated as
+        version 1. Migrations are applied sequentially up to SCHEMA_VERSION.
+        """
+        row = self.conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+
+        if row is None:
+            # New database or pre-versioning database. Check whether the
+            # checksums table has data to distinguish the two cases.
+            has_data = self.conn.execute(
+                "SELECT 1 FROM checksums LIMIT 1"
+            ).fetchone()
+            current = 1 if has_data else SCHEMA_VERSION
+            self.conn.execute(
+                "INSERT INTO schema_version (id, version) VALUES (1, ?)",
+                (current,),
+            )
+            if not has_data:
+                return  # Fresh database, schema is already current
+        else:
+            current = row["version"]
+
+        if current >= SCHEMA_VERSION:
+            return
+
+        # ── Migration 1 → 2: add baseline_checksum column ────────────
+        if current < 2:
+            # Check if column already exists (defensive)
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(checksums)")}
+            if "baseline_checksum" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE checksums ADD COLUMN baseline_checksum TEXT"
+                )
+            # For FAILED rows, the current checksum column holds the
+            # known-good hash (old behavior). Move it to baseline_checksum.
+            # For all other rows, baseline = checksum (they're the same).
+            self.conn.execute(
+                "UPDATE checksums SET baseline_checksum = checksum"
+            )
+            current = 2
+
+        self.conn.execute(
+            "UPDATE schema_version SET version = ? WHERE id = 1",
+            (current,),
+        )
 
     def verify_integrity(self) -> bool:
         """Quick integrity check on the database file itself."""
@@ -138,7 +205,13 @@ class ChecksumDB:
 
     @staticmethod
     def _escape_like(prefix: str) -> str:
-        """Escape SQL LIKE wildcards (%, _, \\) in a path prefix."""
+        """Escape SQL LIKE wildcards (%, _, \\) in a directory prefix.
+
+        Ensures the prefix ends with os.sep so that '/Volumes/Media'
+        does not match '/Volumes/Media2'.
+        """
+        if not prefix.endswith(os.sep):
+            prefix += os.sep
         return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     # ── Run tracking (single row, updated in place) ───────────────────────
@@ -173,17 +246,18 @@ class ChecksumDB:
     def load_all_records(self, prefix: str) -> Dict[str, Tuple[str, int, str, str]]:
         """Load all tracked records under a directory prefix.
 
-        Returns {file_path: (checksum, file_size, file_mtime, status)}.
-        Includes MISSING records so re-added files are verified against
-        their last known-good checksum. Escapes SQL LIKE wildcards.
+        Returns {file_path: (baseline_checksum, file_size, file_mtime, status)}.
+        Uses baseline_checksum for comparisons since it holds the known-good
+        hash. Includes MISSING records so re-added files are verified against
+        their baseline. Escapes SQL LIKE wildcards.
         """
         escaped = self._escape_like(prefix)
         rows = self.conn.execute(
-            "SELECT file_path, checksum, file_size, file_mtime, status FROM checksums "
+            "SELECT file_path, baseline_checksum, file_size, file_mtime, status FROM checksums "
             "WHERE file_path LIKE ? ESCAPE '\\'",
             (escaped + "%",),
         ).fetchall()
-        return {r["file_path"]: (r["checksum"], r["file_size"], r["file_mtime"], r["status"]) for r in rows}
+        return {r["file_path"]: (r["baseline_checksum"], r["file_size"], r["file_mtime"], r["status"]) for r in rows}
 
     def get_missing_paths(self, prefix: str) -> Set[str]:
         """Return all file paths currently marked MISSING under a prefix."""
@@ -218,22 +292,38 @@ class ChecksumDB:
 
         If old_checksum is provided, the file is already tracked — update it.
         Otherwise insert a new record.
+
+        On FAILED, checksum stores the bad hash and baseline_checksum is
+        left unchanged (preserving the known-good hash for restore
+        verification). On all other statuses, both columns are updated
+        to the current hash.
         """
         if old_checksum is not None:
-            self.conn.execute(
-                """UPDATE checksums
-                   SET checksum = ?, file_size = ?, file_mtime = ?,
-                       status = ?, last_verified = ?
-                 WHERE file_path = ?""",
-                (checksum, file_size, file_mtime, status, now, file_path),
-            )
+            if status == "FAILED":
+                self.conn.execute(
+                    """UPDATE checksums
+                       SET checksum = ?, file_size = ?, file_mtime = ?,
+                           status = ?, last_verified = ?
+                     WHERE file_path = ?""",
+                    (checksum, file_size, file_mtime, status, now, file_path),
+                )
+            else:
+                self.conn.execute(
+                    """UPDATE checksums
+                       SET checksum = ?, baseline_checksum = ?,
+                           file_size = ?, file_mtime = ?,
+                           status = ?, last_verified = ?
+                     WHERE file_path = ?""",
+                    (checksum, checksum, file_size, file_mtime, status, now, file_path),
+                )
         else:
             self.conn.execute(
                 """INSERT INTO checksums
                    (file_path, file_name, file_size, file_mtime, checksum,
-                    algorithm, status, first_seen, last_verified)
-                   VALUES (?, ?, ?, ?, ?, 'BLAKE2b', ?, ?, ?)""",
-                (file_path, file_name, file_size, file_mtime, checksum, status, now, now),
+                    baseline_checksum, algorithm, status, first_seen, last_verified)
+                   VALUES (?, ?, ?, ?, ?, ?, 'BLAKE2b', ?, ?, ?)""",
+                (file_path, file_name, file_size, file_mtime, checksum,
+                 checksum, status, now, now),
             )
 
     def mark_missing(self, file_path: str, now: str):
@@ -258,10 +348,11 @@ class ChecksumDB:
         """Accept a file's current content as the new known-good baseline."""
         self.conn.execute(
             """UPDATE checksums
-               SET checksum = ?, file_size = ?, file_mtime = ?,
+               SET checksum = ?, baseline_checksum = ?,
+                   file_size = ?, file_mtime = ?,
                    status = 'OK', last_verified = ?
              WHERE file_path = ?""",
-            (checksum, file_size, file_mtime, now, file_path),
+            (checksum, checksum, file_size, file_mtime, now, file_path),
         )
 
     def get_failed_paths(self, prefix: str) -> List[str]:
@@ -298,7 +389,7 @@ class ChecksumDB:
     def failed_files(self) -> List[Dict]:
         """Return details for all FAILED files."""
         rows = self.conn.execute(
-            "SELECT file_path, file_size, checksum, last_verified "
+            "SELECT file_path, file_size, checksum, baseline_checksum, last_verified "
             "FROM checksums WHERE status = 'FAILED'"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -325,11 +416,20 @@ class ChecksumDB:
             "AND EXISTS ("
             "  SELECT 1 FROM checksums c2 "
             "  WHERE c2.file_path LIKE ? ESCAPE '\\' AND c2.status = 'MISSING' "
-            "  AND c2.checksum = c1.checksum"
+            "  AND c2.baseline_checksum = c1.baseline_checksum"
             ")",
             (escaped + "%", escaped + "%"),
         ).fetchone()
         return row["count"] if row else 0
+
+    def all_records(self) -> List[Dict]:
+        """Return all tracked records for manifest export."""
+        rows = self.conn.execute(
+            "SELECT file_path, baseline_checksum, checksum, file_size, "
+            "file_mtime, status, first_seen, last_verified "
+            "FROM checksums ORDER BY file_path"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ── File lock ──────────────────────────────────────────────────────────────────
@@ -374,10 +474,18 @@ def _now() -> str:
 
 
 def _mtime_iso(stat_result: os.stat_result) -> str:
-    """Convert a stat result's mtime to ISO 8601 UTC string."""
-    return datetime.fromtimestamp(
-        stat_result.st_mtime, tz=timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Convert a stat result's mtime to ISO 8601 UTC string.
+
+    Uses st_mtime_ns for nanosecond precision when the sub-second part
+    is non-zero. Files with exact-second timestamps keep the old format
+    so upgrading doesn't trigger unnecessary re-hashing of every file.
+    """
+    ns = stat_result.st_mtime_ns
+    secs, frac_ns = divmod(ns, 1_000_000_000)
+    dt = datetime.fromtimestamp(secs, tz=timezone.utc)
+    if frac_ns:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac_ns:09d}Z"
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _format_size(size_bytes: float) -> str:
@@ -615,11 +723,11 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
 # ── Pre-scan: decide what needs hashing ────────────────────────────────────────
 
 class FileEntry:
-    """Snapshot of a file's metadata at scan time.
+    """Snapshot of a file's metadata at prescan time.
 
-    Capturing size and mtime here (rather than after hashing) ensures the
-    metadata stored in the database matches the exact bytes that were
-    hashed — no TOCTOU gap.
+    Used to decide whether a file needs re-hashing (based on size/mtime
+    changes). The actual metadata stored in the database comes from
+    fstat() during hashing to avoid TOCTOU gaps.
 
     The 'modified' flag records whether size or mtime changed since the
     last check. This is how rotbyte distinguishes intentional edits
@@ -738,7 +846,7 @@ def run_hashing(
                     # Catch worker crashes (OOM, segfault) so one bad file
                     # doesn't abort the entire run.
                     try:
-                        fpath, digest = future.result()
+                        fpath, digest, hash_size, hash_mtime = future.result()
                     except (BrokenExecutor, Exception) as e:
                         fpath = futures[future]
                         print(f"\n  ! Worker error for {fpath}: {e}", file=sys.stderr)
@@ -775,17 +883,14 @@ def run_hashing(
                         result.failed += 1
                         print(f"\n  ✗ FAILED: {fpath}")
 
-                    result.bytes_hashed += entry.size
+                    result.bytes_hashed += hash_size
 
-                    # On failure, keep the original known-good checksum so
-                    # a backup restore can be verified against it later.
-                    stored_checksum = entry.old_checksum if status == "FAILED" else digest
                     db.upsert_file(
-                        fpath, entry.name, entry.size, entry.mtime,
-                        stored_checksum, entry.old_checksum, status, now,
+                        fpath, entry.name, hash_size, hash_mtime,
+                        digest, entry.old_checksum, status, now,
                     )
 
-                    bar.update(entry.size)
+                    bar.update(hash_size)
 
                 db.commit()
             except BaseException:
@@ -863,6 +968,8 @@ def print_report(db: ChecksumDB):
         for f in failed:
             print(f"    {f['file_path']}")
             print(f"      Size: {_format_size(f['file_size'])}  |  Last verified: {f['last_verified']}")
+            print(f"      Expected: {f['baseline_checksum'][:32]}...")
+            print(f"      Got:      {f['checksum'][:32]}...")
         print()
 
     stale = db.stale_files(90)
@@ -930,6 +1037,10 @@ Exit codes:
     parser.add_argument("--exclude", nargs="+", default=[], metavar="PATH",
                         help="Exclude one or more directories (relative to target dir or absolute)")
     parser.add_argument("--db", help="Database path (default: .{dirname}_checksums.db inside target dir)")
+    parser.add_argument("--export", metavar="FILE",
+                        help="Export a plain-text manifest of all tracked file checksums")
+    parser.add_argument("--json", dest="json_output", action="store_true",
+                        help="Output results as JSON (for scripts and monitoring)")
 
     args = parser.parse_args()
 
@@ -995,6 +1106,11 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         db.close()
         return
 
+    if args.export:
+        _run_export(db, args.export)
+        db.close()
+        return
+
     if args.accept_all:
         _run_accept_all(db, target_dir)
         db.close()
@@ -1037,6 +1153,34 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         signal.signal(signal.SIGINT, prev_sigint)
         signal.signal(signal.SIGTERM, prev_sigterm)
         db.close()
+
+
+# ── Export mode ─────────────────────────────────────────────────────────────────
+
+def _run_export(db: ChecksumDB, export_path: str):
+    """Export a plain-text manifest of all tracked file checksums.
+
+    Format is b2sum-compatible: one line per file with
+    "<baseline_checksum>  <file_path>". This provides an independent
+    copy of the trust anchor outside the SQLite database.
+    """
+    records = db.all_records()
+    if not records:
+        print("  Database is empty — nothing to export.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(export_path, "w") as f:
+            for r in records:
+                if r["status"] == "MISSING":
+                    continue
+                f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
+    except OSError as e:
+        print(f"Error: Could not write to {export_path} — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    exported = sum(1 for r in records if r["status"] != "MISSING")
+    print(f"  ✓ Exported {exported:,} checksums to {export_path}")
 
 
 # ── Import mode ────────────────────────────────────────────────────────────────
@@ -1133,7 +1277,7 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
             continue
 
         # Hash the actual file and compare
-        _, our_hash = hash_file(media_path)
+        _, our_hash, h_size, h_mtime = hash_file(media_path)
         if our_hash is None:
             errors += 1
             continue
@@ -1147,14 +1291,13 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
 
         # Hashes match — import into the database
         media_real = os.path.realpath(media_path)
-        st = os.stat(media_path)
 
         if existing_status in ("MISSING", "FAILED"):
-            db.accept_file(media_real, our_hash, st.st_size, _mtime_iso(st), now)
+            db.accept_file(media_real, our_hash, h_size, h_mtime, now)
         else:
             db.upsert_file(
-                media_real, os.path.basename(media_real), st.st_size,
-                _mtime_iso(st), our_hash, None, "OK", now,
+                media_real, os.path.basename(media_real), h_size,
+                h_mtime, our_hash, None, "OK", now,
             )
 
         # Delete the hash file now that the checksum is in the database
@@ -1205,13 +1348,12 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
             print(f"  File not found on disk: {file_path}", file=sys.stderr)
             sys.exit(1)
 
-        st = os.stat(file_path)
-        _, digest = hash_file(file_path)
+        _, digest, h_size, h_mtime = hash_file(file_path)
         if digest is None:
             print("  Error reading file.", file=sys.stderr)
             sys.exit(1)
 
-        db.accept_file(file_path, digest, st.st_size, _mtime_iso(st), now)
+        db.accept_file(file_path, digest, h_size, h_mtime, now)
         print(f"  ✓ Accepted: {file_path}")
 
     else:
@@ -1242,19 +1384,13 @@ def _run_accept_all(db: ChecksumDB, target_dir: str):
         db.begin()
         try:
             for fpath in failed_paths:
-                try:
-                    st = os.stat(fpath)
-                except OSError:
+                _, digest, h_size, h_mtime = hash_file(fpath)
+                if digest is None:
                     print(f"  ! Cannot read {fpath} — skipping.")
                     errors += 1
                     continue
 
-                _, digest = hash_file(fpath)
-                if digest is None:
-                    errors += 1
-                    continue
-
-                db.accept_file(fpath, digest, st.st_size, _mtime_iso(st), now)
+                db.accept_file(fpath, digest, h_size, h_mtime, now)
                 accepted += 1
                 print(f"  ✓ Accepted: {fpath}")
             db.commit()
@@ -1280,7 +1416,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                 interrupted: List[bool]):
     """Execute the three verification phases: scan, hash, detect missing."""
 
-    quiet = args.quiet
+    quiet = args.quiet or args.json_output
 
     if not quiet:
         print("═" * 60)
@@ -1327,7 +1463,30 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     elapsed = time.monotonic() - start_time
     has_problems = result.failed > 0 or count_missing > 0 or interrupted[0]
 
-    if not quiet or has_problems:
+    if args.json_output:
+        likely_moves = 0
+        if result.new > 0 and count_missing > 0:
+            likely_moves = db.detect_likely_moves(target_dir)
+        summary = {
+            "status": "interrupted" if interrupted[0] else "complete",
+            "directory": target_dir,
+            "duration_seconds": round(elapsed, 2),
+            "bytes_hashed": result.bytes_hashed,
+            "new": result.new,
+            "updated": result.updated,
+            "verified_ok": result.ok,
+            "failed": result.failed,
+            "missing": count_missing,
+            "skipped": skip_count,
+            "errors": result.errors,
+            "likely_moves": likely_moves,
+        }
+        if result.failed > 0:
+            summary["failed_files"] = [
+                f["file_path"] for f in db.failed_files()
+            ]
+        print(json.dumps(summary, indent=2))
+    elif not quiet or has_problems:
         if not quiet:
             print()
         print("═" * 60)
@@ -1350,17 +1509,17 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
             print(f"  Errors       : {result.errors:,}  (could not read/hash)")
         print("═" * 60)
 
-    # Hint about likely renames when new files match missing checksums
-    if result.new > 0 and count_missing > 0:
-        likely_moves = db.detect_likely_moves(target_dir)
-        if likely_moves > 0:
-            print()
-            s = "s" if likely_moves != 1 else ""
-            verb = "match" if likely_moves != 1 else "matches"
-            print(f"  Note: {likely_moves:,} new file{s} {verb}"
-                  f" the checksum of missing files.")
-            print("  This usually means files were renamed or moved.")
-            print("  Run --accept-all to clear, or --report for details.")
+        # Hint about likely renames when new files match missing checksums
+        if result.new > 0 and count_missing > 0:
+            likely_moves = db.detect_likely_moves(target_dir)
+            if likely_moves > 0:
+                print()
+                s = "s" if likely_moves != 1 else ""
+                verb = "match" if likely_moves != 1 else "matches"
+                print(f"  Note: {likely_moves:,} new file{s} {verb}"
+                      f" the checksum of missing files.")
+                print("  This usually means files were renamed or moved.")
+                print("  Run --accept-all to clear, or --report for details.")
 
     if result.failed > 0:
         print()

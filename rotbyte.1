@@ -67,6 +67,15 @@ directory or absolute.
 Use a custom database path instead of the default location inside the
 target directory.
 .TP
+.BI \-\-export " FILE"
+Export a plain-text manifest of all tracked file checksums to FILE.
+Format is b2sum-compatible: one line per file with the BLAKE2b-512
+baseline checksum followed by the file path. Missing files are excluded.
+.TP
+.B \-\-json
+Output results as a JSON object instead of human-readable text. Suppresses
+progress bars and spinners. Suitable for scripts and monitoring pipelines.
+.TP
 .B \-\-version
 Print the version number and exit.
 .SH EXIT STATUS

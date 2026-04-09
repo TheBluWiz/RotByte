@@ -4,10 +4,10 @@ _rotbyte() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="--check --report --accept --accept-all --import --workers --quiet --skip-missing --include-hidden --exclude --db --version --help"
+    opts="--check --report --accept --accept-all --import --workers --quiet --skip-missing --include-hidden --exclude --db --export --json --version --help"
 
     case "$prev" in
-        --accept|--db)
+        --accept|--db|--export)
             COMPREPLY=($(compgen -f -- "$cur"))
             return 0
             ;;
