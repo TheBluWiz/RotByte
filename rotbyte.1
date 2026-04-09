@@ -76,6 +76,40 @@ baseline checksum followed by the file path. Missing files are excluded.
 Output results as a JSON object instead of human-readable text. Suppresses
 progress bars and spinners. Suitable for scripts and monitoring pipelines.
 .TP
+.BI \-\-budget " DURATION"
+Time budget for
+.B \-\-check
+scans (e.g.
+.IR 2h ", " 30m ", " 1h30m ).
+Files are verified stalest-first so each run covers a different portion
+of the database. Over successive runs, everything gets checked.
+.TP
+.B \-\-track
+Install platform-native scheduled scans. On macOS, writes launchd plists
+to
+.IR ~/Library/LaunchAgents/ .
+On Linux, writes systemd user timer and service units to
+.IR ~/.config/systemd/user/ .
+Combine with
+.BR \-\-every ", " \-\-full\-at ", and " \-\-budget
+to configure the schedule.
+.TP
+.BI \-\-every " INTERVAL"
+Quick scan frequency when using
+.BR \-\-track .
+Accepts durations like
+.IR 30m ", " 2h ", " 2h30m .
+Default:
+.IR 60m .
+.TP
+.BI \-\-full\-at " TIME" \fR...
+One or more daily clock times for full
+.B \-\-check
+scans when using
+.BR \-\-track .
+Accepts clock times like
+.IR 2h " (2:00 AM), " 14h30m " (2:30 PM)."
+.TP
 .B \-\-version
 Print the version number and exit.
 .SH EXIT STATUS
@@ -127,6 +161,18 @@ Accept a restored file:
 .PP
 .RS
 .B rotbyte \-\-accept restored_file.mkv
+.RE
+.PP
+Full re-verify with a two-hour time budget:
+.PP
+.RS
+.B rotbyte \-\-check \-\-budget 2h /Volumes/Media
+.RE
+.PP
+Install scheduled scans (quick every 30 min, full daily at 2 AM with budget):
+.PP
+.RS
+.B rotbyte \-\-track \-\-every 30m \-\-full\-at 2h \-\-budget 2h /Volumes/Media
 .RE
 .SH FILES
 .TP

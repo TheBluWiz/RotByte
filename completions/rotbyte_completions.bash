@@ -4,7 +4,7 @@ _rotbyte() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="--check --report --accept --accept-all --import --workers --quiet --skip-missing --include-hidden --exclude --db --export --json --version --help"
+    opts="--check --report --accept --accept-all --import --workers --quiet --skip-missing --include-hidden --exclude --db --export --json --budget --track --every --full-at --version --help"
 
     case "$prev" in
         --accept|--db|--export)
@@ -17,6 +17,14 @@ _rotbyte() {
             ;;
         --exclude)
             COMPREPLY=($(compgen -d -- "$cur"))
+            return 0
+            ;;
+        --budget|--every)
+            COMPREPLY=($(compgen -W "30m 1h 2h 4h 1h30m 2h30m" -- "$cur"))
+            return 0
+            ;;
+        --full-at)
+            COMPREPLY=($(compgen -W "0h 1h 2h 3h 4h 6h 12h 14h 18h 22h" -- "$cur"))
             return 0
             ;;
     esac

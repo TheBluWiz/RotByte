@@ -403,6 +403,26 @@ class ChecksumDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def stalest_file_paths(self, prefix: str, limit: Optional[int] = None) -> List[str]:
+        """Return file paths ordered by oldest last_verified first.
+
+        Used by --budget mode to prioritize re-verifying the files that
+        haven't been checked in the longest time. Only returns non-MISSING
+        files under the given prefix.
+        """
+        escaped = self._escape_like(prefix)
+        query = (
+            "SELECT file_path FROM checksums "
+            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING' "
+            "ORDER BY last_verified ASC"
+        )
+        params: list = [escaped + "%"]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [r["file_path"] for r in rows]
+
     def detect_likely_moves(self, prefix: str) -> int:
         """Count NEW files whose checksum matches a MISSING file.
 
@@ -511,6 +531,54 @@ def _format_duration(seconds: float) -> str:
 def _is_tty() -> bool:
     """True when stderr is an interactive terminal (not a pipe or file)."""
     return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+
+
+import re as _re
+
+def parse_duration(s: str) -> int:
+    """Parse a human duration string like '2h30m', '45m', '3h' into seconds.
+
+    Accepted formats: Nh, Nm, NhMm (e.g. '2h', '30m', '2h30m', '90m').
+    Returns total seconds. Raises ValueError on bad input.
+    """
+    m = _re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", s)
+    if not m or (m.group(1) is None and m.group(2) is None):
+        raise ValueError(
+            f"Invalid duration '{s}'. Use formats like '2h', '30m', or '2h30m'."
+        )
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    total = hours * 3600 + minutes * 60
+    if total <= 0:
+        raise ValueError(f"Duration must be positive: '{s}'")
+    return total
+
+
+def parse_clock_time(s: str) -> Tuple[int, int]:
+    """Parse a clock time like '2h30m', '14h', '2h00m' into (hour, minute).
+
+    Accepted formats: Nh, NhMm (e.g. '2h' = 02:00, '14h30m' = 14:30).
+    Returns (hour, minute). Raises ValueError on bad input.
+    """
+    m = _re.fullmatch(r"(\d+)h(?:(\d+)m)?", s)
+    if not m:
+        raise ValueError(
+            f"Invalid clock time '{s}'. Use formats like '2h', '14h30m'."
+        )
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Invalid clock time '{s}': hour 0-23, minute 0-59.")
+    return hour, minute
+
+
+def _format_clock_time(hour: int, minute: int) -> str:
+    """Format (hour, minute) as a human-readable string like '2:30 AM'."""
+    ampm = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    if minute:
+        return f"{display_hour}:{minute:02d} {ampm}"
+    return f"{display_hour} {ampm}"
 
 
 def _term_width() -> int:
@@ -812,6 +880,7 @@ def run_hashing(
     now: str,
     interrupted: List[bool],
     quiet: bool = False,
+    budget_seconds: Optional[int] = None,
 ) -> HashResult:
     """Hash files in parallel and write results to the database.
 
@@ -819,6 +888,9 @@ def run_hashing(
     in a database transaction with try/finally to guarantee every opened
     transaction is either committed or rolled back — even on interrupt
     or worker crash.
+
+    If budget_seconds is set, hashing stops after the wall-clock budget
+    is exceeded (finishing the current batch first).
     """
     result = HashResult()
     total = len(entries)
@@ -828,11 +900,21 @@ def run_hashing(
     processed = 0
     entry_map = {e.path: e for e in entries}
     bar = ProgressBar(total, quiet=quiet)
+    budget_start = time.monotonic()
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         for batch_start in range(0, total, BATCH_SIZE):
             if interrupted[0]:
                 break
+
+            # Check time budget between batches
+            if budget_seconds is not None:
+                elapsed = time.monotonic() - budget_start
+                if elapsed >= budget_seconds:
+                    if not quiet:
+                        print(f"\n  Time budget reached ({_format_duration(elapsed)})."
+                              f" Stopping with {total - batch_start:,} files remaining.")
+                    break
 
             batch = entries[batch_start : batch_start + BATCH_SIZE]
             futures = {executor.submit(hash_file, e.path): e.path for e in batch}
@@ -1005,6 +1087,9 @@ Examples:
   rotbyte --exclude tmp                  Skip the 'tmp' directory
   rotbyte --exclude tmp cache            Skip multiple directories
   rotbyte --include-hidden               Include hidden files and directories
+  rotbyte --check --budget 2h            Full verify with a 2-hour time limit
+  rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
+  rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
 
 Exit codes:
   0  All files verified OK
@@ -1041,12 +1126,44 @@ Exit codes:
                         help="Export a plain-text manifest of all tracked file checksums")
     parser.add_argument("--json", dest="json_output", action="store_true",
                         help="Output results as JSON (for scripts and monitoring)")
+    parser.add_argument("--budget", metavar="DURATION",
+                        help="Time budget for --check scans (e.g. 2h, 30m, 1h30m). "
+                             "Stalest files are verified first.")
+    parser.add_argument("--track", action="store_true",
+                        help="Install scheduled scans using launchd (macOS) or systemd (Linux)")
+    parser.add_argument("--every", metavar="INTERVAL", default="60m",
+                        help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
+    parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
+                        help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
 
     args = parser.parse_args()
 
     # Validate --workers
     if args.workers < 1:
         print("Error: --workers must be at least 1.", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse --budget duration
+    args.budget_seconds = None
+    if args.budget:
+        try:
+            args.budget_seconds = parse_duration(args.budget)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not args.check and not args.track:
+            print("Error: --budget requires --check or --track with --full-at.", file=sys.stderr)
+            sys.exit(1)
+
+    # Validate --track related args
+    if args.full_at and not args.track:
+        print("Error: --full-at requires --track.", file=sys.stderr)
+        sys.exit(1)
+    if args.every != "60m" and not args.track:
+        print("Error: --every requires --track.", file=sys.stderr)
+        sys.exit(1)
+    if args.budget and args.track and not args.full_at:
+        print("Error: --budget with --track requires --full-at.", file=sys.stderr)
         sys.exit(1)
 
     target_dir = os.path.realpath(args.path)
@@ -1066,6 +1183,29 @@ Exit codes:
     db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
     db_path = args.db or os.path.join(target_dir, db_name)
     lock_path = db_path + ".lock"
+
+    # --track doesn't need the database or lock — it just generates config
+    if args.track:
+        try:
+            every_seconds = parse_duration(args.every)
+        except ValueError as e:
+            print(f"Error: --every: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        full_at_times = None
+        if args.full_at:
+            full_at_times = []
+            for t in args.full_at:
+                try:
+                    full_at_times.append(parse_clock_time(t))
+                except ValueError as e:
+                    print(f"Error: --full-at: {e}", file=sys.stderr)
+                    sys.exit(1)
+
+        rotbyte_exe = _find_rotbyte_executable()
+        _run_track(target_dir, every_seconds, full_at_times,
+                   args.budget_seconds, rotbyte_exe)
+        return
 
     # Acquire file lock to prevent concurrent runs
     lock = FileLock(lock_path)
@@ -1410,6 +1550,303 @@ def _run_accept_all(db: ChecksumDB, target_dir: str):
     print("═" * 60)
 
 
+# ── Track mode (scheduler installation) ────────────────────────────────────────
+
+import hashlib as _hashlib
+import platform as _platform
+import subprocess as _subprocess
+import textwrap as _textwrap
+
+def _dir_hash(target_dir: str) -> str:
+    """Short hash of the target directory path for unique config naming."""
+    return _hashlib.md5(target_dir.encode()).hexdigest()[:8]
+
+
+def _find_rotbyte_executable() -> str:
+    """Find the full path to the rotbyte executable.
+
+    Checks, in order: the script that's currently running (if it looks
+    like an installed entry point), then $PATH via `which`.
+    """
+    # If we were invoked as an installed script (not 'python rotbyte.py')
+    if not sys.argv[0].endswith(".py"):
+        candidate = shutil.which(os.path.basename(sys.argv[0]))
+        if candidate:
+            return os.path.realpath(candidate)
+
+    # Try finding 'rotbyte' on PATH
+    candidate = shutil.which("rotbyte")
+    if candidate:
+        return os.path.realpath(candidate)
+
+    # Fallback: use current Python + current script
+    return f"{sys.executable} {os.path.realpath(sys.argv[0])}"
+
+
+def _generate_launchd_plist(label: str, command: List[str],
+                            interval_seconds: Optional[int] = None,
+                            calendar_times: Optional[List[Tuple[int, int]]] = None) -> str:
+    """Generate a macOS launchd plist XML string.
+
+    Either interval_seconds (for StartInterval) or calendar_times
+    (for StartCalendarInterval) must be provided.
+    """
+    cmd_xml = "\n".join(f"        <string>{c}</string>" for c in command)
+
+    if interval_seconds is not None:
+        trigger = f"    <key>StartInterval</key>\n    <integer>{interval_seconds}</integer>"
+    elif calendar_times is not None:
+        entries = []
+        for hour, minute in calendar_times:
+            entries.append(
+                "        <dict>\n"
+                f"            <key>Hour</key>\n"
+                f"            <integer>{hour}</integer>\n"
+                f"            <key>Minute</key>\n"
+                f"            <integer>{minute}</integer>\n"
+                "        </dict>"
+            )
+        trigger = (
+            "    <key>StartCalendarInterval</key>\n"
+            "    <array>\n" + "\n".join(entries) + "\n"
+            "    </array>"
+        )
+    else:
+        raise ValueError("Must provide interval_seconds or calendar_times")
+
+    return _textwrap.dedent(f"""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>{label}</string>
+            <key>ProgramArguments</key>
+            <array>
+        {cmd_xml}
+            </array>
+        {trigger}
+            <key>StandardOutPath</key>
+            <string>/tmp/{label}.log</string>
+            <key>StandardErrorPath</key>
+            <string>/tmp/{label}.log</string>
+            <key>Nice</key>
+            <integer>10</integer>
+        </dict>
+        </plist>
+    """)
+
+
+def _generate_systemd_unit(description: str, command: List[str]) -> str:
+    """Generate a systemd .service unit file."""
+    exec_start = " ".join(command)
+    return _textwrap.dedent(f"""\
+        [Unit]
+        Description={description}
+
+        [Service]
+        Type=oneshot
+        ExecStart={exec_start}
+        Nice=10
+
+        [Install]
+        WantedBy=default.target
+    """)
+
+
+def _generate_systemd_timer(description: str,
+                            interval_seconds: Optional[int] = None,
+                            calendar_times: Optional[List[Tuple[int, int]]] = None) -> str:
+    """Generate a systemd .timer unit file."""
+    if interval_seconds is not None:
+        minutes = max(1, interval_seconds // 60)
+        schedule = f"    OnBootSec=5min\n    OnUnitActiveSec={minutes}min"
+    elif calendar_times is not None:
+        entries = []
+        for hour, minute in calendar_times:
+            entries.append(f"    OnCalendar=*-*-* {hour:02d}:{minute:02d}:00")
+        schedule = "\n".join(entries) + "\n    Persistent=true"
+    else:
+        raise ValueError("Must provide interval_seconds or calendar_times")
+
+    return _textwrap.dedent(f"""\
+        [Unit]
+        Description={description}
+
+        [Timer]
+        {schedule}
+
+        [Install]
+        WantedBy=timers.target
+    """)
+
+
+def _run_track(target_dir: str, every_seconds: int,
+               full_at: Optional[List[Tuple[int, int]]],
+               budget_seconds: Optional[int],
+               rotbyte_exe: str):
+    """Install platform-native scheduled tasks for rotbyte.
+
+    On macOS: launchd plists in ~/Library/LaunchAgents/
+    On Linux: systemd user timer/service pairs in ~/.config/systemd/user/
+    """
+    is_mac = _platform.system() == "Darwin"
+    is_linux = _platform.system() == "Linux"
+
+    if not is_mac and not is_linux:
+        print(f"Error: --track is not supported on {_platform.system()}.", file=sys.stderr)
+        print("  Supported platforms: macOS (launchd) and Linux (systemd).", file=sys.stderr)
+        sys.exit(1)
+
+    dhash = _dir_hash(target_dir)
+
+    # Split rotbyte_exe into command parts (handles "python /path/to/rotbyte.py")
+    exe_parts = rotbyte_exe.split()
+
+    # Build the commands that will be scheduled
+    quick_cmd = exe_parts + ["--quiet", target_dir]
+    full_cmd = None
+    if full_at:
+        full_cmd = exe_parts + ["--check", "--quiet"]
+        if budget_seconds:
+            # Store as the original duration format for the scheduled command
+            budget_h = budget_seconds // 3600
+            budget_m = (budget_seconds % 3600) // 60
+            budget_str = ""
+            if budget_h:
+                budget_str += f"{budget_h}h"
+            if budget_m:
+                budget_str += f"{budget_m}m"
+            if not budget_str:
+                budget_str = "1m"
+            full_cmd += ["--budget", budget_str]
+        full_cmd.append(target_dir)
+
+    print("═" * 60)
+    print("  rotbyte — Installing scheduled scans")
+    print("═" * 60)
+    print(f"  Directory  : {target_dir}")
+    print(f"  Quick scan : every {_format_duration(every_seconds)}")
+    if full_at:
+        times_str = ", ".join(_format_clock_time(h, m) for h, m in full_at)
+        print(f"  Full scan  : daily at {times_str}")
+        if budget_seconds:
+            print(f"  Budget     : {_format_duration(budget_seconds)} per full scan")
+    print(f"  Platform   : {'macOS (launchd)' if is_mac else 'Linux (systemd)'}")
+    print("═" * 60)
+    print()
+
+    if is_mac:
+        _install_launchd(target_dir, dhash, quick_cmd, every_seconds,
+                         full_cmd, full_at)
+    else:
+        _install_systemd(target_dir, dhash, quick_cmd, every_seconds,
+                         full_cmd, full_at)
+
+    print()
+    print("═" * 60)
+    print("  ✓ Scheduled scans installed successfully.")
+    print()
+    print("  Logs:")
+    if is_mac:
+        print(f"    /tmp/com.rotbyte.quick.{dhash}.log")
+        if full_at:
+            print(f"    /tmp/com.rotbyte.full.{dhash}.log")
+    else:
+        print(f"    journalctl --user -u rotbyte-quick-{dhash}")
+        if full_at:
+            print(f"    journalctl --user -u rotbyte-full-{dhash}")
+    print("═" * 60)
+
+
+def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
+                     every_seconds: int, full_cmd: Optional[List[str]],
+                     full_at: Optional[List[Tuple[int, int]]]):
+    """Write and load macOS launchd plist files."""
+    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    os.makedirs(agents_dir, exist_ok=True)
+
+    quick_label = f"com.rotbyte.quick.{dhash}"
+    quick_plist = os.path.join(agents_dir, f"{quick_label}.plist")
+
+    # Unload existing agents first (ignore errors if not loaded)
+    _subprocess.run(["launchctl", "unload", quick_plist],
+                    capture_output=True)
+
+    plist_content = _generate_launchd_plist(
+        quick_label, quick_cmd, interval_seconds=every_seconds,
+    )
+    with open(quick_plist, "w") as f:
+        f.write(plist_content)
+    _subprocess.run(["launchctl", "load", quick_plist], check=True)
+    print(f"  ✓ Installed: {quick_plist}")
+
+    if full_cmd and full_at:
+        full_label = f"com.rotbyte.full.{dhash}"
+        full_plist = os.path.join(agents_dir, f"{full_label}.plist")
+
+        _subprocess.run(["launchctl", "unload", full_plist],
+                        capture_output=True)
+
+        plist_content = _generate_launchd_plist(
+            full_label, full_cmd, calendar_times=full_at,
+        )
+        with open(full_plist, "w") as f:
+            f.write(plist_content)
+        _subprocess.run(["launchctl", "load", full_plist], check=True)
+        print(f"  ✓ Installed: {full_plist}")
+
+
+def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
+                     every_seconds: int, full_cmd: Optional[List[str]],
+                     full_at: Optional[List[Tuple[int, int]]]):
+    """Write and enable systemd user timer/service pairs."""
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    os.makedirs(unit_dir, exist_ok=True)
+
+    quick_name = f"rotbyte-quick-{dhash}"
+
+    # Quick scan service + timer
+    service_content = _generate_systemd_unit(
+        f"rotbyte quick scan ({target_dir})", quick_cmd,
+    )
+    timer_content = _generate_systemd_timer(
+        f"rotbyte quick scan timer ({target_dir})",
+        interval_seconds=every_seconds,
+    )
+
+    with open(os.path.join(unit_dir, f"{quick_name}.service"), "w") as f:
+        f.write(service_content)
+    with open(os.path.join(unit_dir, f"{quick_name}.timer"), "w") as f:
+        f.write(timer_content)
+
+    _subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    _subprocess.run(["systemctl", "--user", "enable", "--now", f"{quick_name}.timer"],
+                    check=True)
+    print(f"  ✓ Installed: {quick_name}.timer + .service")
+
+    if full_cmd and full_at:
+        full_name = f"rotbyte-full-{dhash}"
+
+        service_content = _generate_systemd_unit(
+            f"rotbyte full scan ({target_dir})", full_cmd,
+        )
+        timer_content = _generate_systemd_timer(
+            f"rotbyte full scan timer ({target_dir})",
+            calendar_times=full_at,
+        )
+
+        with open(os.path.join(unit_dir, f"{full_name}.service"), "w") as f:
+            f.write(service_content)
+        with open(os.path.join(unit_dir, f"{full_name}.timer"), "w") as f:
+            f.write(timer_content)
+
+        _subprocess.run(["systemctl", "--user", "enable", "--now", f"{full_name}.timer"],
+                        check=True)
+        print(f"  ✓ Installed: {full_name}.timer + .service")
+
+
 # ── Normal scan mode ───────────────────────────────────────────────────────────
 
 def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
@@ -1417,6 +1854,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     """Execute the three verification phases: scan, hash, detect missing."""
 
     quiet = args.quiet or args.json_output
+    budget_seconds = getattr(args, "budget_seconds", None)
 
     if not quiet:
         print("═" * 60)
@@ -1425,7 +1863,10 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         print(f"  Directory  : {target_dir}")
         print(f"  Database   : {db.db_path}")
         print(f"  Workers    : {args.workers}")
-        print(f"  Mode       : {'full re-verify (--check)' if args.check else 'quick (changed files only)'}")
+        mode = "full re-verify (--check)" if args.check else "quick (changed files only)"
+        if budget_seconds:
+            mode += f"  ·  budget {_format_duration(budget_seconds)}"
+        print(f"  Mode       : {mode}")
         print("═" * 60)
         print()
 
@@ -1442,6 +1883,17 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         to_hash, skip_count = prescan_files(all_files, existing, args.check)
         sp.set_suffix(f"  {len(to_hash):,} to hash, {skip_count:,} unchanged")
 
+    # When using a time budget with --check, prioritize the stalest files
+    # so each run covers the files that haven't been verified in the longest
+    # time. Over successive runs, the entire database gets covered.
+    if budget_seconds and args.check and len(to_hash) > 1:
+        with Spinner("Sorting by stalest first", quiet=quiet):
+            stalest_order = db.stalest_file_paths(target_dir)
+            stalest_rank = {p: i for i, p in enumerate(stalest_order)}
+            # New files (not in DB yet) go last — they have no staleness
+            max_rank = len(stalest_order)
+            to_hash.sort(key=lambda e: stalest_rank.get(e.path, max_rank))
+
     if not quiet:
         print()
 
@@ -1449,7 +1901,8 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     db.start_run(target_dir)
     now = _now()
     start_time = time.monotonic()
-    result = run_hashing(db, to_hash, args.workers, now, interrupted, quiet)
+    result = run_hashing(db, to_hash, args.workers, now, interrupted, quiet,
+                         budget_seconds=budget_seconds)
 
     # ── Phase 3: Detect missing files ──────────────────────────────────
     count_missing = 0

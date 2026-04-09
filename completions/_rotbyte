@@ -15,6 +15,10 @@ _rotbyte() {
         '--db[Custom database path]:file:_files' \
         '--export[Export checksums manifest]:file:_files' \
         '--json[Output results as JSON]' \
+        '--budget[Time budget for full scans]:duration:(30m 1h 2h 4h 1h30m 2h30m)' \
+        '--track[Install scheduled scans (launchd/systemd)]' \
+        '--every[Quick scan frequency for --track]:interval:(30m 1h 2h 4h)' \
+        '*--full-at[Daily clock times for full scans]:time:(0h 1h 2h 3h 4h 6h 12h 14h 18h 22h)' \
         '--version[Show version]' \
         '--help[Show help]' \
         '1:directory:_directories'
