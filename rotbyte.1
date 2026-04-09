@@ -84,6 +84,17 @@ scans (e.g.
 Files are verified stalest-first so each run covers a different portion
 of the database. Over successive runs, everything gets checked.
 .TP
+.BI \-\-due " DAYS"
+Only re-verify files whose last verification is older than
+.I DAYS
+(e.g.
+.IR 30d ", " 7d ", " 90d ).
+Implies
+.BR \-\-check .
+Combines naturally with
+.B \-\-budget
+to create time-limited incremental scans.
+.TP
 .B \-\-track
 Install platform-native scheduled scans. On macOS, writes launchd plists
 to

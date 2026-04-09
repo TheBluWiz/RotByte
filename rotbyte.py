@@ -423,6 +423,21 @@ class ChecksumDB:
         rows = self.conn.execute(query, params).fetchall()
         return [r["file_path"] for r in rows]
 
+    def due_file_paths(self, prefix: str, days: int) -> Set[str]:
+        """Return paths not verified within the given number of days.
+
+        Used by --due to select only files that are overdue for a full
+        re-verify, avoiding redundant work on recently checked files.
+        """
+        escaped = self._escape_like(prefix)
+        rows = self.conn.execute(
+            "SELECT file_path FROM checksums "
+            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING' "
+            "AND last_verified < datetime('now', ?)",
+            (escaped + "%", f"-{days} days"),
+        ).fetchall()
+        return {r["file_path"] for r in rows}
+
     def detect_likely_moves(self, prefix: str) -> int:
         """Count NEW files whose checksum matches a MISSING file.
 
@@ -570,6 +585,22 @@ def parse_clock_time(s: str) -> Tuple[int, int]:
     if hour > 23 or minute > 59:
         raise ValueError(f"Invalid clock time '{s}': hour 0-23, minute 0-59.")
     return hour, minute
+
+
+def parse_days(s: str) -> int:
+    """Parse a day count like '30d', '7d', '90d' into an integer.
+
+    Raises ValueError on bad input.
+    """
+    m = _re.fullmatch(r"(\d+)d", s)
+    if not m:
+        raise ValueError(
+            f"Invalid day count '{s}'. Use format like '30d', '7d', '90d'."
+        )
+    days = int(m.group(1))
+    if days <= 0:
+        raise ValueError(f"Day count must be positive: '{s}'")
+    return days
 
 
 def _format_clock_time(hour: int, minute: int) -> str:
@@ -1088,6 +1119,8 @@ Examples:
   rotbyte --exclude tmp cache            Skip multiple directories
   rotbyte --include-hidden               Include hidden files and directories
   rotbyte --check --budget 2h            Full verify with a 2-hour time limit
+  rotbyte --due 30d                       Re-verify files not checked in 30 days
+  rotbyte --due 7d --budget 1h           Re-verify week-old files, 1hr budget
   rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
   rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
 
@@ -1129,6 +1162,9 @@ Exit codes:
     parser.add_argument("--budget", metavar="DURATION",
                         help="Time budget for --check scans (e.g. 2h, 30m, 1h30m). "
                              "Stalest files are verified first.")
+    parser.add_argument("--due", metavar="DAYS",
+                        help="Only re-verify files not checked within N days (e.g. 30d, 7d, 90d). "
+                             "Implies --check.")
     parser.add_argument("--track", action="store_true",
                         help="Install scheduled scans using launchd (macOS) or systemd (Linux)")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
@@ -1151,9 +1187,19 @@ Exit codes:
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        if not args.check and not args.track:
-            print("Error: --budget requires --check or --track with --full-at.", file=sys.stderr)
+        if not args.check and not args.due and not args.track:
+            print("Error: --budget requires --check, --due, or --track with --full-at.", file=sys.stderr)
             sys.exit(1)
+
+    # Parse --due and imply --check
+    args.due_days = None
+    if args.due:
+        try:
+            args.due_days = parse_days(args.due)
+        except ValueError as e:
+            print(f"Error: --due: {e}", file=sys.stderr)
+            sys.exit(1)
+        args.check = True
 
     # Validate --track related args
     if args.full_at and not args.track:
@@ -1203,8 +1249,11 @@ Exit codes:
                     sys.exit(1)
 
         rotbyte_exe = _find_rotbyte_executable()
+        # Only pass --workers through if explicitly set (not the default)
+        track_workers = args.workers if args.workers != (os.cpu_count() or 4) else None
         _run_track(target_dir, every_seconds, full_at_times,
-                   args.budget_seconds, rotbyte_exe)
+                   args.budget_seconds, rotbyte_exe, workers=track_workers,
+                   due_days=args.due_days)
         return
 
     # Acquire file lock to prevent concurrent runs
@@ -1685,7 +1734,9 @@ def _generate_systemd_timer(description: str,
 def _run_track(target_dir: str, every_seconds: int,
                full_at: Optional[List[Tuple[int, int]]],
                budget_seconds: Optional[int],
-               rotbyte_exe: str):
+               rotbyte_exe: str,
+               workers: Optional[int] = None,
+               due_days: Optional[int] = None):
     """Install platform-native scheduled tasks for rotbyte.
 
     On macOS: launchd plists in ~/Library/LaunchAgents/
@@ -1704,11 +1755,16 @@ def _run_track(target_dir: str, every_seconds: int,
     # Split rotbyte_exe into command parts (handles "python /path/to/rotbyte.py")
     exe_parts = rotbyte_exe.split()
 
+    # --workers passthrough (only when explicitly set)
+    workers_args = ["--workers", str(workers)] if workers is not None else []
+
     # Build the commands that will be scheduled
-    quick_cmd = exe_parts + ["--quiet", target_dir]
+    quick_cmd = exe_parts + workers_args + ["--quiet", target_dir]
     full_cmd = None
     if full_at:
-        full_cmd = exe_parts + ["--check", "--quiet"]
+        full_cmd = exe_parts + ["--check", "--quiet"] + workers_args
+        if due_days:
+            full_cmd += ["--due", f"{due_days}d"]
         if budget_seconds:
             # Store as the original duration format for the scheduled command
             budget_h = budget_seconds // 3600
@@ -1733,6 +1789,10 @@ def _run_track(target_dir: str, every_seconds: int,
         print(f"  Full scan  : daily at {times_str}")
         if budget_seconds:
             print(f"  Budget     : {_format_duration(budget_seconds)} per full scan")
+        if due_days:
+            print(f"  Due window : files not verified in {due_days} days")
+    if workers is not None:
+        print(f"  Workers    : {workers}")
     print(f"  Platform   : {'macOS (launchd)' if is_mac else 'Linux (systemd)'}")
     print("═" * 60)
     print()
@@ -1855,6 +1915,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
 
     quiet = args.quiet or args.json_output
     budget_seconds = getattr(args, "budget_seconds", None)
+    due_days = getattr(args, "due_days", None)
 
     if not quiet:
         print("═" * 60)
@@ -1864,6 +1925,8 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         print(f"  Database   : {db.db_path}")
         print(f"  Workers    : {args.workers}")
         mode = "full re-verify (--check)" if args.check else "quick (changed files only)"
+        if due_days:
+            mode = f"due files only (not verified in {due_days}d)"
         if budget_seconds:
             mode += f"  ·  budget {_format_duration(budget_seconds)}"
         print(f"  Mode       : {mode}")
@@ -1882,6 +1945,17 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     with Spinner("Comparing", quiet=quiet) as sp:
         to_hash, skip_count = prescan_files(all_files, existing, args.check)
         sp.set_suffix(f"  {len(to_hash):,} to hash, {skip_count:,} unchanged")
+
+    # When --due is set, filter to only files that haven't been verified
+    # within the threshold. New files (not yet in DB) are always included.
+    if due_days:
+        with Spinner(f"Filtering to files due for re-verify ({due_days}d)", quiet=quiet) as sp:
+            due_paths = db.due_file_paths(target_dir, due_days)
+            before = len(to_hash)
+            to_hash = [e for e in to_hash if e.old_checksum is None or e.path in due_paths]
+            filtered = before - len(to_hash)
+            skip_count += filtered
+            sp.set_suffix(f"  {len(to_hash):,} due, {filtered:,} recently verified")
 
     # When using a time budget with --check, prioritize the stalest files
     # so each run covers the files that haven't been verified in the longest
