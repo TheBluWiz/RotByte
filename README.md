@@ -36,10 +36,60 @@ On the first run, rotbyte hashes every file and stores the results. On later run
 - **Move detection** — when new files match the checksum of missing files, rotbyte tells you they were probably renamed rather than deleted and re-added.
 - **Import-friendly** — already have `.b2sum` sidecar files? `rotbyte --import` pulls them in and cleans up the originals.
 - **Cron-ready** — `--quiet` suppresses everything except problems, so you get clean logs.
+- **Time-budgeted scans** — `--budget` caps wall-clock time on full verifies. Stalest files are checked first, so successive runs cover the entire database.
+- **Scheduled scanning** — `--track` installs native launchd (macOS) or systemd (Linux) timers with configurable quick and full scan schedules.
+- **Due-based verification** — `--due 30d` targets only files not checked recently, combining naturally with `--budget`.
+- **JSON output** — `--json` produces machine-readable results for scripts and monitoring pipelines.
+- **Export** — `--export` writes a b2sum-compatible manifest as an independent backup of your checksums outside the database.
+- **Directory exclusion** — `--exclude` skips directories you don't want tracked.
+
+## Scheduling
+
+Instead of writing cron rules by hand, use `--track` to install platform-native scheduled scans:
+
+```bash
+# Quick scan every hour, full verify daily at 2 AM with a 2-hour budget
+rotbyte --track --every 1h --full-at 2h --budget 2h /Volumes/Media
+
+# Quick scan every 30 minutes, full verify twice daily
+rotbyte --track --every 30m --full-at 2h 14h /Volumes/Media
+
+# Check what's scheduled and how your files are doing
+rotbyte --status
+```
+
+On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`.
+
+You can still use cron if you prefer:
 
 ```bash
 # Sunday 2 AM full verify, only log problems
 0 2 * * 0  rotbyte --check -q /Volumes/Media >> /var/log/rotbyte.log 2>&1
+```
+
+## Incremental verification
+
+Large archives can't always be fully re-verified in one sitting. Combine `--check` with `--budget` and `--due` to spread the work across multiple runs:
+
+```bash
+# Full verify with a 2-hour time limit (stalest files first)
+rotbyte --check --budget 2h /Volumes/Media
+
+# Only re-verify files not checked in 30 days, with a 1-hour budget
+rotbyte --due 30d --budget 1h /Volumes/Media
+```
+
+## Recovering from problems
+
+```bash
+# Accept a single restored file as correct
+rotbyte --accept restored_file.mkv
+
+# Accept everything — clears all MISSING and FAILED records
+rotbyte --accept-all
+
+# Export checksums as a portable plain-text manifest
+rotbyte --export checksums.txt
 ```
 
 ## Exit codes
