@@ -958,8 +958,10 @@ def run_hashing(
     transaction is either committed or rolled back — even on interrupt
     or worker crash.
 
-    If budget_seconds is set, hashing stops after the wall-clock budget
-    is exceeded (finishing the current batch first).
+    If budget_seconds is set, the elapsed time is checked after every
+    completed file. When the budget is exceeded the current batch's
+    already-completed results are committed and no further batches are
+    started.
     """
     result = HashResult()
     total = len(entries)
@@ -970,20 +972,12 @@ def run_hashing(
     entry_map = {e.path: e for e in entries}
     bar = ProgressBar(total, quiet=quiet)
     budget_start = time.monotonic()
+    budget_exceeded = False
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         for batch_start in range(0, total, BATCH_SIZE):
-            if interrupted[0]:
+            if interrupted[0] or budget_exceeded:
                 break
-
-            # Check time budget between batches
-            if budget_seconds is not None:
-                elapsed = time.monotonic() - budget_start
-                if elapsed >= budget_seconds:
-                    if not quiet:
-                        print(f"\n  Time budget reached ({_format_duration(elapsed)})."
-                              f" Stopping with {total - batch_start:,} files remaining.")
-                    break
 
             batch = entries[batch_start : batch_start + BATCH_SIZE]
             futures = {executor.submit(hash_file, e.path): e.path for e in batch}
@@ -993,6 +987,17 @@ def run_hashing(
                 for future in as_completed(futures):
                     if interrupted[0]:
                         break
+
+                    # Check time budget after each completed file
+                    if budget_seconds is not None and not budget_exceeded:
+                        elapsed = time.monotonic() - budget_start
+                        if elapsed >= budget_seconds:
+                            budget_exceeded = True
+                            remaining = total - processed
+                            if not quiet:
+                                print(f"\n  Time budget reached ({_format_duration(elapsed)})."
+                                      f" Stopping with {remaining:,} files remaining.")
+                            break
 
                     # Catch worker crashes (OOM, segfault) so one bad file
                     # doesn't abort the entire run.
