@@ -466,6 +466,20 @@ class ChecksumDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def last_activity(self) -> Optional[str]:
+        """Return the most recent last_verified timestamp, or None if empty."""
+        row = self.conn.execute(
+            "SELECT max(last_verified) as latest FROM checksums"
+        ).fetchone()
+        return row["latest"] if row and row["latest"] else None
+
+    def status_counts(self) -> Dict[str, int]:
+        """Return {status: count} dict for all tracked files."""
+        rows = self.conn.execute(
+            "SELECT status, count(*) as count FROM checksums GROUP BY status"
+        ).fetchall()
+        return {r["status"]: r["count"] for r in rows}
+
 
 # ── File lock ──────────────────────────────────────────────────────────────────
 
@@ -610,6 +624,30 @@ def _format_clock_time(hour: int, minute: int) -> str:
     if minute:
         return f"{display_hour}:{minute:02d} {ampm}"
     return f"{display_hour} {ampm}"
+
+
+def _utc_to_local(utc_iso: str) -> str:
+    """Convert a UTC ISO 8601 timestamp to a local time display string.
+
+    Handles both second-precision ('2026-04-09T14:30:00Z') and
+    nanosecond-precision ('2026-04-09T14:30:00.123456789Z') formats.
+    Returns a human-readable local time like '2026-04-09 7:30 AM PDT'.
+    """
+    # Strip nanosecond fractional part if present (strptime only handles up to 6 digits)
+    clean = utc_iso
+    if "." in clean:
+        clean = clean[:clean.index(".")] + "Z"
+    dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    # Get timezone abbreviation
+    tz_name = local.strftime("%Z")
+    ampm = "AM" if local.hour < 12 else "PM"
+    display_hour = local.hour % 12 or 12
+    if local.minute:
+        time_str = f"{display_hour}:{local.minute:02d} {ampm}"
+    else:
+        time_str = f"{display_hour} {ampm}"
+    return f"{local.strftime('%Y-%m-%d')} {time_str} {tz_name}"
 
 
 def _term_width() -> int:
@@ -1123,6 +1161,7 @@ Examples:
   rotbyte --due 7d --budget 1h           Re-verify week-old files, 1hr budget
   rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
   rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
+  rotbyte --status                       Show all scheduled scans and health
 
 Exit codes:
   0  All files verified OK
@@ -1167,12 +1206,19 @@ Exit codes:
                              "Implies --check.")
     parser.add_argument("--track", action="store_true",
                         help="Install scheduled scans using launchd (macOS) or systemd (Linux)")
+    parser.add_argument("--status", action="store_true",
+                        help="Show status of all scheduled scans and file health")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
                         help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
 
     args = parser.parse_args()
+
+    # --status doesn't need a target directory or any other validation
+    if args.status:
+        _run_status()
+        return
 
     # Validate --workers
     if args.workers < 1:
@@ -1905,6 +1951,287 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
         _subprocess.run(["systemctl", "--user", "enable", "--now", f"{full_name}.timer"],
                         check=True)
         print(f"  ✓ Installed: {full_name}.timer + .service")
+
+
+# ── Status mode ────────────────────────────────────────────────────────────────
+
+import glob as _glob
+import plistlib as _plistlib
+
+def _run_status():
+    """Display status of all tracked directories with schedule and health info.
+
+    Discovers installed scheduler configs, opens each target's database,
+    and reports schedule, last activity, and file health.
+    """
+    is_mac = _platform.system() == "Darwin"
+    is_linux = _platform.system() == "Linux"
+
+    if not is_mac and not is_linux:
+        print(f"Error: --status is not supported on {_platform.system()}.", file=sys.stderr)
+        sys.exit(1)
+
+    # Discover all tracked directories grouped by hash
+    tracked = _discover_tracked(is_mac)
+
+    if not tracked:
+        print("  No scheduled scans found.")
+        print()
+        print("  Use --track to set up scheduled scanning:")
+        print("    rotbyte --track /path/to/directory")
+        return
+
+    print()
+    print("═" * 60)
+    print("  rotbyte — Status")
+    print("═" * 60)
+
+    for target_dir, info in sorted(tracked.items()):
+        print()
+        print(f"  {target_dir}")
+
+        # Quick scan info
+        if info.get("quick"):
+            q = info["quick"]
+            active = "active ✓" if q["active"] else "inactive ✗"
+            print(f"    Quick : every {_format_duration(q['interval'])}".ljust(40) + active)
+        else:
+            print(f"    Quick : (not configured)")
+
+        # Full scan info
+        if info.get("full"):
+            f = info["full"]
+            active = "active ✓" if f["active"] else "inactive ✗"
+            times_str = ", ".join(
+                _format_clock_time(h, m) for h, m in f["times"]
+            ) if f.get("times") else "scheduled"
+            print(f"    Full  : daily at {times_str}".ljust(40) + active)
+            # Show extra flags
+            extras = []
+            if f.get("due"):
+                extras.append(f"--due {f['due']}")
+            if f.get("budget"):
+                extras.append(f"--budget {f['budget']}")
+            if f.get("workers"):
+                extras.append(f"--workers {f['workers']}")
+            if extras:
+                print(f"            {' '.join(extras)}")
+        else:
+            print(f"    Full  : (not configured)")
+
+        # Database health
+        db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
+        db_path = os.path.join(target_dir, db_name)
+
+        if not os.path.isfile(db_path):
+            print(f"    Last  : no database yet (first scan has not run)")
+            continue
+
+        try:
+            db = ChecksumDB(db_path)
+        except sqlite3.DatabaseError:
+            print(f"    Last  : database error (may be corrupt)")
+            continue
+
+        try:
+            last = db.last_activity()
+            if last:
+                print(f"    Last  : {_utc_to_local(last)}")
+            else:
+                print(f"    Last  : no scans completed yet")
+
+            counts = db.status_counts()
+            if counts:
+                parts = []
+                ok = counts.get("OK", 0) + counts.get("NEW", 0)
+                if ok:
+                    parts.append(f"{ok:,} OK")
+                failed = counts.get("FAILED", 0)
+                if failed:
+                    parts.append(f"{failed:,} FAILED")
+                missing = counts.get("MISSING", 0)
+                if missing:
+                    parts.append(f"{missing:,} MISSING")
+                print(f"    Files : {' · '.join(parts)}")
+
+                # Show failed file paths
+                if failed:
+                    failed_list = db.failed_files()
+                    for ff in failed_list[:5]:
+                        print(f"      ⚠ {ff['file_path']}")
+                    if len(failed_list) > 5:
+                        print(f"      ... and {len(failed_list) - 5} more")
+        finally:
+            db.close()
+
+    print()
+    print("═" * 60)
+
+
+def _discover_tracked(is_mac: bool) -> Dict[str, Dict]:
+    """Discover all installed rotbyte scheduler configs.
+
+    Returns {target_dir: {"quick": {...}, "full": {...}}} with schedule
+    details and active status for each tracked directory.
+    """
+    if is_mac:
+        return _discover_launchd()
+    return _discover_systemd()
+
+
+def _discover_launchd() -> Dict[str, Dict]:
+    """Parse installed launchd plists to discover tracked directories."""
+    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    tracked: Dict[str, Dict] = {}
+
+    for plist_path in sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist"))):
+        try:
+            with open(plist_path, "rb") as f:
+                plist = _plistlib.load(f)
+        except Exception:
+            continue
+
+        label = plist.get("Label", "")
+        args = plist.get("ProgramArguments", [])
+        if not args:
+            continue
+
+        # The target directory is always the last argument
+        target_dir = args[-1] if args else None
+        if not target_dir or not os.path.isabs(target_dir):
+            continue
+
+        if target_dir not in tracked:
+            tracked[target_dir] = {}
+
+        # Check if this agent is loaded
+        result = _subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True, text=True,
+        )
+        active = result.returncode == 0
+
+        if ".quick." in label:
+            interval = plist.get("StartInterval", 3600)
+            tracked[target_dir]["quick"] = {
+                "interval": interval,
+                "active": active,
+            }
+        elif ".full." in label:
+            times = []
+            cal = plist.get("StartCalendarInterval", [])
+            if isinstance(cal, dict):
+                cal = [cal]
+            for entry in cal:
+                times.append((entry.get("Hour", 0), entry.get("Minute", 0)))
+
+            tracked[target_dir]["full"] = {
+                "times": times,
+                "active": active,
+                **_parse_cmd_flags(args),
+            }
+
+    return tracked
+
+
+def _discover_systemd() -> Dict[str, Dict]:
+    """Parse installed systemd user units to discover tracked directories."""
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    tracked: Dict[str, Dict] = {}
+
+    for service_path in sorted(_glob.glob(os.path.join(unit_dir, "rotbyte-*.service"))):
+        basename = os.path.basename(service_path)
+        # e.g. rotbyte-quick-a1b2c3d4.service
+        name = basename.replace(".service", "")
+
+        try:
+            with open(service_path, "r") as f:
+                content = f.read()
+        except OSError:
+            continue
+
+        # Extract ExecStart line
+        exec_line = None
+        for line in content.splitlines():
+            if line.startswith("ExecStart="):
+                exec_line = line[len("ExecStart="):]
+                break
+        if not exec_line:
+            continue
+
+        args = exec_line.split()
+        target_dir = args[-1] if args else None
+        if not target_dir or not os.path.isabs(target_dir):
+            continue
+
+        if target_dir not in tracked:
+            tracked[target_dir] = {}
+
+        # Check if timer is active
+        timer_name = f"{name}.timer"
+        result = _subprocess.run(
+            ["systemctl", "--user", "is-active", timer_name],
+            capture_output=True, text=True,
+        )
+        active = result.stdout.strip() == "active"
+
+        is_quick = "-quick-" in name
+
+        if is_quick:
+            # Parse interval from timer file
+            timer_path = service_path.replace(".service", ".timer")
+            interval = 3600  # default
+            try:
+                with open(timer_path, "r") as f:
+                    for line in f:
+                        if line.strip().startswith("OnUnitActiveSec="):
+                            val = line.strip().split("=", 1)[1]
+                            # Parse "60min" format
+                            m = _re.match(r"(\d+)min", val)
+                            if m:
+                                interval = int(m.group(1)) * 60
+                            break
+            except OSError:
+                pass
+            tracked[target_dir]["quick"] = {
+                "interval": interval,
+                "active": active,
+            }
+        else:
+            # Parse calendar times from timer file
+            timer_path = service_path.replace(".service", ".timer")
+            times = []
+            try:
+                with open(timer_path, "r") as f:
+                    for line in f:
+                        if line.strip().startswith("OnCalendar="):
+                            val = line.strip().split("=", 1)[1]
+                            # Parse "*-*-* HH:MM:00"
+                            m = _re.search(r"(\d{2}):(\d{2}):00", val)
+                            if m:
+                                times.append((int(m.group(1)), int(m.group(2))))
+            except OSError:
+                pass
+            tracked[target_dir]["full"] = {
+                "times": times,
+                "active": active,
+                **_parse_cmd_flags(args),
+            }
+
+    return tracked
+
+
+def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
+    """Extract --due, --budget, --workers values from a command arg list."""
+    flags: Dict[str, Optional[str]] = {}
+    for i, arg in enumerate(args):
+        if arg == "--due" and i + 1 < len(args):
+            flags["due"] = args[i + 1]
+        elif arg == "--budget" and i + 1 < len(args):
+            flags["budget"] = args[i + 1]
+        elif arg == "--workers" and i + 1 < len(args):
+            flags["workers"] = args[i + 1]
+    return flags
 
 
 # ── Normal scan mode ───────────────────────────────────────────────────────────

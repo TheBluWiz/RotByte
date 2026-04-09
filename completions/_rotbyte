@@ -18,6 +18,7 @@ _rotbyte() {
         '--budget[Time budget for full scans]:duration:(30m 1h 2h 4h 1h30m 2h30m)' \
         '--due[Re-verify files not checked within N days]:days:(7d 14d 30d 60d 90d)' \
         '--track[Install scheduled scans (launchd/systemd)]' \
+        '--status[Show status of all scheduled scans]' \
         '--every[Quick scan frequency for --track]:interval:(30m 1h 2h 4h)' \
         '*--full-at[Daily clock times for full scans]:time:(0h 1h 2h 3h 4h 6h 12h 14h 18h 22h)' \
         '--version[Show version]' \
