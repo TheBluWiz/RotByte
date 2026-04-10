@@ -39,6 +39,7 @@ On the first run, rotbyte hashes every file and stores the results. On later run
 - **Time-budgeted scans** — `--budget` caps wall-clock time on full verifies. Stalest files are checked first, so successive runs cover the entire database.
 - **Scheduled scanning** — `--track` installs native launchd (macOS) or systemd (Linux) timers with configurable quick and full scan schedules.
 - **Due-based verification** — `--due 30d` targets only files not checked recently, combining naturally with `--budget`.
+- **Email notifications** — `--notify email` sends you an alert when bit rot or missing files are detected. Works standalone or with `--track`.
 - **JSON output** — `--json` produces machine-readable results for scripts and monitoring pipelines.
 - **Export** — `--export` writes a b2sum-compatible manifest as an independent backup of your checksums outside the database.
 - **Directory exclusion** — `--exclude` skips directories you don't want tracked.
@@ -66,6 +67,26 @@ You can still use cron if you prefer:
 # Sunday 2 AM full verify, only log problems
 0 2 * * 0  rotbyte --check -q /Volumes/Media >> /var/log/rotbyte.log 2>&1
 ```
+
+## Notifications
+
+Get an email when rotbyte detects bit rot or missing files. One-time setup:
+
+```bash
+rotbyte --notify-setup email
+```
+
+This prompts for your SMTP credentials (e.g. Gmail + app password), sends a test email, and saves the config. Then use `--notify email` on any scan:
+
+```bash
+# One-off scan with email alert
+rotbyte --check --notify email /Volumes/Media
+
+# Bake it into scheduled scans
+rotbyte --track --every 1h --full-at 2h --notify email /Volumes/Media
+```
+
+When everything is fine, no email is sent. When problems are found, you get a message with the file list and next steps.
 
 ## Incremental verification
 

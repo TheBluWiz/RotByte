@@ -21,6 +21,8 @@ _rotbyte() {
         '--status[Show status of all scheduled scans]' \
         '--every[Quick scan frequency for --track]:interval:(30m 1h 2h 4h)' \
         '*--full-at[Daily clock times for full scans]:time:(0h 1h 2h 3h 4h 6h 12h 14h 18h 22h)' \
+        '--notify[Send notification on problems]:backend:(email)' \
+        '--notify-setup[Interactive notification setup]:backend:(email)' \
         '--version[Show version]' \
         '--help[Show help]' \
         '1:directory:_directories'

@@ -31,11 +31,14 @@ Requires Python 3.9+ and a POSIX system (macOS or Linux).
 """
 
 import argparse
+import configparser
+import email.mime.text
 import hashlib
 import json
 import os
 import shutil
 import signal
+import smtplib
 import sqlite3
 import sys
 import threading
@@ -1217,8 +1220,31 @@ Exit codes:
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
                         help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
+    parser.add_argument("--notify", metavar="BACKEND",
+                        help="Send a notification when problems are detected (e.g. email)")
+    parser.add_argument("--notify-setup", metavar="BACKEND", dest="notify_setup",
+                        help="Interactive setup for notifications (e.g. email)")
 
     args = parser.parse_args()
+
+    # --notify-setup is a standalone command
+    if args.notify_setup:
+        if args.notify_setup != "email":
+            print(f"Error: Unknown notification backend '{args.notify_setup}'. "
+                  "Supported: email", file=sys.stderr)
+            sys.exit(1)
+        _run_notify_setup()
+        return
+
+    # Validate --notify
+    if args.notify:
+        if args.notify != "email":
+            print(f"Error: Unknown notification backend '{args.notify}'. "
+                  "Supported: email", file=sys.stderr)
+            sys.exit(1)
+        # Verify config exists early so the user doesn't wait through a full
+        # scan only to discover notifications aren't configured.
+        _load_notify_config()
 
     # --status doesn't need a target directory or any other validation
     if args.status:
@@ -1304,7 +1330,7 @@ Exit codes:
         track_workers = args.workers if args.workers != (os.cpu_count() or 4) else None
         _run_track(target_dir, every_seconds, full_at_times,
                    args.budget_seconds, rotbyte_exe, workers=track_workers,
-                   due_days=args.due_days)
+                   due_days=args.due_days, notify=args.notify)
         return
 
     # Acquire file lock to prevent concurrent runs
@@ -1787,7 +1813,8 @@ def _run_track(target_dir: str, every_seconds: int,
                budget_seconds: Optional[int],
                rotbyte_exe: str,
                workers: Optional[int] = None,
-               due_days: Optional[int] = None):
+               due_days: Optional[int] = None,
+               notify: Optional[str] = None):
     """Install platform-native scheduled tasks for rotbyte.
 
     On macOS: launchd plists in ~/Library/LaunchAgents/
@@ -1808,12 +1835,13 @@ def _run_track(target_dir: str, every_seconds: int,
 
     # --workers passthrough (only when explicitly set)
     workers_args = ["--workers", str(workers)] if workers is not None else []
+    notify_args = ["--notify", notify] if notify else []
 
     # Build the commands that will be scheduled
-    quick_cmd = exe_parts + workers_args + ["--quiet", target_dir]
+    quick_cmd = exe_parts + workers_args + notify_args + ["--quiet", target_dir]
     full_cmd = None
     if full_at:
-        full_cmd = exe_parts + ["--check", "--quiet"] + workers_args
+        full_cmd = exe_parts + ["--check", "--quiet"] + workers_args + notify_args
         if due_days:
             full_cmd += ["--due", f"{due_days}d"]
         if budget_seconds:
@@ -1844,6 +1872,8 @@ def _run_track(target_dir: str, every_seconds: int,
             print(f"  Due window : files not verified in {due_days} days")
     if workers is not None:
         print(f"  Workers    : {workers}")
+    if notify:
+        print(f"  Notify     : {notify}")
     print(f"  Platform   : {'macOS (launchd)' if is_mac else 'Linux (systemd)'}")
     print("═" * 60)
     print()
@@ -2021,6 +2051,8 @@ def _run_status():
                 extras.append(f"--workers {f['workers']}")
             if extras:
                 print(f"            {' '.join(extras)}")
+            if f.get("notify"):
+                print(f"    Notify: {f['notify']}")
         else:
             print(f"    Full  : (not configured)")
 
@@ -2227,7 +2259,7 @@ def _discover_systemd() -> Dict[str, Dict]:
 
 
 def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
-    """Extract --due, --budget, --workers values from a command arg list."""
+    """Extract --due, --budget, --workers, --notify values from a command arg list."""
     flags: Dict[str, Optional[str]] = {}
     for i, arg in enumerate(args):
         if arg == "--due" and i + 1 < len(args):
@@ -2236,7 +2268,184 @@ def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
             flags["budget"] = args[i + 1]
         elif arg == "--workers" and i + 1 < len(args):
             flags["workers"] = args[i + 1]
+        elif arg == "--notify" and i + 1 < len(args):
+            flags["notify"] = args[i + 1]
     return flags
+
+
+# ── Email notifications ────────────────────────────────────────────────────────
+
+def _notify_config_path() -> str:
+    """Return the platform-appropriate path for the notify config file."""
+    if _platform.system() == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support/rotbyte")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        base = os.path.join(base, "rotbyte")
+    return os.path.join(base, "notify.conf")
+
+
+def _load_notify_config() -> configparser.ConfigParser:
+    """Load and return the notification config, or exit with an error."""
+    path = _notify_config_path()
+    if not os.path.isfile(path):
+        print(f"Error: No notification config found at {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
+        sys.exit(1)
+    config = configparser.ConfigParser()
+    config.read(path)
+    if "email" not in config:
+        print(f"Error: No [email] section in {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+        sys.exit(1)
+    for key in ("smtp_host", "smtp_port", "username", "password", "to"):
+        if key not in config["email"]:
+            print(f"Error: Missing '{key}' in [email] section of {path}", file=sys.stderr)
+            print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+            sys.exit(1)
+    return config
+
+
+def _run_notify_setup():
+    """Interactive setup for email notifications."""
+    print("═" * 60)
+    print("  rotbyte — Email notification setup")
+    print("═" * 60)
+    print()
+    print("  You'll need SMTP credentials for your email provider.")
+    print("  For Gmail, use an App Password (not your account password).")
+    print("  See: https://support.google.com/accounts/answer/185833")
+    print()
+
+    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
+    if not smtp_host:
+        print("Error: SMTP host is required.", file=sys.stderr)
+        sys.exit(1)
+
+    smtp_port_str = input("  SMTP port [587]: ").strip()
+    smtp_port = int(smtp_port_str) if smtp_port_str else 587
+
+    username = input("  Username (your email address): ").strip()
+    if not username:
+        print("Error: Username is required.", file=sys.stderr)
+        sys.exit(1)
+
+    password = input("  Password / app password: ").strip()
+    if not password:
+        print("Error: Password is required.", file=sys.stderr)
+        sys.exit(1)
+
+    to_addr = input(f"  Send alerts to [{username}]: ").strip()
+    if not to_addr:
+        to_addr = username
+
+    # Test the connection
+    print()
+    print("  Testing connection...", end="", flush=True)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(username, password)
+
+            msg = email.mime.text.MIMEText(
+                "This is a test notification from rotbyte.\n\n"
+                "If you received this, email notifications are working correctly.\n"
+            )
+            msg["Subject"] = "rotbyte: test notification"
+            msg["From"] = username
+            msg["To"] = to_addr
+            server.sendmail(username, [to_addr], msg.as_string())
+    except Exception as e:
+        print(f" failed.\n\n  Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(" ok.")
+
+    # Write config
+    config_path = _notify_config_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    config = configparser.ConfigParser()
+    config["email"] = {
+        "smtp_host": smtp_host,
+        "smtp_port": str(smtp_port),
+        "username": username,
+        "password": password,
+        "to": to_addr,
+    }
+    with open(config_path, "w") as f:
+        config.write(f)
+    os.chmod(config_path, 0o600)
+
+    print(f"  Config saved to {config_path}")
+    print(f"  Test email sent to {to_addr} — check your inbox.")
+    print()
+    print("  Usage:")
+    print("    rotbyte --check --notify email /Volumes/Media")
+    print("    rotbyte --track --notify email --every 1h /Volumes/Media")
+
+
+def _send_email_notification(target_dir: str, failed: int, count_missing: int,
+                             failed_files: List[Dict]):
+    """Send an email notification about scan problems.
+
+    Best-effort: prints a warning on failure but never prevents the scan
+    from completing with its normal exit code.
+    """
+    try:
+        config = _load_notify_config()
+    except SystemExit:
+        # _load_notify_config calls sys.exit on error; during notification
+        # we want to warn, not abort.
+        print("  Warning: could not load email config — skipping notification.",
+              file=sys.stderr)
+        return
+
+    section = config["email"]
+
+    # Build subject
+    parts = []
+    if failed > 0:
+        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
+
+    # Build body
+    lines = [
+        f"rotbyte detected problems in {target_dir}:\n",
+    ]
+    if failed > 0:
+        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        lines.append(f"  Missing files:    {count_missing}")
+    lines.append("")
+
+    if failed_files:
+        lines.append("Affected files:")
+        for f in failed_files[:50]:
+            lines.append(f"  ✗ {f['file_path']}")
+        if len(failed_files) > 50:
+            lines.append(f"  ... and {len(failed_files) - 50} more")
+        lines.append("")
+
+    lines.append("Run `rotbyte --report` for full details.")
+    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
+
+    body = "\n".join(lines)
+
+    try:
+        msg = email.mime.text.MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = section["username"]
+        msg["To"] = section["to"]
+
+        with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
+                          timeout=30) as server:
+            server.starttls()
+            server.login(section["username"], section["password"])
+            server.sendmail(section["username"], [section["to"]], msg.as_string())
+    except Exception as e:
+        print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)
 
 
 # ── Normal scan mode ───────────────────────────────────────────────────────────
@@ -2321,6 +2530,12 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     # ── Summary ────────────────────────────────────────────────────────
     elapsed = time.monotonic() - start_time
     has_problems = result.failed > 0 or count_missing > 0 or interrupted[0]
+
+    # ── Email notification (if configured) ─────────────────────────────
+    if args.notify == "email" and (result.failed > 0 or count_missing > 0):
+        failed_details = db.failed_files() if result.failed > 0 else []
+        _send_email_notification(target_dir, result.failed, count_missing,
+                                 failed_details)
 
     if args.json_output:
         likely_moves = 0

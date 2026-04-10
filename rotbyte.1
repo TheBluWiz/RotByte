@@ -126,6 +126,25 @@ scans when using
 Accepts clock times like
 .IR 2h " (2:00 AM), " 14h30m " (2:30 PM)."
 .TP
+.BI \-\-notify " BACKEND"
+Send a notification when problems (bit rot or missing files) are detected.
+Currently supported backends:
+.IR email .
+Requires prior configuration via
+.BR \-\-notify\-setup .
+Can be used standalone or with
+.BR \-\-track ,
+which persists the flag into the scheduled commands.
+.TP
+.BI \-\-notify\-setup " BACKEND"
+Interactive setup for notifications. Prompts for SMTP credentials,
+stores them in
+.IR ~/.config/rotbyte/notify.conf
+(Linux) or
+.IR "~/Library/Application Support/rotbyte/notify.conf"
+(macOS) with 0600 permissions, and sends a test email to confirm
+the configuration works.
+.TP
 .B \-\-version
 Print the version number and exit.
 .SH EXIT STATUS
@@ -189,6 +208,24 @@ Install scheduled scans (quick every 30 min, full daily at 2 AM with budget):
 .PP
 .RS
 .B rotbyte \-\-track \-\-every 30m \-\-full\-at 2h \-\-budget 2h /Volumes/Media
+.RE
+.PP
+Set up email notifications:
+.PP
+.RS
+.B rotbyte \-\-notify\-setup email
+.RE
+.PP
+Full re-verify with email notification on problems:
+.PP
+.RS
+.B rotbyte \-\-check \-\-notify email /Volumes/Media
+.RE
+.PP
+Scheduled scans with email alerts:
+.PP
+.RS
+.B rotbyte \-\-track \-\-every 1h \-\-full\-at 2h \-\-notify email /Volumes/Media
 .RE
 .SH FILES
 .TP
