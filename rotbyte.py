@@ -1689,23 +1689,48 @@ def _dir_hash(target_dir: str) -> str:
 
 
 def _find_rotbyte_executable() -> str:
-    """Find the full path to the rotbyte executable.
+    """Find the full path to the rotbyte executable for scheduled tasks.
 
-    Checks, in order: the script that's currently running (if it looks
-    like an installed entry point), then $PATH via `which`.
+    On macOS, always returns 'python script.py' format to avoid going
+    through shell wrapper scripts (like Homebrew's bash wrappers). This
+    is critical for Full Disk Access — TCC checks the binary that
+    actually performs I/O (Python), and a bash wrapper in the chain
+    breaks the attribution.
+
+    On Linux (systemd), the shell wrapper is fine since there's no TCC.
     """
-    # If we were invoked as an installed script (not 'python rotbyte.py')
+    if _platform.system() == "Darwin":
+        # Always use Python directly on macOS to avoid bash wrapper
+        # attribution issues with Full Disk Access
+        script = os.path.realpath(sys.argv[0])
+        if script.endswith(".py"):
+            return f"{sys.executable} {script}"
+        # If invoked via a wrapper, find the .py script it points to
+        wrapper = shutil.which(os.path.basename(sys.argv[0]))
+        if wrapper:
+            wrapper = os.path.realpath(wrapper)
+            try:
+                with open(wrapper, "r") as f:
+                    content = f.read()
+                # Parse Homebrew-style wrapper:
+                #   exec "/path/to/rotbyte.py" "$@"
+                match = _re.search(r'exec\s+"([^"]+\.py)"', content)
+                if match:
+                    return f"{sys.executable} {match.group(1)}"
+            except OSError:
+                pass
+        return f"{sys.executable} {script}"
+
+    # Linux / other: shell wrappers work fine
     if not sys.argv[0].endswith(".py"):
         candidate = shutil.which(os.path.basename(sys.argv[0]))
         if candidate:
             return os.path.realpath(candidate)
 
-    # Try finding 'rotbyte' on PATH
     candidate = shutil.which("rotbyte")
     if candidate:
         return os.path.realpath(candidate)
 
-    # Fallback: use current Python + current script
     return f"{sys.executable} {os.path.realpath(sys.argv[0])}"
 
 
@@ -1717,51 +1742,50 @@ def _generate_launchd_plist(label: str, command: List[str],
     Either interval_seconds (for StartInterval) or calendar_times
     (for StartCalendarInterval) must be provided.
     """
-    cmd_xml = "\n".join(f"        <string>{c}</string>" for c in command)
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"',
+        '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+        '<plist version="1.0">',
+        '<dict>',
+        '    <key>Label</key>',
+        f'    <string>{label}</string>',
+        '    <key>ProgramArguments</key>',
+        '    <array>',
+    ]
+    for c in command:
+        lines.append(f'        <string>{c}</string>')
+    lines.append('    </array>')
 
     if interval_seconds is not None:
-        trigger = f"    <key>StartInterval</key>\n    <integer>{interval_seconds}</integer>"
+        lines.append('    <key>StartInterval</key>')
+        lines.append(f'    <integer>{interval_seconds}</integer>')
     elif calendar_times is not None:
-        entries = []
+        lines.append('    <key>StartCalendarInterval</key>')
+        lines.append('    <array>')
         for hour, minute in calendar_times:
-            entries.append(
-                "        <dict>\n"
-                f"            <key>Hour</key>\n"
-                f"            <integer>{hour}</integer>\n"
-                f"            <key>Minute</key>\n"
-                f"            <integer>{minute}</integer>\n"
-                "        </dict>"
-            )
-        trigger = (
-            "    <key>StartCalendarInterval</key>\n"
-            "    <array>\n" + "\n".join(entries) + "\n"
-            "    </array>"
-        )
+            lines.append('        <dict>')
+            lines.append('            <key>Hour</key>')
+            lines.append(f'            <integer>{hour}</integer>')
+            lines.append('            <key>Minute</key>')
+            lines.append(f'            <integer>{minute}</integer>')
+            lines.append('        </dict>')
+        lines.append('    </array>')
     else:
         raise ValueError("Must provide interval_seconds or calendar_times")
 
-    return _textwrap.dedent(f"""\
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>{label}</string>
-            <key>ProgramArguments</key>
-            <array>
-        {cmd_xml}
-            </array>
-        {trigger}
-            <key>StandardOutPath</key>
-            <string>/tmp/{label}.log</string>
-            <key>StandardErrorPath</key>
-            <string>/tmp/{label}.log</string>
-            <key>Nice</key>
-            <integer>10</integer>
-        </dict>
-        </plist>
-    """)
+    lines.extend([
+        '    <key>StandardOutPath</key>',
+        f'    <string>/tmp/{label}.log</string>',
+        '    <key>StandardErrorPath</key>',
+        f'    <string>/tmp/{label}.log</string>',
+        '    <key>Nice</key>',
+        '    <integer>10</integer>',
+        '</dict>',
+        '</plist>',
+        '',
+    ])
+    return '\n'.join(lines)
 
 
 def _generate_systemd_unit(description: str, command: List[str]) -> str:
