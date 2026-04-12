@@ -1170,6 +1170,8 @@ Examples:
   rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
   rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
   rotbyte --status                       Show all scheduled scans and health
+  rotbyte --untrack /Volumes/Media       Remove scheduled scans for a directory
+  rotbyte --untrack-all                  Remove all scheduled scans
 
 Exit codes:
   0  All files verified OK
@@ -1220,6 +1222,10 @@ Exit codes:
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
                         help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
+    parser.add_argument("--untrack", action="store_true",
+                        help="Remove scheduled scans for the given directory")
+    parser.add_argument("--untrack-all", action="store_true",
+                        help="Remove all scheduled scans for every tracked directory")
     parser.add_argument("--notify", metavar="BACKEND",
                         help="Send a notification when problems are detected (e.g. email)")
     parser.add_argument("--notify-setup", metavar="BACKEND", dest="notify_setup",
@@ -1231,7 +1237,11 @@ Exit codes:
     if args.notify_setup:
         if args.notify_setup != "email":
             print(f"Error: Unknown notification backend '{args.notify_setup}'. "
-                  "Supported: email", file=sys.stderr)
+                  "Currently supported: email\n"
+                  "Usage: --notify-setup email    Interactive setup to configure email notifications.\n"
+                  "       --notify email          Send an email alert when problems are detected.\n"
+                  "       Run --notify-setup email first to store your SMTP credentials.",
+                  file=sys.stderr)
             sys.exit(1)
         _run_notify_setup()
         return
@@ -1240,7 +1250,11 @@ Exit codes:
     if args.notify:
         if args.notify != "email":
             print(f"Error: Unknown notification backend '{args.notify}'. "
-                  "Supported: email", file=sys.stderr)
+                  "Currently supported: email\n"
+                  "Usage: --notify email          Send an email alert when problems are detected.\n"
+                  "       --notify-setup email    Interactive setup to configure email notifications.\n"
+                  "       Run --notify-setup email first to store your SMTP credentials.",
+                  file=sys.stderr)
             sys.exit(1)
         # Verify config exists early so the user doesn't wait through a full
         # scan only to discover notifications aren't configured.
@@ -1251,9 +1265,18 @@ Exit codes:
         _run_status()
         return
 
+    # --untrack-all doesn't need a target directory
+    if args.untrack_all:
+        _run_untrack_all()
+        return
+
     # Validate --workers
     if args.workers < 1:
-        print("Error: --workers must be at least 1.", file=sys.stderr)
+        print("Error: --workers must be a positive integer.\n"
+              "Usage: --workers N    Set parallel hashing workers (e.g. --workers 8).\n"
+              f"       Defaults to your CPU count ({os.cpu_count() or 4}). Higher values\n"
+              "       speed up large scans on fast storage.",
+              file=sys.stderr)
         sys.exit(1)
 
     # Parse --budget duration
@@ -1262,10 +1285,19 @@ Exit codes:
         try:
             args.budget_seconds = parse_duration(args.budget)
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            print(f"Error: --budget: {e}\n"
+                  "Usage: --budget DURATION    Limit how long a --check scan runs.\n"
+                  "       Accepts: 2h, 30m, 1h30m, 90m, etc.\n"
+                  "       Stalest files are verified first so successive runs cover everything.",
+                  file=sys.stderr)
             sys.exit(1)
         if not args.check and not args.due and not args.track:
-            print("Error: --budget requires --check, --due, or --track with --full-at.", file=sys.stderr)
+            print("Error: --budget requires --check, --due, or --track with --full-at.\n"
+                  "Usage: --budget limits scan time. Combine with:\n"
+                  "         rotbyte --check --budget 2h       Full verify, stop after 2 hours\n"
+                  "         rotbyte --due 30d --budget 1h     Re-verify stale files, stop after 1 hour\n"
+                  "         rotbyte --track --full-at 2h --budget 3h  Scheduled full scan with budget",
+                  file=sys.stderr)
             sys.exit(1)
 
     # Parse --due and imply --check
@@ -1274,45 +1306,99 @@ Exit codes:
         try:
             args.due_days = parse_days(args.due)
         except ValueError as e:
-            print(f"Error: --due: {e}", file=sys.stderr)
+            print(f"Error: --due: {e}\n"
+                  "Usage: --due DAYS    Only re-verify files not checked within N days.\n"
+                  "       Accepts: 30d, 7d, 90d (the 'd' suffix is optional).\n"
+                  "       Implies --check. New files are always included.",
+                  file=sys.stderr)
             sys.exit(1)
         args.check = True
 
     # Validate --track related args
     if args.full_at and not args.track:
-        print("Error: --full-at requires --track.", file=sys.stderr)
+        print("Error: --full-at requires --track.\n"
+              "Usage: --full-at sets daily times for full --check scans as part of scheduled tracking.\n"
+              "       Example: rotbyte --track --full-at 2h 14h /Volumes/Media\n"
+              "       This schedules full integrity checks at 02:00 and 14:00 daily.",
+              file=sys.stderr)
         sys.exit(1)
     if args.every != "60m" and not args.track:
-        print("Error: --every requires --track.", file=sys.stderr)
+        print("Error: --every requires --track.\n"
+              "Usage: --every INTERVAL    Set quick-scan frequency for scheduled tracking.\n"
+              "       Example: rotbyte --track --every 30m /Volumes/Media\n"
+              "       Runs a quick scan every 30 minutes. Default: 60m.",
+              file=sys.stderr)
         sys.exit(1)
     if args.budget and args.track and not args.full_at:
-        print("Error: --budget with --track requires --full-at.", file=sys.stderr)
+        print("Error: --budget with --track requires --full-at.\n"
+              "Usage: --budget limits full-scan duration during scheduled tracking, so it\n"
+              "       needs --full-at to know which scans to apply the budget to.\n"
+              "       Example: rotbyte --track --full-at 2h --budget 3h /Volumes/Media",
+              file=sys.stderr)
         sys.exit(1)
 
     target_dir = os.path.realpath(args.path)
     if not os.path.isdir(target_dir):
-        print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
+        print(f"Error: '{target_dir}' is not a directory.\n"
+              "Usage: rotbyte [PATH]    Scan a directory for bit rot.\n"
+              "       PATH must be an existing directory. Defaults to the current\n"
+              "       directory if omitted.\n"
+              "       Example: rotbyte /Volumes/Media",
+              file=sys.stderr)
         sys.exit(1)
 
     # Resolve --exclude paths relative to the target directory
     exclude_dirs: Set[str] = set()
     for exc in args.exclude:
         if os.path.isabs(exc):
-            exclude_dirs.add(os.path.realpath(exc))
+            resolved = os.path.realpath(exc)
         else:
-            exclude_dirs.add(os.path.realpath(os.path.join(target_dir, exc)))
+            resolved = os.path.realpath(os.path.join(target_dir, exc))
+        if not os.path.isdir(resolved):
+            print(f"  Warning: --exclude path '{exc}' does not exist or is not a directory, "
+                  "ignoring.", file=sys.stderr)
+        else:
+            exclude_dirs.add(resolved)
     args.exclude_dirs = exclude_dirs
 
     db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
     db_path = args.db or os.path.join(target_dir, db_name)
+
+    # Validate --db path: parent directory must exist
+    if args.db:
+        db_parent = os.path.dirname(os.path.realpath(args.db))
+        if not os.path.isdir(db_parent):
+            print(f"Error: Parent directory for --db does not exist: {db_parent}\n"
+                  "Usage: --db PATH    Custom database path (default: inside target dir).\n"
+                  "       The parent directory must already exist.\n"
+                  f"       Example: rotbyte --db /path/to/checksums.db {args.path}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    # Validate --accept early: must not be a directory
+    if args.accept and os.path.isdir(os.path.realpath(args.accept)):
+        print(f"Error: --accept target '{args.accept}' is a directory, not a file.\n"
+              "Usage: --accept FILE    Accept a single file's current state as baseline.\n"
+              "       To accept all files at once, use --accept-all instead.\n"
+              "       Example: rotbyte --accept movie.mkv",
+              file=sys.stderr)
+        sys.exit(1)
+
     lock_path = db_path + ".lock"
 
     # --track doesn't need the database or lock — it just generates config
+    if args.untrack:
+        _run_untrack(target_dir)
+        return
+
     if args.track:
         try:
             every_seconds = parse_duration(args.every)
         except ValueError as e:
-            print(f"Error: --every: {e}", file=sys.stderr)
+            print(f"Error: --every: {e}\n"
+                  "Usage: --every INTERVAL    Quick-scan frequency (e.g. 30m, 2h, 1h30m).\n"
+                  "       Default: 60m.",
+                  file=sys.stderr)
             sys.exit(1)
 
         full_at_times = None
@@ -1322,7 +1408,11 @@ Exit codes:
                 try:
                     full_at_times.append(parse_clock_time(t))
                 except ValueError as e:
-                    print(f"Error: --full-at: {e}", file=sys.stderr)
+                    print(f"Error: --full-at: {e}\n"
+                          "Usage: --full-at TIME [TIME ...]    Daily clock times for full scans.\n"
+                          "       Use 24h format, e.g. 2h, 14h, 14h30m.\n"
+                          "       Example: rotbyte --track --full-at 2h 14h /Volumes/Media",
+                          file=sys.stderr)
                     sys.exit(1)
 
         rotbyte_exe = _find_rotbyte_executable()
@@ -1353,9 +1443,12 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     try:
         db = ChecksumDB(db_path)
     except sqlite3.DatabaseError as e:
-        print(f"Error: Could not open database — {e}", file=sys.stderr)
-        print(f"  Path: {db_path}", file=sys.stderr)
-        print("  It may be corrupt. Restore from backup or delete to start fresh.", file=sys.stderr)
+        print(f"Error: Could not open database — {e}\n"
+              f"  Path: {db_path}\n"
+              "  The database file may be corrupt or not a valid SQLite file.\n"
+              "  Restore from backup or delete to start fresh.\n"
+              "  Use --db to specify an alternative database path.",
+              file=sys.stderr)
         sys.exit(1)
 
     # Catch subtler corruption that doesn't prevent opening
@@ -1432,7 +1525,17 @@ def _run_export(db: ChecksumDB, export_path: str):
     """
     records = db.all_records()
     if not records:
-        print("  Database is empty — nothing to export.", file=sys.stderr)
+        print("Error: Database is empty — nothing to export.\n"
+              "Usage: --export FILE    Export a b2sum-compatible manifest of all tracked checksums.\n"
+              "       Run a scan first so there are files in the database to export.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if os.path.isdir(export_path):
+        print(f"Error: '{export_path}' is a directory.\n"
+              "Usage: --export FILE    Export checksums to a file, not a directory.\n"
+              "       Example: rotbyte --export checksums.txt",
+              file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -1442,7 +1545,10 @@ def _run_export(db: ChecksumDB, export_path: str):
                     continue
                 f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
     except OSError as e:
-        print(f"Error: Could not write to {export_path} — {e}", file=sys.stderr)
+        print(f"Error: Could not write to {export_path} — {e}\n"
+              "Usage: --export FILE    The path must be writable.\n"
+              "       Example: rotbyte --export /tmp/checksums.txt",
+              file=sys.stderr)
         sys.exit(1)
 
     exported = sum(1 for r in records if r["status"] != "MISSING")
@@ -1602,7 +1708,11 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
 
     status = db.get_file_status(file_path)
     if status is None:
-        print(f"  '{file_arg}' is not tracked in the database.", file=sys.stderr)
+        print(f"Error: '{file_arg}' is not tracked in the database.\n"
+              "Usage: --accept FILE    Accept a file's current state as the new baseline.\n"
+              "       The file must already be tracked by rotbyte (status MISSING or FAILED).\n"
+              "       Run rotbyte --report to see which files need attention.",
+              file=sys.stderr)
         sys.exit(1)
 
     if status == "MISSING":
@@ -1611,7 +1721,11 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
 
     elif status == "FAILED":
         if not os.path.isfile(file_path):
-            print(f"  File not found on disk: {file_path}", file=sys.stderr)
+            print(f"Error: File not found on disk: {file_path}\n"
+                  "Usage: --accept FILE    Re-hash and accept a FAILED file as the new baseline.\n"
+                  "       The file must exist on disk so rotbyte can compute its new checksum.\n"
+                  "       Restore the file from backup first, then run --accept again.",
+                  file=sys.stderr)
             sys.exit(1)
 
         _, digest, h_size, h_mtime = hash_file(file_path)
@@ -1848,7 +1962,10 @@ def _run_track(target_dir: str, every_seconds: int,
     is_linux = _platform.system() == "Linux"
 
     if not is_mac and not is_linux:
-        print(f"Error: --track is not supported on {_platform.system()}.", file=sys.stderr)
+        print(f"Error: --track is not supported on {_platform.system()}.\n"
+              "Usage: --track installs scheduled scans via launchd (macOS) or systemd (Linux).\n"
+              "       Your current platform is not supported for automatic scheduling.",
+              file=sys.stderr)
         print("  Supported platforms: macOS (launchd) and Linux (systemd).", file=sys.stderr)
         sys.exit(1)
 
@@ -2012,6 +2129,146 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
         print(f"  ✓ Installed: {full_name}.timer + .service")
 
 
+# ── Untrack mode (scheduler removal) ───────────────────────────────────────────
+
+def _run_untrack(target_dir: str):
+    """Remove all scheduled scans for a single directory."""
+    is_mac = _platform.system() == "Darwin"
+    is_linux = _platform.system() == "Linux"
+
+    if not is_mac and not is_linux:
+        print(f"Error: --untrack is not supported on {_platform.system()}.\n"
+              "Usage: --untrack removes scheduled scans for a directory.\n"
+              "       Only supported on macOS (launchd) and Linux (systemd).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    dhash = _dir_hash(target_dir)
+    removed = _remove_scheduled(dhash, is_mac)
+
+    print("═" * 60)
+    print("  rotbyte — Removing scheduled scans")
+    print("═" * 60)
+    print(f"  Directory : {target_dir}")
+    print()
+
+    if removed:
+        for path in removed:
+            print(f"  ✓ Removed: {path}")
+    else:
+        print("  No scheduled scans found for this directory.")
+
+    print()
+    print("═" * 60)
+
+
+def _run_untrack_all():
+    """Remove all scheduled scans for every tracked directory."""
+    is_mac = _platform.system() == "Darwin"
+    is_linux = _platform.system() == "Linux"
+
+    if not is_mac and not is_linux:
+        print(f"Error: --untrack-all is not supported on {_platform.system()}.\n"
+              "Usage: --untrack-all removes all scheduled scans for every tracked directory.\n"
+              "       Only supported on macOS (launchd) and Linux (systemd).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Discover all rotbyte config files and extract their hashes
+    hashes = _discover_all_hashes(is_mac)
+
+    print("═" * 60)
+    print("  rotbyte — Removing all scheduled scans")
+    print("═" * 60)
+    print()
+
+    if not hashes:
+        print("  No scheduled scans found.")
+        print()
+        print("═" * 60)
+        return
+
+    total_removed: List[str] = []
+    for dhash in hashes:
+        removed = _remove_scheduled(dhash, is_mac)
+        total_removed.extend(removed)
+
+    if total_removed:
+        for path in total_removed:
+            print(f"  ✓ Removed: {path}")
+    else:
+        print("  No scheduled scans found.")
+
+    print()
+    print("═" * 60)
+
+
+def _discover_all_hashes(is_mac: bool) -> Set[str]:
+    """Find all unique rotbyte scheduler hashes installed on the system."""
+    hashes: Set[str] = set()
+    if is_mac:
+        agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+        for path in _glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist")):
+            # com.rotbyte.quick.HASH.plist or com.rotbyte.full.HASH.plist
+            basename = os.path.basename(path)
+            parts = basename.replace(".plist", "").split(".")
+            if len(parts) >= 4:
+                hashes.add(parts[3])
+    else:
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        for path in _glob.glob(os.path.join(unit_dir, "rotbyte-*.service")):
+            # rotbyte-quick-HASH.service or rotbyte-full-HASH.service
+            basename = os.path.basename(path).replace(".service", "")
+            # Split on first two hyphens: rotbyte, quick/full, HASH
+            parts = basename.split("-", 2)
+            if len(parts) >= 3:
+                hashes.add(parts[2])
+    return hashes
+
+
+def _remove_scheduled(dhash: str, is_mac: bool) -> List[str]:
+    """Remove all scheduled scan configs for a given directory hash.
+
+    Returns list of removed file paths.
+    """
+    removed: List[str] = []
+
+    if is_mac:
+        agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+        for kind in ("quick", "full"):
+            label = f"com.rotbyte.{kind}.{dhash}"
+            plist_path = os.path.join(agents_dir, f"{label}.plist")
+            if os.path.isfile(plist_path):
+                _subprocess.run(["launchctl", "unload", plist_path],
+                                capture_output=True)
+                os.unlink(plist_path)
+                removed.append(plist_path)
+    else:
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        for kind in ("quick", "full"):
+            name = f"rotbyte-{kind}-{dhash}"
+            timer_path = os.path.join(unit_dir, f"{name}.timer")
+            service_path = os.path.join(unit_dir, f"{name}.service")
+
+            if os.path.isfile(timer_path):
+                _subprocess.run(
+                    ["systemctl", "--user", "disable", "--now", f"{name}.timer"],
+                    capture_output=True,
+                )
+                os.unlink(timer_path)
+                removed.append(timer_path)
+
+            if os.path.isfile(service_path):
+                os.unlink(service_path)
+                removed.append(service_path)
+
+        if removed:
+            _subprocess.run(["systemctl", "--user", "daemon-reload"],
+                            capture_output=True)
+
+    return removed
+
+
 # ── Status mode ────────────────────────────────────────────────────────────────
 
 import glob as _glob
@@ -2027,7 +2284,10 @@ def _run_status():
     is_linux = _platform.system() == "Linux"
 
     if not is_mac and not is_linux:
-        print(f"Error: --status is not supported on {_platform.system()}.", file=sys.stderr)
+        print(f"Error: --status is not supported on {_platform.system()}.\n"
+              "Usage: --status shows the state of all scheduled scans and file health.\n"
+              "       Only supported on macOS (launchd) and Linux (systemd).",
+              file=sys.stderr)
         sys.exit(1)
 
     # Discover all tracked directories grouped by hash
@@ -2313,19 +2573,24 @@ def _load_notify_config() -> configparser.ConfigParser:
     """Load and return the notification config, or exit with an error."""
     path = _notify_config_path()
     if not os.path.isfile(path):
-        print(f"Error: No notification config found at {path}", file=sys.stderr)
-        print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
+        print(f"Error: No notification config found at {path}\n"
+              "Usage: Run `rotbyte --notify-setup email` first to configure SMTP credentials.\n"
+              "       Then use --notify email on subsequent scans to enable alerts.",
+              file=sys.stderr)
         sys.exit(1)
     config = configparser.ConfigParser()
     config.read(path)
     if "email" not in config:
-        print(f"Error: No [email] section in {path}", file=sys.stderr)
-        print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+        print(f"Error: No [email] section in {path}\n"
+              "Usage: Run `rotbyte --notify-setup email` to reconfigure from scratch.",
+              file=sys.stderr)
         sys.exit(1)
     for key in ("smtp_host", "smtp_port", "username", "password", "to"):
         if key not in config["email"]:
-            print(f"Error: Missing '{key}' in [email] section of {path}", file=sys.stderr)
-            print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+            print(f"Error: Missing '{key}' in [email] section of {path}\n"
+                  "Usage: Run `rotbyte --notify-setup email` to reconfigure.\n"
+                  f"       The config file requires: smtp_host, smtp_port, username, password, to.",
+                  file=sys.stderr)
             sys.exit(1)
     return config
 
@@ -2341,14 +2606,6 @@ def _run_notify_setup():
     print("  See: https://support.google.com/accounts/answer/185833")
     print()
 
-    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
-    if not smtp_host:
-        print("Error: SMTP host is required.", file=sys.stderr)
-        sys.exit(1)
-
-    smtp_port_str = input("  SMTP port [587]: ").strip()
-    smtp_port = int(smtp_port_str) if smtp_port_str else 587
-
     username = input("  Username (your email address): ").strip()
     if not username:
         print("Error: Username is required.", file=sys.stderr)
@@ -2359,9 +2616,21 @@ def _run_notify_setup():
         print("Error: Password is required.", file=sys.stderr)
         sys.exit(1)
 
+    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
+    if not smtp_host:
+        print("Error: SMTP host is required.", file=sys.stderr)
+        sys.exit(1)
+
+    smtp_port_str = input("  SMTP port [587]: ").strip()
+    smtp_port = int(smtp_port_str) if smtp_port_str else 587
+
     to_addr = input(f"  Send alerts to [{username}]: ").strip()
     if not to_addr:
         to_addr = username
+
+    from_addr = input(f"  Send alerts from [{username}]: ").strip()
+    if not from_addr:
+        from_addr = username
 
     # Test the connection
     print()
@@ -2376,9 +2645,9 @@ def _run_notify_setup():
                 "If you received this, email notifications are working correctly.\n"
             )
             msg["Subject"] = "rotbyte: test notification"
-            msg["From"] = username
+            msg["From"] = from_addr
             msg["To"] = to_addr
-            server.sendmail(username, [to_addr], msg.as_string())
+            server.sendmail(from_addr, [to_addr], msg.as_string())
     except Exception as e:
         print(f" failed.\n\n  Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2395,6 +2664,7 @@ def _run_notify_setup():
         "username": username,
         "password": password,
         "to": to_addr,
+        "from": from_addr,
     }
     with open(config_path, "w") as f:
         config.write(f)
@@ -2409,8 +2679,15 @@ def _run_notify_setup():
 
 
 def _send_email_notification(target_dir: str, failed: int, count_missing: int,
-                             failed_files: List[Dict]):
-    """Send an email notification about scan problems.
+                             failed_files: List[Dict], errors: int = 0,
+                             was_interrupted: bool = False):
+    """Send an email notification about a scan result.
+
+    Four notification states, in priority order:
+      interrupted — scan was cut short by SIGINT/SIGTERM
+      fail        — bit rot or missing files detected
+      warning     — all checksums OK but some files could not be read
+      pass        — full re-verify completed with no problems
 
     Best-effort: prints a warning on failure but never prevents the scan
     from completing with its normal exit code.
@@ -2426,48 +2703,84 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
 
     section = config["email"]
 
-    # Build subject
-    parts = []
-    if failed > 0:
-        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
-    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
+    if was_interrupted:
+        subject = f"rotbyte \u26a0 {target_dir} \u2014 scan interrupted"
+        body = "\n".join([
+            f"rotbyte was interrupted before completing the scan of {target_dir}.\n",
+            "The scan did not finish — some files may not have been verified this run.",
+            "",
+            f"Re-run `rotbyte --check {target_dir}` to complete verification.",
+        ])
 
-    # Build body
-    lines = [
-        f"rotbyte detected problems in {target_dir}:\n",
-    ]
-    if failed > 0:
-        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        lines.append(f"  Missing files:    {count_missing}")
-    lines.append("")
+    elif failed > 0 or count_missing > 0:
+        # Fail: bit rot or missing files detected.
+        parts = []
+        if failed > 0:
+            parts.append(f"{failed} failed")
+        if count_missing > 0:
+            parts.append(f"{count_missing} missing")
+        subject = f"rotbyte \u2717 {target_dir} \u2014 {', '.join(parts)}"
 
-    if failed_files:
-        lines.append("Affected files:")
-        for f in failed_files[:50]:
-            lines.append(f"  ✗ {f['file_path']}")
-        if len(failed_files) > 50:
-            lines.append(f"  ... and {len(failed_files) - 50} more")
+        lines = [
+            f"rotbyte detected problems in {target_dir}:\n",
+        ]
+        if failed > 0:
+            lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
+        if count_missing > 0:
+            lines.append(f"  Missing files:    {count_missing}")
         lines.append("")
 
-    lines.append("Run `rotbyte --report` for full details.")
-    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
+        if failed_files:
+            lines.append("Affected files:")
+            for f in failed_files[:50]:
+                lines.append(f"  \u2717 {f['file_path']}")
+            if len(failed_files) > 50:
+                lines.append(f"  ... and {len(failed_files) - 50} more")
+            lines.append("")
 
-    body = "\n".join(lines)
+        lines.append("Run `rotbyte --report` for full details.")
+        lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
+        body = "\n".join(lines)
+
+    elif errors > 0:
+        # Warning: checksums clean but some files could not be read.
+        subject = (f"rotbyte \u26a0 {target_dir} \u2014 "
+                   f"{errors} read error{'s' if errors != 1 else ''}")
+        body = "\n".join([
+            f"rotbyte completed a full re-verify of {target_dir}.\n",
+            (f"  {errors} file{'s' if errors != 1 else ''} could not be read and "
+             f"{'were' if errors != 1 else 'was'} skipped."),
+            "",
+            "This may indicate a hardware problem, a permissions issue, or a file",
+            "that was in use during the scan. No checksum changes were detected in",
+            "the files that were successfully read.",
+            "",
+            f"Re-run `rotbyte --check {target_dir}` to retry the skipped files.",
+            "Run `rotbyte --report` for full details.",
+        ])
+
+    else:
+        # Pass: full re-verify completed with no problems.
+        subject = f"rotbyte \u2713 {target_dir} \u2014 all files OK"
+        body = "\n".join([
+            f"rotbyte completed a full re-verify of {target_dir}.\n",
+            "All files verified OK \u2014 no bit rot or missing files detected.",
+            "",
+            "Run `rotbyte --report` for full details.",
+        ])
 
     try:
         msg = email.mime.text.MIMEText(body)
         msg["Subject"] = subject
-        msg["From"] = section["username"]
+        from_addr = section.get("from", section["username"])
+        msg["From"] = from_addr
         msg["To"] = section["to"]
 
         with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
                           timeout=30) as server:
             server.starttls()
             server.login(section["username"], section["password"])
-            server.sendmail(section["username"], [section["to"]], msg.as_string())
+            server.sendmail(from_addr, [section["to"]], msg.as_string())
     except Exception as e:
         print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)
 
@@ -2556,10 +2869,18 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     has_problems = result.failed > 0 or count_missing > 0 or interrupted[0]
 
     # ── Email notification (if configured) ─────────────────────────────
-    if args.notify == "email" and (result.failed > 0 or count_missing > 0):
-        failed_details = db.failed_files() if result.failed > 0 else []
-        _send_email_notification(target_dir, result.failed, count_missing,
-                                 failed_details)
+    if args.notify == "email":
+        if getattr(args, "check", False):
+            # Full re-verify: always notify with the appropriate state.
+            failed_details = db.failed_files() if result.failed > 0 else []
+            _send_email_notification(target_dir, result.failed, count_missing,
+                                     failed_details, errors=result.errors,
+                                     was_interrupted=interrupted[0])
+        elif result.failed > 0 or count_missing > 0:
+            # Quick scan: only notify on problems (fail state).
+            failed_details = db.failed_files() if result.failed > 0 else []
+            _send_email_notification(target_dir, result.failed, count_missing,
+                                     failed_details)
 
     if args.json_output:
         likely_moves = 0

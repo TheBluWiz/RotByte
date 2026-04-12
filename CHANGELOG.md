@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.0.0 — 2026-04-12
+
+**Notifications**
+- `--notify email` now sends a health report after every full re-verify (`--check`), not only when problems are found
+- Four distinct email states with matching subject lines: pass (✓ all files OK), warning (⚠ N read errors), fail (✗ N failed, N missing), interrupted (⚠ scan interrupted)
+- Quick scans still only notify when problems are detected
+- `--notify-setup` now collects a "Send alerts from" address for custom sender and alias support; credentials include a `from` key alongside `username`, `to`, `smtp_host`, and `smtp_port`
+
+**Documentation**
+- Comprehensive documentation audit and polish pass for v1.0.0
+- Consistent use of "full re-verify" throughout all docs
+- Added "What to expect" section to `docs/Email Notification Setup.md` with the four notification states
+- Updated `docs/macOS Permissions.md` version references to v1.0.0
+
+---
+
+## 0.1.1 — 2026-04-10
+
+**Notifications**
+- `--notify email` sends an alert when bit rot or missing files are detected
+- `--notify-setup email` interactive SMTP configuration with test email
+- Credentials stored in `~/.config/rotbyte/notify.conf` (Linux) or `~/Library/Application Support/rotbyte/notify.conf` (macOS) with 0600 permissions
+- Notification is best-effort: send failures print a warning but never change the scan exit code
+- `--notify` carries through `--track` into generated launchd/systemd commands
+- `--status` displays notify configuration for tracked directories
+
+**macOS Full Disk Access fix**
+- `--track` now generates launchd plists that invoke Python directly instead of going through the Homebrew bash wrapper
+- This fixes "authorization denied" errors on TCC-protected directories (`~/Desktop`, `~/Documents`, `~/Downloads`, `/Volumes/...`) when Full Disk Access is granted to the Python binary
+- Linux (systemd) is unaffected
+
+**Plist generation fix**
+- Fixed malformed XML in generated launchd plists caused by `textwrap.dedent` with interpolated variables
+- Plists now pass `plistlib` validation, fixing `--status` showing "no scheduled scans found"
+
+**Shell completions**
+- Added `--notify` and `--notify-setup` to Bash, Zsh, and Fish completions
+
+**Documentation**
+- Added macOS permissions guide (`docs/macOS Permissions.md`)
+- Added email notification setup guide with Gmail, iCloud, and Outlook instructions (`docs/Email Notification Setup.md`)
+- Added Notifications section to README
+- Updated man page with `--notify` and `--notify-setup` entries
+
 ## 0.1.0 — 2026-04-08
 
 Initial release.
@@ -25,10 +69,6 @@ Initial release.
 **Scheduling**
 - `--track` installs native launchd (macOS) or systemd (Linux) timers with configurable `--every` and `--full-at` schedules
 - `--status` shows all scheduled scans, last activity, and file health
-
-**Notifications**
-- `--notify-setup email` interactive SMTP configuration with test message
-- `--notify email` sends alerts when bit rot or missing files are detected
 
 **Output**
 - `--report` prints a human-readable integrity summary
