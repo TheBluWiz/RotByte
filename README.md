@@ -57,7 +57,9 @@ rotbyte --report
 
 ### Your first run
 
-On the first run, rotbyte hashes every file in the target directory and stores the results in a `.dirname_checksums.db` SQLite database inside that directory. Subsequent runs only re-hash files whose size or modification time changed, so they're fast.
+On the first run, rotbyte hashes every file in the target directory and stores the results in a `.{dirname}_rotbyte.db` SQLite database inside that directory. Subsequent runs only re-hash files whose size or modification time changed, so they're fast.
+
+> Databases from rotbyte 1.0 and earlier used the name `.{dirname}_checksums.db`. They are auto-migrated on the first run of any newer version — the DB plus its `.lock`, WAL, SHM, and `.manifest` sidecars are atomically renamed, with all history preserved. You'll see a single `Renamed legacy database to …` notice on stderr when it happens.
 
 ```bash
 # Index all files in the current directory

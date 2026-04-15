@@ -24,8 +24,11 @@ With --check:
       silent bit rot where the file corrupts without the metadata changing.
       This is the only mode that can detect true bit rot.
 
-The database (.{dirname}_checksums.db) is created automatically inside
-the target directory on first run.
+The database (.{dirname}_rotbyte.db) is created automatically inside
+the target directory on first run. Databases from rotbyte 1.0 and earlier
+(.{dirname}_rotbyte.db) are auto-migrated on the first run of any newer
+version — the DB plus its .lock / WAL / SHM / .manifest sidecars are
+atomically renamed, with history preserved.
 
 Requires Python 3.9+ on macOS, Linux, or Windows.
 """
@@ -103,6 +106,10 @@ CREATE INDEX IF NOT EXISTS idx_status        ON checksums(status);
 CREATE INDEX IF NOT EXISTS idx_last_verified ON checksums(last_verified);
 CREATE INDEX IF NOT EXISTS idx_file_name     ON checksums(file_name);
 CREATE INDEX IF NOT EXISTS idx_file_size     ON checksums(file_size);
+-- idx_baseline_checksum is created in _ensure_indexes() rather than here
+-- because legacy v1 databases don't have the baseline_checksum column
+-- until _migrate() adds it. Running CREATE INDEX here would fail on
+-- pre-migration open.
 
 CREATE TABLE IF NOT EXISTS last_run (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -118,10 +125,16 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 VERSION = "1.0.0"
-DB_FILENAME_SUFFIX = "_checksums.db"
+# Current DB filename shape: ".{dirname}_rotbyte.db". The leading dot keeps
+# the file hidden on POSIX; the {dirname} prefix keeps DBs distinguishable
+# when users copy them side-by-side onto a backup target.
+DB_FILENAME_SUFFIX = "_rotbyte.db"
+# Prior name, retained so existing users are auto-migrated on first run of
+# a version that ships the rename. See _migrate_legacy_db_name().
+LEGACY_DB_FILENAME_SUFFIX = "_checksums.db"
 HASH_BUFFER_SIZE = 1024 * 1024  # 1 MiB — balances syscall overhead vs memory
 BATCH_SIZE = 200                # DB writes per transaction before committing
 
@@ -177,6 +190,19 @@ class ChecksumDB:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
         self._migrate()
+        self._ensure_indexes()
+
+    def _ensure_indexes(self):
+        """Create indexes that depend on columns added by migrations.
+
+        Runs after _migrate() so legacy v1 databases (which lack
+        baseline_checksum until the 1→2 migration adds it) can open
+        cleanly before the index exists. Idempotent.
+        """
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_baseline_checksum "
+            "ON checksums(baseline_checksum)"
+        )
 
     def _migrate(self):
         """Run any pending schema migrations.
@@ -223,6 +249,18 @@ class ChecksumDB:
             )
             current = 2
 
+        # ── Migration 2 → 3: index baseline_checksum for move detection ──
+        # Without this index, looking up MISSING rows by checksum when new
+        # files arrive is O(n) per lookup and O(n²) for large reshuffles
+        # (e.g. a media-library reorganization). The index is ~64 bytes per
+        # row and pays for itself the first time a user reorganizes.
+        if current < 3:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_baseline_checksum "
+                "ON checksums(baseline_checksum)"
+            )
+            current = 3
+
         self.conn.execute(
             "UPDATE schema_version SET version = ? WHERE id = 1",
             (current,),
@@ -234,6 +272,14 @@ class ChecksumDB:
         return result is not None and result[0] == "ok"
 
     def close(self):
+        # PRAGMA optimize refreshes query-planner statistics on indexes
+        # touched during this session. Cheap (milliseconds) and keeps
+        # plans accurate as the database grows. SQLite's recommended
+        # close-time hygiene as of 3.18.
+        try:
+            self.conn.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass
         self.conn.close()
 
     @staticmethod
@@ -551,6 +597,71 @@ class ChecksumDB:
         verified = row["verified"] or 0
         due = total - verified
         return total, verified, due
+
+
+# ── Legacy database auto-migration ─────────────────────────────────────────────
+
+def _migrate_legacy_db_name(new_db_path: str) -> None:
+    """Rename a pre-1.1 .{dirname}_checksums.db to .{dirname}_rotbyte.db.
+
+    Runs before the lock is taken and before the DB is opened. Scope:
+
+      - Only acts if `new_db_path` ends with the current suffix
+        (.{dirname}_rotbyte.db) AND the new-name file does not yet exist.
+      - Derives the legacy path by swapping the suffix and checks whether
+        that file exists. If both exist, leaves both alone and prints a
+        loud warning — that is an ambiguous state the user must resolve.
+      - Atomically renames the DB and its .lock, -wal, -shm, and
+        .manifest sidecars using os.replace() (atomic on POSIX and
+        Windows when source and target are on the same volume).
+      - Quiet when nothing to do. One informational line when it migrates.
+
+    Users who passed a custom --db path are responsible for their own
+    renames; this helper only handles the default-path layout.
+    """
+    if not new_db_path.endswith(DB_FILENAME_SUFFIX):
+        return  # Custom --db path; out of scope
+    if os.path.exists(new_db_path):
+        return  # Already on the new name
+    legacy_path = new_db_path[:-len(DB_FILENAME_SUFFIX)] + LEGACY_DB_FILENAME_SUFFIX
+    if not os.path.exists(legacy_path):
+        return  # Nothing to migrate
+
+    # Ambiguous state: the legacy file exists but so does something else
+    # at the new path. Covered by the os.path.exists check above, but
+    # guard the sidecars too — if any new-name sidecar exists while the
+    # legacy DB is present, refuse rather than clobber.
+    sidecar_suffixes = (".lock", "-wal", "-shm", ".manifest")
+    for sfx in sidecar_suffixes:
+        if os.path.exists(new_db_path + sfx) and os.path.exists(legacy_path + sfx):
+            print(f"Warning: both legacy and current rotbyte database files present:",
+                  file=sys.stderr)
+            print(f"  legacy : {legacy_path}{sfx}", file=sys.stderr)
+            print(f"  current: {new_db_path}{sfx}", file=sys.stderr)
+            print("  Resolve manually before running rotbyte.", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        os.replace(legacy_path, new_db_path)
+    except OSError as e:
+        print(f"Warning: could not rename legacy database {legacy_path}: {e}",
+              file=sys.stderr)
+        return
+
+    migrated = [os.path.basename(new_db_path)]
+    for sfx in sidecar_suffixes:
+        src = legacy_path + sfx
+        dst = new_db_path + sfx
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.replace(src, dst)
+                migrated.append(os.path.basename(dst))
+            except OSError as e:
+                print(f"Warning: could not rename {src}: {e}", file=sys.stderr)
+
+    print(f"  Renamed legacy database to {os.path.basename(new_db_path)} "
+          f"({len(migrated)} file{'s' if len(migrated) != 1 else ''})",
+          file=sys.stderr)
 
 
 # ── File lock ──────────────────────────────────────────────────────────────────
@@ -1292,7 +1403,7 @@ Exit codes:
                         help="Include hidden files and directories (excluded by default)")
     parser.add_argument("--exclude", nargs="+", default=[], metavar="PATH",
                         help="Exclude one or more directories (relative to target dir or absolute)")
-    parser.add_argument("--db", help="Database path (default: .{dirname}_checksums.db inside target dir)")
+    parser.add_argument("--db", help="Database path (default: .{dirname}_rotbyte.db inside target dir)")
     parser.add_argument("--export", metavar="FILE",
                         help="Export a plain-text manifest of all tracked file checksums")
     parser.add_argument("--json", dest="json_output", action="store_true",
@@ -1434,6 +1545,11 @@ Exit codes:
 
     db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
     db_path = args.db or os.path.join(target_dir, db_name)
+    # Auto-migrate a pre-1.1 .{dirname}_checksums.db if the user hasn't
+    # overridden --db. No-op when nothing to migrate; emits a one-line
+    # notice when it acts. Runs before any lock or DB open.
+    if not args.db:
+        _migrate_legacy_db_name(db_path)
     lock_path = db_path + ".lock"
 
     # --track doesn't need the database or lock — it just generates config
@@ -1815,25 +1931,37 @@ def _discover_db_for_file(file_arg: str) -> str:
     """Discover the rotbyte database for a given file path.
 
     Search order:
-    1. Current working directory for .{dirname}_checksums.db
-    2. Each ancestor directory of the file, checking for .{dirname}_checksums.db
+    1. Current working directory for .{dirname}_rotbyte.db
+    2. Each ancestor directory of the file, checking for .{dirname}_rotbyte.db
+    3. As a fallback, the legacy .{dirname}_checksums.db name is also checked
+       at each step. When a legacy file is found, it is auto-migrated in
+       place before being returned.
 
     Returns the database path, or exits with an error if none is found.
     """
+    def _check_dir(d: str) -> Optional[str]:
+        base = os.path.basename(d)
+        new_path = os.path.join(d, "." + base + DB_FILENAME_SUFFIX)
+        if os.path.isfile(new_path):
+            return new_path
+        legacy_path = os.path.join(d, "." + base + LEGACY_DB_FILENAME_SUFFIX)
+        if os.path.isfile(legacy_path):
+            _migrate_legacy_db_name(new_path)
+            if os.path.isfile(new_path):
+                return new_path
+        return None
+
     # 1. Check current working directory
-    cwd = os.getcwd()
-    cwd_db = os.path.join(cwd, "." + os.path.basename(cwd) + DB_FILENAME_SUFFIX)
-    if os.path.isfile(cwd_db):
-        return cwd_db
+    found = _check_dir(os.getcwd())
+    if found:
+        return found
 
     # 2. Walk up from the file's resolved location
     search_dir = os.path.dirname(os.path.realpath(file_arg))
     while True:
-        candidate = os.path.join(
-            search_dir, "." + os.path.basename(search_dir) + DB_FILENAME_SUFFIX
-        )
-        if os.path.isfile(candidate):
-            return candidate
+        found = _check_dir(search_dir)
+        if found:
+            return found
         parent = os.path.dirname(search_dir)
         if parent == search_dir:
             break  # reached filesystem root

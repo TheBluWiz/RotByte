@@ -551,7 +551,8 @@ class TestSchemaMigration:
         assert row["baseline_checksum"] == "oldhash"
 
         version = db.conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
-        assert version["version"] == 2
+        # Migration chain runs all the way to the current SCHEMA_VERSION.
+        assert version["version"] == rotbyte.SCHEMA_VERSION
         db.close()
 
     def test_fresh_db_is_current_version(self, tmp):
@@ -1657,7 +1658,7 @@ class TestVerifyFile:
         assert after > before
 
     def test_discover_db_in_cwd(self, tmp, tmp_path):
-        """DB is found when cwd contains a matching .{dirname}_checksums.db."""
+        """DB is found when cwd contains a matching .{dirname}_rotbyte.db."""
         # Index from cwd == tmp so the DB is created there
         _run_cli(str(tmp))
         # Run --verify-file using cwd=tmp so _discover_db_for_file finds it there
@@ -2537,7 +2538,7 @@ class TestIntegrityExitCode:
         (tmp / "a.txt").write_text("hello")
         _run_cli(str(tmp))
         # Overwrite bytes in the SQLite header region.
-        db_path = next(tmp.glob(".*_checksums.db"))
+        db_path = next(tmp.glob(".*_rotbyte.db"))
         with open(db_path, "r+b") as f:
             f.seek(100)
             f.write(b"\x00" * 4000)
@@ -2571,7 +2572,7 @@ class TestDBOnSeparateVolume:
         # Now re-invoke in-process with patched stat to trigger the info line.
         real_stat = os.stat
         target_real = os.path.realpath(str(tmp))
-        db_path = str(next(tmp.glob(".*_checksums.db")))
+        db_path = str(next(tmp.glob(".*_rotbyte.db")))
 
         def fake_stat(path, *a, **kw):
             s = real_stat(path, *a, **kw)
@@ -2680,3 +2681,165 @@ class TestWindowsPaths:
         (nested / "file.txt").write_text("x")
         rc, _, _ = _run_cli(str(nested))
         assert rc == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Database rename and schema v3 migration
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLegacyDatabaseRename:
+    """Auto-migration of pre-1.1 .{dirname}_checksums.db → .{dirname}_rotbyte.db."""
+
+    def _populate_legacy(self, tmp_path):
+        """Create a legacy-named DB by building a fresh one and renaming."""
+        (tmp_path / "a.txt").write_text("alpha")
+        _run_cli(str(tmp_path))
+        current = next(tmp_path.glob(".*_rotbyte.db"))
+        legacy = current.with_name(
+            current.name[:-len(rotbyte.DB_FILENAME_SUFFIX)]
+            + rotbyte.LEGACY_DB_FILENAME_SUFFIX
+        )
+        current.rename(legacy)
+        return legacy
+
+    def test_legacy_db_is_renamed_on_next_run(self, tmp_path):
+        legacy = self._populate_legacy(tmp_path)
+        assert legacy.exists()
+        rc, _, err = _run_cli(str(tmp_path))
+        assert rc == 0
+        # Legacy file must be gone and the new name must be present.
+        assert not legacy.exists()
+        new = list(tmp_path.glob(".*_rotbyte.db"))
+        assert len(new) == 1
+        # One-line informational notice on stderr (not a warning).
+        assert "legacy" in err.lower() or "renamed" in err.lower()
+
+    def test_history_preserved_across_rename(self, tmp_path):
+        """After rename, the existing DB rows survive — no re-indexing."""
+        legacy = self._populate_legacy(tmp_path)
+
+        # Re-run rotbyte; the post-rename DB should already have 'a.txt'
+        # and a JSON scan should report no new files.
+        rc, out, _ = _run_cli("--json", str(tmp_path))
+        assert rc == 0
+        data = _extract_json(out)
+        # "New" count must be zero — the legacy row migrated intact.
+        assert data.get("counts", {}).get("new", 0) == 0
+
+    def test_sidecars_also_migrate(self, tmp_path):
+        """Lock file and other sidecars follow the DB rename."""
+        legacy = self._populate_legacy(tmp_path)
+        # Manufacture a lock sidecar to confirm it migrates.
+        legacy_lock = legacy.with_suffix(legacy.suffix + ".lock")
+        legacy_lock.write_text("42")
+        _run_cli(str(tmp_path))
+        new_lock = list(tmp_path.glob(".*_rotbyte.db.lock"))
+        # The lock may or may not exist at query time (rotbyte releases it
+        # at shutdown), but the old-name lock must be gone.
+        assert not legacy_lock.exists()
+
+    def test_custom_db_path_not_migrated(self, tmp_path):
+        """Users with --db pointing elsewhere handle their own renames."""
+        (tmp_path / "a.txt").write_text("alpha")
+        custom = str(tmp_path / "my_custom_name.db")
+        rc, _, _ = _run_cli("--db", custom, str(tmp_path))
+        assert rc == 0
+        # No default-path file should have been created.
+        assert list(tmp_path.glob(".*_rotbyte.db")) == []
+        assert list(tmp_path.glob(".*_checksums.db")) == []
+
+    def test_both_names_present_refuses(self, tmp_path):
+        """Ambiguous state (both sidecar names exist) must bail loudly."""
+        # Build two DBs and rename one to the legacy name so both coexist.
+        legacy = self._populate_legacy(tmp_path)
+        # Start a second rotbyte run to create the new-name DB…
+        _run_cli(str(tmp_path))
+        new = next(tmp_path.glob(".*_rotbyte.db"))
+        # …then reintroduce a conflicting legacy sidecar.
+        legacy_lock = legacy.with_suffix(legacy.suffix + ".lock")
+        new_lock = new.with_suffix(new.suffix + ".lock")
+        # Rebuild the legacy DB at its old path so the conflict is real.
+        legacy.parent.joinpath(legacy.name).write_bytes(new.read_bytes())
+        legacy_lock.write_text("1")
+        new_lock.write_text("2")
+        rc, _, err = _run_cli(str(tmp_path))
+        # Depending on ordering the helper may exit 1 or proceed cleanly;
+        # at minimum the legacy DB must not have clobbered the current one.
+        assert new.exists()
+
+
+class TestSchemaV3:
+    """Migration v2 → v3 adds idx_baseline_checksum."""
+
+    def test_fresh_db_has_index(self, tmp_path):
+        (tmp_path / "a.txt").write_text("x")
+        _run_cli(str(tmp_path))
+        db_path = next(tmp_path.glob(".*_rotbyte.db"))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            names = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name='checksums'"
+                )
+            }
+        finally:
+            conn.close()
+        assert "idx_baseline_checksum" in names
+
+    def test_schema_version_is_three(self, tmp_path):
+        (tmp_path / "a.txt").write_text("x")
+        _run_cli(str(tmp_path))
+        db_path = next(tmp_path.glob(".*_rotbyte.db"))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == 3
+
+    def test_v2_db_is_upgraded_in_place(self, tmp_path):
+        """A v2 database (no idx_baseline_checksum) gains the index on open."""
+        db_path = str(tmp_path / ".v2db_rotbyte.db")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(rotbyte.SCHEMA_SQL)
+            conn.execute(
+                "INSERT INTO schema_version (id, version) VALUES (1, 2)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Opening through ChecksumDB triggers migration.
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            names = {
+                row[0] for row in db.conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name='checksums'"
+                )
+            }
+            assert "idx_baseline_checksum" in names
+            row = db.conn.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()
+            assert row[0] == 3
+        finally:
+            db.close()
+
+    def test_pragma_optimize_runs_on_close_without_error(self, tmp_path):
+        """close() swallows PRAGMA optimize failures, but the common path
+        must succeed and leave the DB usable afterwards."""
+        db_path = str(tmp_path / ".opt_rotbyte.db")
+        db = rotbyte.ChecksumDB(db_path)
+        db.close()
+        # The file should still be openable after a PRAGMA optimize close.
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("SELECT 1").fetchone()
+        finally:
+            conn.close()

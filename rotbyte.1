@@ -19,7 +19,7 @@ to force a full re-verify of every file, which is the only way to catch
 true bit rot (corruption without metadata change).
 .PP
 The database is created automatically as
-.BI . dirname _checksums.db
+.BI . dirname _rotbyte.db
 inside the target directory on first run.
 .PP
 Sending SIGINT (Ctrl\-C) once causes the current batch to finish, saves
@@ -369,11 +369,11 @@ Remove all scheduled scans:
 .RE
 .SH FILES
 .TP
-.BI . dirname _checksums.db
+.BI . dirname _rotbyte.db
 SQLite database storing checksums and metadata, created inside the
 target directory.
 .TP
-.BI . dirname _checksums.db.lock
+.BI . dirname _rotbyte.db.lock
 Lock file preventing concurrent runs.
 .SH ENVIRONMENT
 .TP
@@ -408,7 +408,7 @@ in the source distribution for the setup procedure.
 If a
 .B rotbyte
 process is killed with SIGKILL (or otherwise hard-killed), the lock file
-.BI ( .dirname _checksums.db.lock )
+.BI ( .dirname _rotbyte.db.lock )
 will not be removed automatically. Delete it manually before re-running.
 .SH REQUIREMENTS
 Python 3.9 or later. macOS or Linux (uses

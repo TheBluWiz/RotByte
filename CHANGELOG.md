@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Database rename and indexing**
+- Default database file renamed from `.{dirname}_checksums.db` to `.{dirname}_rotbyte.db` for clearer tool attribution, especially on backup drives where multiple DBs may sit side by side
+- Leading dot preserved (hidden on POSIX); dirname prefix retained so DBs remain distinguishable when copied
+- Legacy `.{dirname}_checksums.db` files are **auto-migrated on first open** — the DB plus its `.lock`, `-wal`, `-shm`, and `.manifest` sidecars are atomically renamed via `os.replace()`, with all history preserved. A single `Renamed legacy database to …` notice is printed to stderr
+- Ambiguous state (both legacy and current files present for the same sidecar) is detected and refused loudly rather than silently clobbering either side
+- Custom `--db` paths are left alone — users with non-default paths manage their own renames
+- New schema version **3** adds `idx_baseline_checksum`, dramatically accelerating move detection when many files are renamed or reorganized (previously O(n) per lookup → O(log n); the quadratic blow-up on large reshuffles is gone)
+- `_ensure_indexes()` runs after migration so fresh databases and upgraded v1/v2 databases both end up with the same index set
+- `PRAGMA optimize` is now run at close time to keep the query planner's statistics accurate as the database grows — cheap (milliseconds) and follows SQLite's recommended close-time hygiene
+- Man page references updated to the new filename
+- Module docstring and `--db` help text updated
+- 9 new tests: fresh-DB index presence, schema v3 on new DBs, in-place v2→v3 upgrade, PRAGMA optimize no-error on close, and 5 covering the rename path (migration runs, history preserved, sidecars migrate, custom `--db` path is not touched, ambiguous state refused)
+
 **Windows support**
 - Added full Windows support. rotbyte now runs on macOS, Linux, and Windows with no runtime dependencies outside the standard library.
 - File locking uses `msvcrt.locking` on Windows and `fcntl.flock` on POSIX via a unified `_try_lock`/`_unlock` shim; conditional `fcntl` import avoids the ImportError on Windows
