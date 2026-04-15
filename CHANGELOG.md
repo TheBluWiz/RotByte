@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+**Windows support**
+- Added full Windows support. rotbyte now runs on macOS, Linux, and Windows with no runtime dependencies outside the standard library.
+- File locking uses `msvcrt.locking` on Windows and `fcntl.flock` on POSIX via a unified `_try_lock`/`_unlock` shim; conditional `fcntl` import avoids the ImportError on Windows
+- `SIGTERM` handler is now registered only on POSIX (Windows has no SIGTERM); `SIGINT` still works everywhere
+- `--track` on Windows registers user-level Task Scheduler tasks under `\rotbyte\` via `schtasks.exe /Create /XML`; no administrator elevation required
+- Generated Task XML maps `--budget` to `ExecutionTimeLimit` and sets `StartWhenAvailable=true` so missed runs catch up
+- New `--run-on-battery` flag (Windows-only effect): default is to skip scheduled runs on battery power, matching typical Task Scheduler defaults; pass the flag with `--track` to override
+- `--status` discovers Windows tasks via `schtasks /Query /XML` and parses the XML back into schedule summaries
+- Windows log paths: `%LOCALAPPDATA%\rotbyte\logs\`; generated Task XML stored at `%LOCALAPPDATA%\rotbyte\tasks\`
+- New docs page `docs/Windows Task Scheduler.md` covering inspection, uninstall, battery behavior, Controlled Folder Access, and long-path handling
+
+**Packaging**
+- Added `pyproject.toml` with a `rotbyte = rotbyte:main` console entry point; rotbyte can now be installed via `pipx install rotbyte` on any platform
+- Zero runtime dependencies; Python 3.9+ only
+- Single-file module layout preserved (`py-modules = ["rotbyte"]`) so the source remains one file
+- Data-files entries ship the man page and shell completions for system-wide pip installs (pipx places neither — documented)
+
+**Database durability**
+- Database integrity is now verified on every invocation via `PRAGMA quick_check`
+- Integrity failures exit with new code **4** (previously exit 1) and print a 3-option recovery message pointing at backups, `--import`, and starting fresh
+- New `--auto-export` flag (off by default): after a successful `--check`, writes `<db_path>.manifest` atomically (tmp + rename) as a b2sum-compatible independent backup of the checksum set
+- `--auto-export` persists through `--track` — the flag is embedded in the generated scheduler command so every scheduled full scan refreshes the manifest
+- Cross-volume DB detection: when the database lives on a different volume than the data it tracks (the recommended durability pattern), rotbyte prints `DB on separate volume: ✓` at startup; silent when same volume, suppressed under `--quiet` and `--json`
+- README gains a "Protecting the database itself" section documenting the pattern
+
+**Documentation**
+- README install section now leads with `pipx install rotbyte`; Homebrew is listed as the macOS-specific alternative that also ships the man page and completions
+- Added one-line explanation of BLAKE2b choice (cryptographic strength + speed over SHA-256)
+- Added "rotbyte and backups" section clarifying rotbyte is a tripwire, not a backup; recommends the 3-2-1 backup model alongside
+- Scheduling section documents Windows Task Scheduler and the battery default
+- Requirements line updated to reflect Python 3.9+ on macOS, Linux, or Windows
+- Exit code 4 added to the exit codes table and the `--help` epilogue
+
+**Tests**
+- 38 new test functions covering the new surface
+- Platform-agnostic: `_IS_WINDOWS` constant, `_quote_windows_args` (6 cases), `_iso_duration`/`_parse_iso_duration` round-trips (11 cases), `_generate_task_xml` structure and escaping (10 cases), `_try_lock`/`_unlock` shim (3 cases), `--auto-export` behavior (4 cases), integrity exit-code-4 path (1 case), cross-volume DB detection (2 cases)
+- Windows-only, gated with `@pytest.mark.skipif(sys.platform != "win32")`: schtasks install→discover round-trip, `--run-on-battery` flag reaches installed XML, backslash path handling — all 3 skipped on macOS/Linux but activate automatically on a `windows-latest` CI runner
+- Total: 240 passing, 3 skipped (Windows-only) on macOS/Linux
+
+**Notifications**
+- Added `--scheduled` flag (set internally by `--track`) to distinguish scheduled runs from manual ones
+- `--track` now bakes `--scheduled` into stored command strings so scheduled runs are identifiable
+- Scheduled partial scans (no `--full-at`) suppress email notifications with a "Skipping email notification (scheduled partial scan)" message
+- Scheduled full scans (`--full-at`) always send email, even if budget-interrupted
+- Manual (untracked) runs with `--notify email` always send email regardless of `--budget`
+- 4 new tests covering all notification combinations: untracked always-sends, scheduled-partial suppresses, scheduled-full sends, and budget-interrupted-full sends
+
+**Freshness stats for `--track` + `--due`**
+- `--status` now shows a verification freshness summary when a tracked directory has `--due` configured: counts of files verified within the window vs. due for re-verification, plus a coverage percentage
+- `--notify` email bodies now include the same freshness summary line when `--due` is active
+- New `ChecksumDB.freshness_stats(prefix, days)` method returns `(total, verified_within, due)` counts for non-MISSING files, using the indexed `last_verified` column
+- 13 new tests covering the DB method, `--status` output presence/absence, and email body with and without freshness data
+
+**Verification**
+- `--verify-file <path>` checks a single file against its stored baseline checksum without scanning the entire directory tree
+- Database discovery checks the current working directory first, then walks up the directory tree from the file's location to find the nearest `.db` file
+- Exit codes follow existing conventions: 0 (OK), 1 (error), 2 (checksum mismatch)
+- New internals: `_discover_db_for_file()`, `_run_verify_file()`, `ChecksumDB.get_file_record()`, `ChecksumDB.update_last_verified()`
+- 8 new tests covering verification success, bit rot detection, missing/untracked files, `last_verified` updates, and all three database discovery paths
+
+---
+
 ## 1.0.0 — 2026-04-12
 
 **Notifications**

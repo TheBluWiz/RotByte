@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rotbyte"
+version = "1.0.0"
+description = "Detect silent data corruption (bit rot) via BLAKE2b checksums in a local SQLite database."
+readme = "README.md"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.9"
+authors = [{ name = "rotbyte contributors" }]
+keywords = ["bit-rot", "checksum", "integrity", "blake2b", "archive", "backup"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Monitoring",
+]
+# rotbyte has zero runtime dependencies — stdlib only.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/rotbyte/rotbyte"
+Changelog = "https://github.com/rotbyte/rotbyte/blob/main/CHANGELOG.md"
+
+[project.scripts]
+rotbyte = "rotbyte:main"
+
+[tool.setuptools]
+# Single-file module layout — rotbyte.py lives at the repo root.
+py-modules = ["rotbyte"]
+
+# Auxiliary files (man page, shell completions) are installed for system-wide
+# installs (pip with --prefix) but are not placed in pipx's isolated venv.
+# Packagers should install these manually for the best user experience.
+[tool.setuptools.data-files]
+"share/man/man1" = ["rotbyte.1"]
+"share/bash-completion/completions" = ["completions/rotbyte_completions.bash"]
+"share/zsh/site-functions" = ["completions/_rotbyte"]
+"share/fish/vendor_completions.d" = ["completions/rotbyte_completions.fish"]

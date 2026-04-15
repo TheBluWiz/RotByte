@@ -151,6 +151,29 @@ Combine with
 .BR \-\-every ", " \-\-full\-at ", and " \-\-budget
 to configure the schedule.
 .TP
+.B \-\-track\-setup
+Interactive setup wizard for
+.BR \-\-track .
+Prompts in order for: target directory, quick scan frequency
+.RB ( \-\-every ),
+full scan clock times
+.RB ( \-\-full\-at ),
+time budget per full scan
+.RB ( \-\-budget ),
+due threshold
+.RB ( \-\-due ),
+and whether to enable email notifications
+.RB ( \-\-notify " " email ).
+Each value is validated with the same parser used by the corresponding flag
+and the user is re-prompted on invalid input. Before installing, prints the
+equivalent
+.B \-\-track
+command line so the user can learn the flag form for future use.
+Email notifications require prior configuration via
+.BR \-\-notify\-setup ;
+if the config is absent, the wizard continues without email rather than
+installing a broken schedule.
+.TP
 .B \-\-status
 Show the status of all installed scheduled scans. For each tracked
 directory, displays: the quick and full scan schedule and whether each
@@ -307,6 +330,12 @@ Install scheduled scans (quick every 30 min, full re-verify daily at 2 AM with b
 .PP
 .RS
 .B rotbyte \-\-track \-\-every 30m \-\-full\-at 2h \-\-budget 2h /Volumes/Media
+.RE
+.PP
+Interactive setup wizard for scheduled scans:
+.PP
+.RS
+.B rotbyte \-\-track\-setup /Volumes/Media
 .RE
 .PP
 Set up email notifications:

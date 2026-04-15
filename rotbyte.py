@@ -27,7 +27,7 @@ With --check:
 The database (.{dirname}_checksums.db) is created automatically inside
 the target directory on first run.
 
-Requires Python 3.9+ and a POSIX system (macOS or Linux).
+Requires Python 3.9+ on macOS, Linux, or Windows.
 """
 
 import argparse
@@ -43,8 +43,38 @@ import sqlite3
 import sys
 import threading
 import time
-import fcntl
 from concurrent.futures import ProcessPoolExecutor, as_completed, BrokenExecutor
+
+# Platform-specific locking primitives. rotbyte uses an advisory file lock
+# to prevent two processes from writing to the same database concurrently.
+# POSIX systems (macOS/Linux) use fcntl.flock; Windows uses msvcrt.locking
+# on a byte-range at the start of the lock file.
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:
+    import msvcrt  # type: ignore[import-not-found]
+else:
+    import fcntl
+
+def _try_lock(fileobj) -> bool:
+    """Non-blocking exclusive lock. Returns True on success, False if held."""
+    try:
+        if _IS_WINDOWS:
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fileobj, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (OSError, IOError):
+        return False
+
+def _unlock(fileobj) -> None:
+    """Release a lock acquired via _try_lock. Safe to call if not held."""
+    try:
+        if _IS_WINDOWS:
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fileobj, fcntl.LOCK_UN)
+    except OSError:
+        pass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -376,6 +406,23 @@ class ChecksumDB:
         ).fetchone()
         return row["status"] if row else None
 
+    def get_file_record(self, file_path: str) -> Optional[Dict]:
+        """Return the full database record for a file, or None if not tracked."""
+        row = self.conn.execute(
+            "SELECT file_path, baseline_checksum, checksum, file_size, "
+            "file_mtime, status, first_seen, last_verified "
+            "FROM checksums WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_last_verified(self, file_path: str, now: str):
+        """Update last_verified timestamp for a file without changing any other field."""
+        self.conn.execute(
+            "UPDATE checksums SET last_verified = ? WHERE file_path = ?",
+            (now, file_path),
+        )
+
     def purge_file(self, file_path: str):
         """Remove a single file's record from the database entirely."""
         self.conn.execute("DELETE FROM checksums WHERE file_path = ?", (file_path,))
@@ -483,6 +530,28 @@ class ChecksumDB:
         ).fetchall()
         return {r["status"]: r["count"] for r in rows}
 
+    def freshness_stats(self, prefix: str, days: int) -> tuple:
+        """Return (total, verified_within, due) counts for non-MISSING files.
+
+        Used to summarize verification coverage when --due is active.
+        'verified_within' counts files whose last_verified is within the
+        given day window; 'due' is the remainder (outside window or NULL).
+        """
+        escaped = self._escape_like(prefix)
+        row = self.conn.execute(
+            "SELECT "
+            "  count(*) as total, "
+            "  sum(CASE WHEN last_verified >= datetime('now', ?) THEN 1 ELSE 0 END) "
+            "    as verified "
+            "FROM checksums "
+            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING'",
+            (f"-{days} days", escaped + "%"),
+        ).fetchone()
+        total = row["total"] or 0
+        verified = row["verified"] or 0
+        due = total - verified
+        return total, verified, due
+
 
 # ── File lock ──────────────────────────────────────────────────────────────────
 
@@ -500,19 +569,38 @@ class FileLock:
 
     def acquire(self) -> bool:
         try:
-            self.lock_file = open(self.lock_path, "w")
-            fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.lock_file.write(str(os.getpid()))
-            self.lock_file.flush()
-            return True
-        except (OSError, IOError):
+            # "a+b" so Windows msvcrt.locking has a real byte to lock on.
+            self.lock_file = open(self.lock_path, "a+b")
+        except OSError:
             return False
+        if not _try_lock(self.lock_file):
+            try:
+                self.lock_file.close()
+            finally:
+                self.lock_file = None
+            return False
+        try:
+            self.lock_file.seek(0)
+            self.lock_file.truncate()
+            self.lock_file.write(str(os.getpid()).encode("ascii"))
+            self.lock_file.flush()
+        except OSError:
+            # A write failure doesn't invalidate the lock; the PID record
+            # is informational only.
+            pass
+        return True
 
     def release(self):
         if self.lock_file:
             try:
-                fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+                _unlock(self.lock_file)
                 self.lock_file.close()
+            except OSError:
+                pass
+            self.lock_file = None
+            # Best-effort cleanup; on Windows the file may still be in use
+            # by another process briefly, which is harmless.
+            try:
                 os.unlink(self.lock_path)
             except OSError:
                 pass
@@ -1170,14 +1258,13 @@ Examples:
   rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
   rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
   rotbyte --status                       Show all scheduled scans and health
-  rotbyte --untrack /Volumes/Media       Remove scheduled scans for a directory
-  rotbyte --untrack-all                  Remove all scheduled scans
 
 Exit codes:
   0  All files verified OK
   1  Missing files detected
   2  Bit rot detected (checksum mismatch)
   3  Run was interrupted (safe to re-run)
+  4  Database integrity check failed (restore from backup)
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1187,6 +1274,8 @@ Exit codes:
                         help="Force re-hash of every file regardless of modification time")
     parser.add_argument("--accept", metavar="FILE",
                         help="Accept a single file's current state (clears MISSING or re-hashes FAILED)")
+    parser.add_argument("--verify-file", metavar="FILE", dest="verify_file",
+                        help="Verify a single file's integrity against the database")
     parser.add_argument("--accept-all", action="store_true",
                         help="Accept all current state as new baseline (clears all MISSING and FAILED)")
     parser.add_argument("--import", dest="import_hashes", action="store_true",
@@ -1215,21 +1304,31 @@ Exit codes:
                         help="Only re-verify files not checked within N days (e.g. 30d, 7d, 90d). "
                              "Implies --check.")
     parser.add_argument("--track", action="store_true",
-                        help="Install scheduled scans using launchd (macOS) or systemd (Linux)")
+                        help="Install scheduled scans using launchd (macOS), systemd (Linux), "
+                             "or Task Scheduler (Windows)")
+    parser.add_argument("--auto-export", dest="auto_export", action="store_true",
+                        help="After a successful --check, write a b2sum-compatible manifest "
+                             "to <db_path>.manifest as an independent backup of checksums. "
+                             "Off by default. Persists across scheduled runs when combined "
+                             "with --track.")
+    parser.add_argument("--run-on-battery", dest="run_on_battery", action="store_true",
+                        help="Windows --track only: allow scheduled scans to run while on "
+                             "battery power. Default is to skip runs on battery to preserve "
+                             "battery life (matches typical Task Scheduler defaults).")
+    parser.add_argument("--track-setup", dest="track_setup", action="store_true",
+                        help="Interactive setup wizard for --track (prompts for schedule, budget, etc.)")
     parser.add_argument("--status", action="store_true",
                         help="Show status of all scheduled scans and file health")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
                         help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
-    parser.add_argument("--untrack", action="store_true",
-                        help="Remove scheduled scans for the given directory")
-    parser.add_argument("--untrack-all", action="store_true",
-                        help="Remove all scheduled scans for every tracked directory")
     parser.add_argument("--notify", metavar="BACKEND",
                         help="Send a notification when problems are detected (e.g. email)")
     parser.add_argument("--notify-setup", metavar="BACKEND", dest="notify_setup",
                         help="Interactive setup for notifications (e.g. email)")
+    parser.add_argument("--scheduled", action="store_true",
+                        help="Internal: set by --track to identify scheduled runs")
 
     args = parser.parse_args()
 
@@ -1237,24 +1336,22 @@ Exit codes:
     if args.notify_setup:
         if args.notify_setup != "email":
             print(f"Error: Unknown notification backend '{args.notify_setup}'. "
-                  "Currently supported: email\n"
-                  "Usage: --notify-setup email    Interactive setup to configure email notifications.\n"
-                  "       --notify email          Send an email alert when problems are detected.\n"
-                  "       Run --notify-setup email first to store your SMTP credentials.",
-                  file=sys.stderr)
+                  "Supported: email", file=sys.stderr)
             sys.exit(1)
         _run_notify_setup()
+        return
+
+    # --track-setup is a standalone command — runs the interactive wizard
+    # and dispatches to the normal --track install path with the collected args.
+    if args.track_setup:
+        _run_track_setup(args.path)
         return
 
     # Validate --notify
     if args.notify:
         if args.notify != "email":
             print(f"Error: Unknown notification backend '{args.notify}'. "
-                  "Currently supported: email\n"
-                  "Usage: --notify email          Send an email alert when problems are detected.\n"
-                  "       --notify-setup email    Interactive setup to configure email notifications.\n"
-                  "       Run --notify-setup email first to store your SMTP credentials.",
-                  file=sys.stderr)
+                  "Supported: email", file=sys.stderr)
             sys.exit(1)
         # Verify config exists early so the user doesn't wait through a full
         # scan only to discover notifications aren't configured.
@@ -1265,18 +1362,27 @@ Exit codes:
         _run_status()
         return
 
-    # --untrack-all doesn't need a target directory
-    if args.untrack_all:
-        _run_untrack_all()
+    # --verify-file has its own database discovery and bypasses the normal
+    # target_dir / db_path resolution
+    if args.verify_file:
+        db_path = _discover_db_for_file(args.verify_file)
+        target_dir = os.path.dirname(db_path)
+        lock_path = db_path + ".lock"
+        lock = FileLock(lock_path)
+        if not lock.acquire():
+            print("Error: Another instance is already running against this database.",
+                  file=sys.stderr)
+            print(f"  If this is a mistake, remove: {lock_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            _run(args, target_dir, db_path)
+        finally:
+            lock.release()
         return
 
     # Validate --workers
     if args.workers < 1:
-        print("Error: --workers must be a positive integer.\n"
-              "Usage: --workers N    Set parallel hashing workers (e.g. --workers 8).\n"
-              f"       Defaults to your CPU count ({os.cpu_count() or 4}). Higher values\n"
-              "       speed up large scans on fast storage.",
-              file=sys.stderr)
+        print("Error: --workers must be at least 1.", file=sys.stderr)
         sys.exit(1)
 
     # Parse --budget duration
@@ -1285,19 +1391,10 @@ Exit codes:
         try:
             args.budget_seconds = parse_duration(args.budget)
         except ValueError as e:
-            print(f"Error: --budget: {e}\n"
-                  "Usage: --budget DURATION    Limit how long a --check scan runs.\n"
-                  "       Accepts: 2h, 30m, 1h30m, 90m, etc.\n"
-                  "       Stalest files are verified first so successive runs cover everything.",
-                  file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         if not args.check and not args.due and not args.track:
-            print("Error: --budget requires --check, --due, or --track with --full-at.\n"
-                  "Usage: --budget limits scan time. Combine with:\n"
-                  "         rotbyte --check --budget 2h       Full verify, stop after 2 hours\n"
-                  "         rotbyte --due 30d --budget 1h     Re-verify stale files, stop after 1 hour\n"
-                  "         rotbyte --track --full-at 2h --budget 3h  Scheduled full scan with budget",
-                  file=sys.stderr)
+            print("Error: --budget requires --check, --due, or --track with --full-at.", file=sys.stderr)
             sys.exit(1)
 
     # Parse --due and imply --check
@@ -1306,99 +1403,45 @@ Exit codes:
         try:
             args.due_days = parse_days(args.due)
         except ValueError as e:
-            print(f"Error: --due: {e}\n"
-                  "Usage: --due DAYS    Only re-verify files not checked within N days.\n"
-                  "       Accepts: 30d, 7d, 90d (the 'd' suffix is optional).\n"
-                  "       Implies --check. New files are always included.",
-                  file=sys.stderr)
+            print(f"Error: --due: {e}", file=sys.stderr)
             sys.exit(1)
         args.check = True
 
     # Validate --track related args
     if args.full_at and not args.track:
-        print("Error: --full-at requires --track.\n"
-              "Usage: --full-at sets daily times for full --check scans as part of scheduled tracking.\n"
-              "       Example: rotbyte --track --full-at 2h 14h /Volumes/Media\n"
-              "       This schedules full integrity checks at 02:00 and 14:00 daily.",
-              file=sys.stderr)
+        print("Error: --full-at requires --track.", file=sys.stderr)
         sys.exit(1)
     if args.every != "60m" and not args.track:
-        print("Error: --every requires --track.\n"
-              "Usage: --every INTERVAL    Set quick-scan frequency for scheduled tracking.\n"
-              "       Example: rotbyte --track --every 30m /Volumes/Media\n"
-              "       Runs a quick scan every 30 minutes. Default: 60m.",
-              file=sys.stderr)
+        print("Error: --every requires --track.", file=sys.stderr)
         sys.exit(1)
     if args.budget and args.track and not args.full_at:
-        print("Error: --budget with --track requires --full-at.\n"
-              "Usage: --budget limits full-scan duration during scheduled tracking, so it\n"
-              "       needs --full-at to know which scans to apply the budget to.\n"
-              "       Example: rotbyte --track --full-at 2h --budget 3h /Volumes/Media",
-              file=sys.stderr)
+        print("Error: --budget with --track requires --full-at.", file=sys.stderr)
         sys.exit(1)
 
     target_dir = os.path.realpath(args.path)
     if not os.path.isdir(target_dir):
-        print(f"Error: '{target_dir}' is not a directory.\n"
-              "Usage: rotbyte [PATH]    Scan a directory for bit rot.\n"
-              "       PATH must be an existing directory. Defaults to the current\n"
-              "       directory if omitted.\n"
-              "       Example: rotbyte /Volumes/Media",
-              file=sys.stderr)
+        print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
         sys.exit(1)
 
     # Resolve --exclude paths relative to the target directory
     exclude_dirs: Set[str] = set()
     for exc in args.exclude:
         if os.path.isabs(exc):
-            resolved = os.path.realpath(exc)
+            exclude_dirs.add(os.path.realpath(exc))
         else:
-            resolved = os.path.realpath(os.path.join(target_dir, exc))
-        if not os.path.isdir(resolved):
-            print(f"  Warning: --exclude path '{exc}' does not exist or is not a directory, "
-                  "ignoring.", file=sys.stderr)
-        else:
-            exclude_dirs.add(resolved)
+            exclude_dirs.add(os.path.realpath(os.path.join(target_dir, exc)))
     args.exclude_dirs = exclude_dirs
 
     db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
     db_path = args.db or os.path.join(target_dir, db_name)
-
-    # Validate --db path: parent directory must exist
-    if args.db:
-        db_parent = os.path.dirname(os.path.realpath(args.db))
-        if not os.path.isdir(db_parent):
-            print(f"Error: Parent directory for --db does not exist: {db_parent}\n"
-                  "Usage: --db PATH    Custom database path (default: inside target dir).\n"
-                  "       The parent directory must already exist.\n"
-                  f"       Example: rotbyte --db /path/to/checksums.db {args.path}",
-                  file=sys.stderr)
-            sys.exit(1)
-
-    # Validate --accept early: must not be a directory
-    if args.accept and os.path.isdir(os.path.realpath(args.accept)):
-        print(f"Error: --accept target '{args.accept}' is a directory, not a file.\n"
-              "Usage: --accept FILE    Accept a single file's current state as baseline.\n"
-              "       To accept all files at once, use --accept-all instead.\n"
-              "       Example: rotbyte --accept movie.mkv",
-              file=sys.stderr)
-        sys.exit(1)
-
     lock_path = db_path + ".lock"
 
     # --track doesn't need the database or lock — it just generates config
-    if args.untrack:
-        _run_untrack(target_dir)
-        return
-
     if args.track:
         try:
             every_seconds = parse_duration(args.every)
         except ValueError as e:
-            print(f"Error: --every: {e}\n"
-                  "Usage: --every INTERVAL    Quick-scan frequency (e.g. 30m, 2h, 1h30m).\n"
-                  "       Default: 60m.",
-                  file=sys.stderr)
+            print(f"Error: --every: {e}", file=sys.stderr)
             sys.exit(1)
 
         full_at_times = None
@@ -1408,11 +1451,7 @@ Exit codes:
                 try:
                     full_at_times.append(parse_clock_time(t))
                 except ValueError as e:
-                    print(f"Error: --full-at: {e}\n"
-                          "Usage: --full-at TIME [TIME ...]    Daily clock times for full scans.\n"
-                          "       Use 24h format, e.g. 2h, 14h, 14h30m.\n"
-                          "       Example: rotbyte --track --full-at 2h 14h /Volumes/Media",
-                          file=sys.stderr)
+                    print(f"Error: --full-at: {e}", file=sys.stderr)
                     sys.exit(1)
 
         rotbyte_exe = _find_rotbyte_executable()
@@ -1420,7 +1459,9 @@ Exit codes:
         track_workers = args.workers if args.workers != (os.cpu_count() or 4) else None
         _run_track(target_dir, every_seconds, full_at_times,
                    args.budget_seconds, rotbyte_exe, workers=track_workers,
-                   due_days=args.due_days, notify=args.notify)
+                   due_days=args.due_days, notify=args.notify,
+                   auto_export=args.auto_export,
+                   run_on_battery=args.run_on_battery)
         return
 
     # Acquire file lock to prevent concurrent runs
@@ -1439,25 +1480,44 @@ Exit codes:
 def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     """Core logic, called with the file lock held."""
 
-    # Open or create the database, catching corruption at connect time
+    # Open or create the database, catching corruption at connect time.
+    # Integrity failures at open or via PRAGMA exit with code 4 so that
+    # automation can distinguish a corrupted tripwire from normal findings.
     try:
         db = ChecksumDB(db_path)
     except sqlite3.DatabaseError as e:
-        print(f"Error: Could not open database — {e}\n"
-              f"  Path: {db_path}\n"
-              "  The database file may be corrupt or not a valid SQLite file.\n"
-              "  Restore from backup or delete to start fresh.\n"
-              "  Use --db to specify an alternative database path.",
-              file=sys.stderr)
-        sys.exit(1)
+        print(f"Error: Could not open database — {e}", file=sys.stderr)
+        print(f"  Path: {db_path}", file=sys.stderr)
+        print("  The database file appears corrupt.", file=sys.stderr)
+        print("  Recovery options:", file=sys.stderr)
+        print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
+        print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
+        print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
+        sys.exit(4)
 
-    # Catch subtler corruption that doesn't prevent opening
+    # Catch subtler corruption that doesn't prevent opening. Runs on every
+    # invocation — PRAGMA quick_check is milliseconds even on large DBs.
     if not db.verify_integrity():
         print("Error: Database failed integrity check.", file=sys.stderr)
         print(f"  Path: {db_path}", file=sys.stderr)
-        print("  Restore from backup or delete to start fresh.", file=sys.stderr)
+        print("  The database is internally inconsistent.", file=sys.stderr)
+        print("  Recovery options:", file=sys.stderr)
+        print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
+        print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
+        print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
         db.close()
-        sys.exit(1)
+        sys.exit(4)
+
+    # Informational one-liner when the DB lives on a different volume than
+    # the data it tracks — the recommended durability pattern. Silent when
+    # they share a volume (no nagging users on default layouts). Suppressed
+    # in quiet and JSON modes.
+    if not getattr(args, "quiet", False) and not getattr(args, "json_output", False):
+        try:
+            if os.stat(target_dir).st_dev != os.stat(db_path).st_dev:
+                print("  DB on separate volume: ✓")
+        except OSError:
+            pass
 
     # ── Dispatch to the requested mode ─────────────────────────────────
     if args.report:
@@ -1477,6 +1537,11 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
 
     if args.accept:
         _run_accept_one(db, target_dir, args.accept)
+        db.close()
+        return
+
+    if args.verify_file:
+        _run_verify_file(db, args.verify_file)
         db.close()
         return
 
@@ -1501,17 +1566,44 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         print("\n\n  Interrupt received — finishing current batch and saving progress...")
         print("  Press Ctrl-C again to abort immediately.\n")
 
+    # SIGTERM is POSIX-only; Windows delivers CTRL_BREAK_EVENT etc. instead.
+    # We register SIGINT everywhere and SIGTERM only where it exists.
     prev_sigint = signal.getsignal(signal.SIGINT)
-    prev_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    prev_sigterm = None
+    if not _IS_WINDOWS:
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         _run_phases(db, target_dir, args, interrupted)
     finally:
         signal.signal(signal.SIGINT, prev_sigint)
-        signal.signal(signal.SIGTERM, prev_sigterm)
+        if not _IS_WINDOWS and prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
         db.close()
+
+
+def _auto_export_manifest(db: "ChecksumDB", manifest_path: str,
+                          args: argparse.Namespace) -> None:
+    """Write a b2sum-compatible manifest of all non-MISSING tracked files.
+
+    Same format as --export but written automatically next to the DB.
+    Uses atomic write (tmp file + rename) so a crash mid-export doesn't
+    leave a truncated manifest in place of a valid one.
+    """
+    records = db.all_records()
+    tmp_path = manifest_path + ".tmp"
+    count = 0
+    with open(tmp_path, "w") as f:
+        for r in records:
+            if r["status"] == "MISSING":
+                continue
+            f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
+            count += 1
+    os.replace(tmp_path, manifest_path)
+    if not getattr(args, "quiet", False) and not getattr(args, "json_output", False):
+        print(f"  ✓ Auto-exported {count:,} checksums to {manifest_path}")
 
 
 # ── Export mode ─────────────────────────────────────────────────────────────────
@@ -1525,17 +1617,7 @@ def _run_export(db: ChecksumDB, export_path: str):
     """
     records = db.all_records()
     if not records:
-        print("Error: Database is empty — nothing to export.\n"
-              "Usage: --export FILE    Export a b2sum-compatible manifest of all tracked checksums.\n"
-              "       Run a scan first so there are files in the database to export.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    if os.path.isdir(export_path):
-        print(f"Error: '{export_path}' is a directory.\n"
-              "Usage: --export FILE    Export checksums to a file, not a directory.\n"
-              "       Example: rotbyte --export checksums.txt",
-              file=sys.stderr)
+        print("  Database is empty — nothing to export.", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -1545,10 +1627,7 @@ def _run_export(db: ChecksumDB, export_path: str):
                     continue
                 f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
     except OSError as e:
-        print(f"Error: Could not write to {export_path} — {e}\n"
-              "Usage: --export FILE    The path must be writable.\n"
-              "       Example: rotbyte --export /tmp/checksums.txt",
-              file=sys.stderr)
+        print(f"Error: Could not write to {export_path} — {e}", file=sys.stderr)
         sys.exit(1)
 
     exported = sum(1 for r in records if r["status"] != "MISSING")
@@ -1708,11 +1787,7 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
 
     status = db.get_file_status(file_path)
     if status is None:
-        print(f"Error: '{file_arg}' is not tracked in the database.\n"
-              "Usage: --accept FILE    Accept a file's current state as the new baseline.\n"
-              "       The file must already be tracked by rotbyte (status MISSING or FAILED).\n"
-              "       Run rotbyte --report to see which files need attention.",
-              file=sys.stderr)
+        print(f"  '{file_arg}' is not tracked in the database.", file=sys.stderr)
         sys.exit(1)
 
     if status == "MISSING":
@@ -1721,11 +1796,7 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
 
     elif status == "FAILED":
         if not os.path.isfile(file_path):
-            print(f"Error: File not found on disk: {file_path}\n"
-                  "Usage: --accept FILE    Re-hash and accept a FAILED file as the new baseline.\n"
-                  "       The file must exist on disk so rotbyte can compute its new checksum.\n"
-                  "       Restore the file from backup first, then run --accept again.",
-                  file=sys.stderr)
+            print(f"  File not found on disk: {file_path}", file=sys.stderr)
             sys.exit(1)
 
         _, digest, h_size, h_mtime = hash_file(file_path)
@@ -1738,6 +1809,75 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
 
     else:
         print(f"  '{file_arg}' has status '{status}' — nothing to accept.")
+
+
+def _discover_db_for_file(file_arg: str) -> str:
+    """Discover the rotbyte database for a given file path.
+
+    Search order:
+    1. Current working directory for .{dirname}_checksums.db
+    2. Each ancestor directory of the file, checking for .{dirname}_checksums.db
+
+    Returns the database path, or exits with an error if none is found.
+    """
+    # 1. Check current working directory
+    cwd = os.getcwd()
+    cwd_db = os.path.join(cwd, "." + os.path.basename(cwd) + DB_FILENAME_SUFFIX)
+    if os.path.isfile(cwd_db):
+        return cwd_db
+
+    # 2. Walk up from the file's resolved location
+    search_dir = os.path.dirname(os.path.realpath(file_arg))
+    while True:
+        candidate = os.path.join(
+            search_dir, "." + os.path.basename(search_dir) + DB_FILENAME_SUFFIX
+        )
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(search_dir)
+        if parent == search_dir:
+            break  # reached filesystem root
+        search_dir = parent
+
+    print(f"Error: No rotbyte database found for '{file_arg}'.", file=sys.stderr)
+    print("  Run 'rotbyte <directory>' first to create a database.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _run_verify_file(db: ChecksumDB, file_arg: str):
+    """Verify a single file's integrity against the database.
+
+    Looks up the file by its absolute path, hashes it, and compares against
+    the stored baseline_checksum (the known-good hash).
+
+    Exit codes: 0 = OK, 2 = checksum mismatch, 1 = error (not tracked, not found, read error).
+    """
+    file_path = os.path.realpath(file_arg)
+    now = _now()
+
+    record = db.get_file_record(file_path)
+    if record is None:
+        print(f"  '{file_arg}' is not tracked in the database.", file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.isfile(file_path):
+        print(f"  File not found on disk: {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    _, digest, _h_size, _h_mtime = hash_file(file_path)
+    if digest is None:
+        print("  Error reading file.", file=sys.stderr)
+        sys.exit(1)
+
+    baseline = record["baseline_checksum"]
+    if digest == baseline:
+        db.update_last_verified(file_path, now)
+        print(f"  ✓ OK: {file_path}")
+    else:
+        print(f"  ✗ FAILED: {file_path}", file=sys.stderr)
+        print(f"    Expected : {baseline}", file=sys.stderr)
+        print(f"    Got      : {digest}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _run_accept_all(db: ChecksumDB, target_dir: str):
@@ -1952,22 +2092,28 @@ def _run_track(target_dir: str, every_seconds: int,
                rotbyte_exe: str,
                workers: Optional[int] = None,
                due_days: Optional[int] = None,
-               notify: Optional[str] = None):
+               notify: Optional[str] = None,
+               auto_export: bool = False,
+               run_on_battery: bool = False):
     """Install platform-native scheduled tasks for rotbyte.
 
-    On macOS: launchd plists in ~/Library/LaunchAgents/
-    On Linux: systemd user timer/service pairs in ~/.config/systemd/user/
+    On macOS:   launchd plists in ~/Library/LaunchAgents/
+    On Linux:   systemd user timer/service pairs in ~/.config/systemd/user/
+    On Windows: Task Scheduler tasks under \\rotbyte\\ (user-level).
     """
     is_mac = _platform.system() == "Darwin"
     is_linux = _platform.system() == "Linux"
+    is_windows = _platform.system() == "Windows"
 
-    if not is_mac and not is_linux:
-        print(f"Error: --track is not supported on {_platform.system()}.\n"
-              "Usage: --track installs scheduled scans via launchd (macOS) or systemd (Linux).\n"
-              "       Your current platform is not supported for automatic scheduling.",
+    if not is_mac and not is_linux and not is_windows:
+        print(f"Error: --track is not supported on {_platform.system()}.", file=sys.stderr)
+        print("  Supported platforms: macOS (launchd), Linux (systemd), Windows (Task Scheduler).",
               file=sys.stderr)
-        print("  Supported platforms: macOS (launchd) and Linux (systemd).", file=sys.stderr)
         sys.exit(1)
+
+    if run_on_battery and not is_windows:
+        # Silent on non-Windows — flag is platform-specific but permissive.
+        pass
 
     dhash = _dir_hash(target_dir)
 
@@ -1977,12 +2123,17 @@ def _run_track(target_dir: str, every_seconds: int,
     # --workers passthrough (only when explicitly set)
     workers_args = ["--workers", str(workers)] if workers is not None else []
     notify_args = ["--notify", notify] if notify else []
+    # --auto-export is a bare flag that persists in the scheduled command
+    # so each future run re-exports the manifest after a full --check.
+    auto_export_args = ["--auto-export"] if auto_export else []
 
     # Build the commands that will be scheduled
-    quick_cmd = exe_parts + workers_args + notify_args + ["--quiet", target_dir]
+    quick_cmd = (exe_parts + workers_args + notify_args + auto_export_args
+                 + ["--scheduled", "--quiet", target_dir])
     full_cmd = None
     if full_at:
-        full_cmd = exe_parts + ["--check", "--quiet"] + workers_args + notify_args
+        full_cmd = (exe_parts + ["--check", "--quiet"] + workers_args + notify_args
+                    + auto_export_args + ["--scheduled"])
         if due_days:
             full_cmd += ["--due", f"{due_days}d"]
         if budget_seconds:
@@ -2015,16 +2166,30 @@ def _run_track(target_dir: str, every_seconds: int,
         print(f"  Workers    : {workers}")
     if notify:
         print(f"  Notify     : {notify}")
-    print(f"  Platform   : {'macOS (launchd)' if is_mac else 'Linux (systemd)'}")
+    if auto_export:
+        print(f"  Manifest   : auto-exported after each full scan")
+    if is_windows:
+        plat_label = "Windows (Task Scheduler)"
+    elif is_mac:
+        plat_label = "macOS (launchd)"
+    else:
+        plat_label = "Linux (systemd)"
+    print(f"  Platform   : {plat_label}")
+    if is_windows:
+        print(f"  On battery : {'allowed' if run_on_battery else 'skip (default)'}")
     print("═" * 60)
     print()
 
     if is_mac:
         _install_launchd(target_dir, dhash, quick_cmd, every_seconds,
                          full_cmd, full_at)
-    else:
+    elif is_linux:
         _install_systemd(target_dir, dhash, quick_cmd, every_seconds,
                          full_cmd, full_at)
+    else:
+        _install_schtasks(target_dir, dhash, quick_cmd, every_seconds,
+                          full_cmd, full_at, budget_seconds=budget_seconds,
+                          run_on_battery=run_on_battery)
 
     print()
     print("═" * 60)
@@ -2035,10 +2200,17 @@ def _run_track(target_dir: str, every_seconds: int,
         print(f"    /tmp/com.rotbyte.quick.{dhash}.log")
         if full_at:
             print(f"    /tmp/com.rotbyte.full.{dhash}.log")
-    else:
+    elif is_linux:
         print(f"    journalctl --user -u rotbyte-quick-{dhash}")
         if full_at:
             print(f"    journalctl --user -u rotbyte-full-{dhash}")
+    else:
+        log_dir = os.path.join(os.environ.get("LOCALAPPDATA",
+                               os.path.expanduser("~")), "rotbyte", "logs")
+        print(f"    {os.path.join(log_dir, f'quick-{dhash}.log')}")
+        if full_at:
+            print(f"    {os.path.join(log_dir, f'full-{dhash}.log')}")
+        print("    (also visible in Task Scheduler → Task History)")
     print("═" * 60)
 
 
@@ -2129,144 +2301,274 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
         print(f"  ✓ Installed: {full_name}.timer + .service")
 
 
-# ── Untrack mode (scheduler removal) ───────────────────────────────────────────
+# ── Windows Task Scheduler install ─────────────────────────────────────────────
 
-def _run_untrack(target_dir: str):
-    """Remove all scheduled scans for a single directory."""
-    is_mac = _platform.system() == "Darwin"
-    is_linux = _platform.system() == "Linux"
-
-    if not is_mac and not is_linux:
-        print(f"Error: --untrack is not supported on {_platform.system()}.\n"
-              "Usage: --untrack removes scheduled scans for a directory.\n"
-              "       Only supported on macOS (launchd) and Linux (systemd).",
-              file=sys.stderr)
-        sys.exit(1)
-
-    dhash = _dir_hash(target_dir)
-    removed = _remove_scheduled(dhash, is_mac)
-
-    print("═" * 60)
-    print("  rotbyte — Removing scheduled scans")
-    print("═" * 60)
-    print(f"  Directory : {target_dir}")
-    print()
-
-    if removed:
-        for path in removed:
-            print(f"  ✓ Removed: {path}")
-    else:
-        print("  No scheduled scans found for this directory.")
-
-    print()
-    print("═" * 60)
+def _xml_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&apos;"))
 
 
-def _run_untrack_all():
-    """Remove all scheduled scans for every tracked directory."""
-    is_mac = _platform.system() == "Darwin"
-    is_linux = _platform.system() == "Linux"
+def _generate_task_xml(description: str, command: List[str],
+                       triggers_xml: str, run_on_battery: bool,
+                       execution_time_limit: Optional[str] = None) -> str:
+    """Generate a Windows Task Scheduler XML definition.
 
-    if not is_mac and not is_linux:
-        print(f"Error: --untrack-all is not supported on {_platform.system()}.\n"
-              "Usage: --untrack-all removes all scheduled scans for every tracked directory.\n"
-              "       Only supported on macOS (launchd) and Linux (systemd).",
-              file=sys.stderr)
-        sys.exit(1)
-
-    # Discover all rotbyte config files and extract their hashes
-    hashes = _discover_all_hashes(is_mac)
-
-    print("═" * 60)
-    print("  rotbyte — Removing all scheduled scans")
-    print("═" * 60)
-    print()
-
-    if not hashes:
-        print("  No scheduled scans found.")
-        print()
-        print("═" * 60)
-        return
-
-    total_removed: List[str] = []
-    for dhash in hashes:
-        removed = _remove_scheduled(dhash, is_mac)
-        total_removed.extend(removed)
-
-    if total_removed:
-        for path in total_removed:
-            print(f"  ✓ Removed: {path}")
-    else:
-        print("  No scheduled scans found.")
-
-    print()
-    print("═" * 60)
-
-
-def _discover_all_hashes(is_mac: bool) -> Set[str]:
-    """Find all unique rotbyte scheduler hashes installed on the system."""
-    hashes: Set[str] = set()
-    if is_mac:
-        agents_dir = os.path.expanduser("~/Library/LaunchAgents")
-        for path in _glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist")):
-            # com.rotbyte.quick.HASH.plist or com.rotbyte.full.HASH.plist
-            basename = os.path.basename(path)
-            parts = basename.replace(".plist", "").split(".")
-            if len(parts) >= 4:
-                hashes.add(parts[3])
-    else:
-        unit_dir = os.path.expanduser("~/.config/systemd/user")
-        for path in _glob.glob(os.path.join(unit_dir, "rotbyte-*.service")):
-            # rotbyte-quick-HASH.service or rotbyte-full-HASH.service
-            basename = os.path.basename(path).replace(".service", "")
-            # Split on first two hyphens: rotbyte, quick/full, HASH
-            parts = basename.split("-", 2)
-            if len(parts) >= 3:
-                hashes.add(parts[2])
-    return hashes
-
-
-def _remove_scheduled(dhash: str, is_mac: bool) -> List[str]:
-    """Remove all scheduled scan configs for a given directory hash.
-
-    Returns list of removed file paths.
+    `triggers_xml` is a <Triggers>...</Triggers> block the caller assembles
+    (interval-based for quick scans, calendar-based for full scans).
+    `execution_time_limit` is an ISO 8601 duration like "PT2H" that maps
+    directly to --budget for full scans.
     """
-    removed: List[str] = []
+    if not command:
+        raise ValueError("command must not be empty")
+    program = _xml_escape(command[0])
+    arguments = _xml_escape(_quote_windows_args(command[1:])) if len(command) > 1 else ""
+    desc = _xml_escape(description)
+    author = _xml_escape(os.environ.get("USERNAME", "rotbyte"))
+    # Default: stop after 24 hours of runtime even if the task never finished,
+    # to avoid stuck tasks blocking the next schedule. Full scans override via
+    # execution_time_limit when --budget is set.
+    time_limit = execution_time_limit or "PT24H"
+    battery_flags = (
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        if run_on_battery else
+        "    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>\n"
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo>\n'
+        f'    <Description>{desc}</Description>\n'
+        f'    <Author>{author}</Author>\n'
+        '    <URI>\\rotbyte\\' + _xml_escape(description) + '</URI>\n'
+        '  </RegistrationInfo>\n'
+        f'  {triggers_xml}\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <LogonType>InteractiveToken</LogonType>\n'
+        '      <RunLevel>LeastPrivilege</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        + battery_flags +
+        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
+        '    <Enabled>true</Enabled>\n'
+        '    <Hidden>false</Hidden>\n'
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n'
+        '    <WakeToRun>false</WakeToRun>\n'
+        f'    <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>\n'
+        '    <Priority>7</Priority>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec>\n'
+        f'      <Command>{program}</Command>\n'
+        + (f'      <Arguments>{arguments}</Arguments>\n' if arguments else '') +
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n'
+    )
 
-    if is_mac:
-        agents_dir = os.path.expanduser("~/Library/LaunchAgents")
-        for kind in ("quick", "full"):
-            label = f"com.rotbyte.{kind}.{dhash}"
-            plist_path = os.path.join(agents_dir, f"{label}.plist")
-            if os.path.isfile(plist_path):
-                _subprocess.run(["launchctl", "unload", plist_path],
-                                capture_output=True)
-                os.unlink(plist_path)
-                removed.append(plist_path)
-    else:
-        unit_dir = os.path.expanduser("~/.config/systemd/user")
-        for kind in ("quick", "full"):
-            name = f"rotbyte-{kind}-{dhash}"
-            timer_path = os.path.join(unit_dir, f"{name}.timer")
-            service_path = os.path.join(unit_dir, f"{name}.service")
 
-            if os.path.isfile(timer_path):
-                _subprocess.run(
-                    ["systemctl", "--user", "disable", "--now", f"{name}.timer"],
-                    capture_output=True,
-                )
-                os.unlink(timer_path)
-                removed.append(timer_path)
+def _quote_windows_args(args: List[str]) -> str:
+    """Quote a list of arguments for a Windows <Arguments> element.
 
-            if os.path.isfile(service_path):
-                os.unlink(service_path)
-                removed.append(service_path)
+    Uses the CommandLineToArgvW convention: wrap in double quotes any
+    argument that contains a space or double quote, and escape embedded
+    quotes by doubling backslashes + quote.
+    """
+    out = []
+    for a in args:
+        if not a:
+            out.append('""')
+            continue
+        needs_quote = any(c in a for c in ' \t"')
+        if not needs_quote:
+            out.append(a)
+            continue
+        # Escape per MS rules
+        escaped = a.replace("\\", "\\\\").replace('"', '\\"')
+        out.append(f'"{escaped}"')
+    return " ".join(out)
 
-        if removed:
-            _subprocess.run(["systemctl", "--user", "daemon-reload"],
-                            capture_output=True)
 
-    return removed
+def _iso_duration(seconds: int) -> str:
+    """Convert seconds to ISO 8601 duration (e.g. PT2H, PT30M, PT1H30M)."""
+    hours, rem = divmod(max(seconds, 0), 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}H")
+    if minutes:
+        parts.append(f"{minutes}M")
+    if secs and not (hours or minutes):
+        parts.append(f"{secs}S")
+    return "PT" + ("".join(parts) if parts else "1M")
+
+
+def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
+                      every_seconds: int, full_cmd: Optional[List[str]],
+                      full_at: Optional[List[Tuple[int, int]]],
+                      budget_seconds: Optional[int] = None,
+                      run_on_battery: bool = False):
+    """Register Windows Task Scheduler tasks under \\rotbyte\\.
+
+    Uses `schtasks.exe /Create /XML` so the full richness of the task
+    definition (ExecutionTimeLimit, battery policy, StartWhenAvailable)
+    is preserved. Requires no elevated privileges for user-level tasks.
+    """
+    import tempfile
+
+    tasks_dir = os.path.join(os.environ.get("LOCALAPPDATA",
+                             os.path.expanduser("~")), "rotbyte", "tasks")
+    os.makedirs(tasks_dir, exist_ok=True)
+
+    # ── Quick scan ─────────────────────────────────────────────────────
+    quick_name = f"rotbyte-quick-{dhash}"
+    quick_path = f"\\rotbyte\\{quick_name}"
+    interval_iso = _iso_duration(every_seconds)
+    # Start trigger a minute from now so the task has a concrete StartBoundary.
+    start = datetime.now().replace(microsecond=0).isoformat()
+    quick_triggers = (
+        '<Triggers>\n'
+        '    <TimeTrigger>\n'
+        f'      <StartBoundary>{start}</StartBoundary>\n'
+        '      <Enabled>true</Enabled>\n'
+        '      <Repetition>\n'
+        f'        <Interval>{interval_iso}</Interval>\n'
+        '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
+        '      </Repetition>\n'
+        '    </TimeTrigger>\n'
+        '  </Triggers>'
+    )
+    quick_xml = _generate_task_xml(
+        f"rotbyte quick scan ({target_dir})", quick_cmd,
+        quick_triggers, run_on_battery,
+    )
+    quick_xml_path = os.path.join(tasks_dir, f"{quick_name}.xml")
+    # schtasks expects UTF-16-LE with BOM for /XML input.
+    with open(quick_xml_path, "wb") as f:
+        f.write(quick_xml.encode("utf-16"))
+
+    _subprocess.run(
+        ["schtasks.exe", "/Create", "/TN", quick_path, "/XML", quick_xml_path, "/F"],
+        check=True,
+    )
+    print(f"  ✓ Installed: {quick_path}")
+
+    # ── Full scan ──────────────────────────────────────────────────────
+    if full_cmd and full_at:
+        full_name = f"rotbyte-full-{dhash}"
+        full_task_path = f"\\rotbyte\\{full_name}"
+        # Multiple CalendarTrigger blocks, one per clock time.
+        trigger_parts = ['<Triggers>']
+        for hh, mm in full_at:
+            today = datetime.now().date()
+            sb = f"{today.isoformat()}T{hh:02d}:{mm:02d}:00"
+            trigger_parts.append(
+                '    <CalendarTrigger>\n'
+                f'      <StartBoundary>{sb}</StartBoundary>\n'
+                '      <Enabled>true</Enabled>\n'
+                '      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n'
+                '    </CalendarTrigger>'
+            )
+        trigger_parts.append('  </Triggers>')
+        full_triggers = "\n".join(trigger_parts)
+        # Map --budget to ExecutionTimeLimit so the task auto-stops when
+        # the budget is exhausted, matching launchd/systemd behavior.
+        limit = _iso_duration(budget_seconds) if budget_seconds else None
+        full_xml = _generate_task_xml(
+            f"rotbyte full scan ({target_dir})", full_cmd,
+            full_triggers, run_on_battery, execution_time_limit=limit,
+        )
+        full_xml_path = os.path.join(tasks_dir, f"{full_name}.xml")
+        with open(full_xml_path, "wb") as f:
+            f.write(full_xml.encode("utf-16"))
+        _subprocess.run(
+            ["schtasks.exe", "/Create", "/TN", full_task_path, "/XML", full_xml_path, "/F"],
+            check=True,
+        )
+        print(f"  ✓ Installed: {full_task_path}")
+
+
+def _discover_schtasks() -> Dict[str, Dict]:
+    """Query Task Scheduler for installed rotbyte tasks.
+
+    Parses `schtasks /Query /XML` output to reconstruct per-directory
+    schedule info for --status.
+    """
+    try:
+        result = _subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", "\\rotbyte\\", "/XML"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return {}
+    if result.returncode != 0 or not result.stdout:
+        return {}
+
+    # Output is a concatenated series of Task XML docs. Split on the
+    # XML prolog to recover each one.
+    import re
+    docs = [d for d in re.split(r'(?=<\?xml )', result.stdout) if d.strip()]
+    import xml.etree.ElementTree as ET
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+    found: Dict[str, Dict] = {}
+    for doc in docs:
+        try:
+            root = ET.fromstring(doc)
+        except ET.ParseError:
+            continue
+        desc_el = root.find("t:RegistrationInfo/t:Description", ns)
+        desc = desc_el.text if desc_el is not None and desc_el.text else ""
+        # Description format: "rotbyte quick scan (TARGET)" / "rotbyte full scan (TARGET)"
+        m = re.match(r"rotbyte (quick|full) scan \((.+)\)", desc)
+        if not m:
+            continue
+        kind, target = m.group(1), m.group(2)
+        entry = found.setdefault(target, {"target_dir": target, "platform": "windows"})
+        if kind == "quick":
+            interval_el = root.find(
+                "t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", ns)
+            entry["quick_interval"] = _parse_iso_duration(interval_el.text) if interval_el is not None else None
+        else:
+            times = []
+            for ct in root.findall("t:Triggers/t:CalendarTrigger", ns):
+                sb = ct.find("t:StartBoundary", ns)
+                if sb is None or not sb.text:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(sb.text)
+                    times.append((dt.hour, dt.minute))
+                except ValueError:
+                    continue
+            entry["full_at"] = times
+            limit_el = root.find("t:Settings/t:ExecutionTimeLimit", ns)
+            if limit_el is not None and limit_el.text:
+                entry["budget"] = _parse_iso_duration(limit_el.text)
+    return found
+
+
+def _parse_iso_duration(s: Optional[str]) -> Optional[int]:
+    """Parse an ISO 8601 duration (PT2H30M) into seconds. Best-effort."""
+    if not s or not s.startswith("PT"):
+        return None
+    import re
+    total = 0
+    for num, unit in re.findall(r"(\d+)([HMS])", s[2:]):
+        n = int(num)
+        if unit == "H":
+            total += n * 3600
+        elif unit == "M":
+            total += n * 60
+        elif unit == "S":
+            total += n
+    return total or None
 
 
 # ── Status mode ────────────────────────────────────────────────────────────────
@@ -2282,16 +2584,17 @@ def _run_status():
     """
     is_mac = _platform.system() == "Darwin"
     is_linux = _platform.system() == "Linux"
+    is_windows = _platform.system() == "Windows"
 
-    if not is_mac and not is_linux:
-        print(f"Error: --status is not supported on {_platform.system()}.\n"
-              "Usage: --status shows the state of all scheduled scans and file health.\n"
-              "       Only supported on macOS (launchd) and Linux (systemd).",
-              file=sys.stderr)
+    if not is_mac and not is_linux and not is_windows:
+        print(f"Error: --status is not supported on {_platform.system()}.", file=sys.stderr)
         sys.exit(1)
 
     # Discover all tracked directories grouped by hash
-    tracked = _discover_tracked(is_mac)
+    if is_windows:
+        tracked = _discover_schtasks()
+    else:
+        tracked = _discover_tracked(is_mac)
 
     if not tracked:
         print("  No scheduled scans found.")
@@ -2382,6 +2685,18 @@ def _run_status():
                         print(f"      ⚠ {ff['file_path']}")
                     if len(failed_list) > 5:
                         print(f"      ... and {len(failed_list) - 5} more")
+
+            # Show verification freshness when --due is configured
+            due_str = info.get("full", {}).get("due")
+            if due_str:
+                try:
+                    due_days = parse_days(due_str)
+                    total, verified, due_count = db.freshness_stats(target_dir, due_days)
+                    pct = (verified / total * 100) if total else 0.0
+                    print(f"    Fresh : {verified:,} / {total:,} files verified within {due_str} window ({pct:.1f}%)")
+                    print(f"            {due_count:,} files due for re-verification")
+                except ValueError:
+                    pass
         finally:
             db.close()
 
@@ -2573,26 +2888,136 @@ def _load_notify_config() -> configparser.ConfigParser:
     """Load and return the notification config, or exit with an error."""
     path = _notify_config_path()
     if not os.path.isfile(path):
-        print(f"Error: No notification config found at {path}\n"
-              "Usage: Run `rotbyte --notify-setup email` first to configure SMTP credentials.\n"
-              "       Then use --notify email on subsequent scans to enable alerts.",
-              file=sys.stderr)
+        print(f"Error: No notification config found at {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
         sys.exit(1)
     config = configparser.ConfigParser()
     config.read(path)
     if "email" not in config:
-        print(f"Error: No [email] section in {path}\n"
-              "Usage: Run `rotbyte --notify-setup email` to reconfigure from scratch.",
-              file=sys.stderr)
+        print(f"Error: No [email] section in {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
         sys.exit(1)
     for key in ("smtp_host", "smtp_port", "username", "password", "to"):
         if key not in config["email"]:
-            print(f"Error: Missing '{key}' in [email] section of {path}\n"
-                  "Usage: Run `rotbyte --notify-setup email` to reconfigure.\n"
-                  f"       The config file requires: smtp_host, smtp_port, username, password, to.",
-                  file=sys.stderr)
+            print(f"Error: Missing '{key}' in [email] section of {path}", file=sys.stderr)
+            print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
             sys.exit(1)
     return config
+
+
+def _run_track_setup(path_arg: str):
+    """Interactive setup wizard for --track.
+
+    Collects the same inputs --track accepts as flags, validating each with
+    the existing parsers, then calls _run_track() to perform the actual
+    platform install. No install logic is duplicated here.
+    """
+    print("═" * 60)
+    print("  rotbyte — Scheduled scan setup")
+    print("═" * 60)
+    print()
+    print("  This wizard installs scheduled scans via launchd (macOS)")
+    print("  or systemd (Linux). Press Ctrl-C at any prompt to abort.")
+    print()
+
+    # 1. Target directory
+    default_dir = os.path.realpath(path_arg)
+    raw = input(f"  Directory to scan [{default_dir}]: ").strip()
+    target_dir = os.path.realpath(raw) if raw else default_dir
+    if not os.path.isdir(target_dir):
+        print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    # 2. Quick scan frequency
+    while True:
+        raw = input("  Quick scan frequency [60m]: ").strip() or "60m"
+        try:
+            every_seconds = parse_duration(raw)
+            every_display = raw
+            break
+        except ValueError as e:
+            print(f"  Invalid duration: {e}")
+
+    # 3. Full scan clock times (optional)
+    full_at_times: Optional[List[Tuple[int, int]]] = None
+    full_at_display: List[str] = []
+    while True:
+        raw = input("  Full scan clock times, space-separated (e.g. 2h 14h) [none]: ").strip()
+        if not raw:
+            break
+        try:
+            full_at_times = [parse_clock_time(t) for t in raw.split()]
+            full_at_display = raw.split()
+            break
+        except ValueError as e:
+            print(f"  Invalid clock time: {e}")
+
+    # 4. Budget (only meaningful with full scans)
+    budget_seconds: Optional[int] = None
+    budget_display: Optional[str] = None
+    if full_at_times:
+        while True:
+            raw = input("  Time budget per full scan (e.g. 2h) [none]: ").strip()
+            if not raw:
+                break
+            try:
+                budget_seconds = parse_duration(raw)
+                budget_display = raw
+                break
+            except ValueError as e:
+                print(f"  Invalid duration: {e}")
+
+    # 5. Due threshold
+    due_days: Optional[int] = None
+    due_display: Optional[str] = None
+    while True:
+        raw = input("  Re-verify files not checked within (e.g. 30d) [none]: ").strip()
+        if not raw:
+            break
+        try:
+            due_days = parse_days(raw)
+            due_display = raw
+            break
+        except ValueError as e:
+            print(f"  Invalid --due value: {e}")
+
+    # 6. Email notifications (optional)
+    notify: Optional[str] = None
+    raw = input("  Send email on problems? [y/N]: ").strip().lower()
+    if raw in ("y", "yes"):
+        cfg_path = _notify_config_path()
+        if not os.path.exists(cfg_path):
+            print(f"  Email isn't configured yet ({cfg_path} not found).")
+            print("  Run 'rotbyte --notify-setup email' first, then re-run --track-setup.")
+            print("  Continuing without email notifications.")
+        else:
+            notify = "email"
+
+    # 7. Confirmation summary
+    rotbyte_exe = _find_rotbyte_executable()
+    cli_parts = [rotbyte_exe, "--track", "--every", every_display]
+    if full_at_display:
+        cli_parts.extend(["--full-at", *full_at_display])
+    if budget_display:
+        cli_parts.extend(["--budget", budget_display])
+    if due_display:
+        cli_parts.extend(["--due", due_display])
+    if notify:
+        cli_parts.extend(["--notify", notify])
+    cli_parts.append(target_dir)
+
+    print()
+    print("  Equivalent command:")
+    print(f"    {' '.join(cli_parts)}")
+    print()
+    raw = input("  Install? [Y/n]: ").strip().lower()
+    if raw in ("n", "no"):
+        print("  Aborted.")
+        return
+
+    # 8. Install via the existing code path
+    _run_track(target_dir, every_seconds, full_at_times, budget_seconds,
+               rotbyte_exe, workers=None, due_days=due_days, notify=notify)
 
 
 def _run_notify_setup():
@@ -2606,6 +3031,14 @@ def _run_notify_setup():
     print("  See: https://support.google.com/accounts/answer/185833")
     print()
 
+    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
+    if not smtp_host:
+        print("Error: SMTP host is required.", file=sys.stderr)
+        sys.exit(1)
+
+    smtp_port_str = input("  SMTP port [587]: ").strip()
+    smtp_port = int(smtp_port_str) if smtp_port_str else 587
+
     username = input("  Username (your email address): ").strip()
     if not username:
         print("Error: Username is required.", file=sys.stderr)
@@ -2616,21 +3049,9 @@ def _run_notify_setup():
         print("Error: Password is required.", file=sys.stderr)
         sys.exit(1)
 
-    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
-    if not smtp_host:
-        print("Error: SMTP host is required.", file=sys.stderr)
-        sys.exit(1)
-
-    smtp_port_str = input("  SMTP port [587]: ").strip()
-    smtp_port = int(smtp_port_str) if smtp_port_str else 587
-
     to_addr = input(f"  Send alerts to [{username}]: ").strip()
     if not to_addr:
         to_addr = username
-
-    from_addr = input(f"  Send alerts from [{username}]: ").strip()
-    if not from_addr:
-        from_addr = username
 
     # Test the connection
     print()
@@ -2645,9 +3066,9 @@ def _run_notify_setup():
                 "If you received this, email notifications are working correctly.\n"
             )
             msg["Subject"] = "rotbyte: test notification"
-            msg["From"] = from_addr
+            msg["From"] = username
             msg["To"] = to_addr
-            server.sendmail(from_addr, [to_addr], msg.as_string())
+            server.sendmail(username, [to_addr], msg.as_string())
     except Exception as e:
         print(f" failed.\n\n  Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2664,7 +3085,6 @@ def _run_notify_setup():
         "username": username,
         "password": password,
         "to": to_addr,
-        "from": from_addr,
     }
     with open(config_path, "w") as f:
         config.write(f)
@@ -2679,18 +3099,15 @@ def _run_notify_setup():
 
 
 def _send_email_notification(target_dir: str, failed: int, count_missing: int,
-                             failed_files: List[Dict], errors: int = 0,
-                             was_interrupted: bool = False):
-    """Send an email notification about a scan result.
-
-    Four notification states, in priority order:
-      interrupted — scan was cut short by SIGINT/SIGTERM
-      fail        — bit rot or missing files detected
-      warning     — all checksums OK but some files could not be read
-      pass        — full re-verify completed with no problems
+                             failed_files: List[Dict],
+                             freshness: Optional[tuple] = None):
+    """Send an email notification about scan problems.
 
     Best-effort: prints a warning on failure but never prevents the scan
     from completing with its normal exit code.
+
+    freshness, if provided, is a (total, verified_within, due) tuple from
+    ChecksumDB.freshness_stats() and is appended as a summary line.
     """
     try:
         config = _load_notify_config()
@@ -2703,84 +3120,54 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
 
     section = config["email"]
 
-    if was_interrupted:
-        subject = f"rotbyte \u26a0 {target_dir} \u2014 scan interrupted"
-        body = "\n".join([
-            f"rotbyte was interrupted before completing the scan of {target_dir}.\n",
-            "The scan did not finish — some files may not have been verified this run.",
-            "",
-            f"Re-run `rotbyte --check {target_dir}` to complete verification.",
-        ])
+    # Build subject
+    parts = []
+    if failed > 0:
+        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
 
-    elif failed > 0 or count_missing > 0:
-        # Fail: bit rot or missing files detected.
-        parts = []
-        if failed > 0:
-            parts.append(f"{failed} failed")
-        if count_missing > 0:
-            parts.append(f"{count_missing} missing")
-        subject = f"rotbyte \u2717 {target_dir} \u2014 {', '.join(parts)}"
+    # Build body
+    lines = [
+        f"rotbyte detected problems in {target_dir}:\n",
+    ]
+    if failed > 0:
+        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        lines.append(f"  Missing files:    {count_missing}")
+    lines.append("")
 
-        lines = [
-            f"rotbyte detected problems in {target_dir}:\n",
-        ]
-        if failed > 0:
-            lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
-        if count_missing > 0:
-            lines.append(f"  Missing files:    {count_missing}")
+    if failed_files:
+        lines.append("Affected files:")
+        for f in failed_files[:50]:
+            lines.append(f"  ✗ {f['file_path']}")
+        if len(failed_files) > 50:
+            lines.append(f"  ... and {len(failed_files) - 50} more")
         lines.append("")
 
-        if failed_files:
-            lines.append("Affected files:")
-            for f in failed_files[:50]:
-                lines.append(f"  \u2717 {f['file_path']}")
-            if len(failed_files) > 50:
-                lines.append(f"  ... and {len(failed_files) - 50} more")
-            lines.append("")
+    if freshness is not None:
+        f_total, f_verified, f_due = freshness
+        f_pct = (f_verified / f_total * 100) if f_total else 0.0
+        lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} files verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
+        lines.append("")
 
-        lines.append("Run `rotbyte --report` for full details.")
-        lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
-        body = "\n".join(lines)
+    lines.append("Run `rotbyte --report` for full details.")
+    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
 
-    elif errors > 0:
-        # Warning: checksums clean but some files could not be read.
-        subject = (f"rotbyte \u26a0 {target_dir} \u2014 "
-                   f"{errors} read error{'s' if errors != 1 else ''}")
-        body = "\n".join([
-            f"rotbyte completed a full re-verify of {target_dir}.\n",
-            (f"  {errors} file{'s' if errors != 1 else ''} could not be read and "
-             f"{'were' if errors != 1 else 'was'} skipped."),
-            "",
-            "This may indicate a hardware problem, a permissions issue, or a file",
-            "that was in use during the scan. No checksum changes were detected in",
-            "the files that were successfully read.",
-            "",
-            f"Re-run `rotbyte --check {target_dir}` to retry the skipped files.",
-            "Run `rotbyte --report` for full details.",
-        ])
-
-    else:
-        # Pass: full re-verify completed with no problems.
-        subject = f"rotbyte \u2713 {target_dir} \u2014 all files OK"
-        body = "\n".join([
-            f"rotbyte completed a full re-verify of {target_dir}.\n",
-            "All files verified OK \u2014 no bit rot or missing files detected.",
-            "",
-            "Run `rotbyte --report` for full details.",
-        ])
+    body = "\n".join(lines)
 
     try:
         msg = email.mime.text.MIMEText(body)
         msg["Subject"] = subject
-        from_addr = section.get("from", section["username"])
-        msg["From"] = from_addr
+        msg["From"] = section["username"]
         msg["To"] = section["to"]
 
         with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
                           timeout=30) as server:
             server.starttls()
             server.login(section["username"], section["password"])
-            server.sendmail(from_addr, [section["to"]], msg.as_string())
+            server.sendmail(section["username"], [section["to"]], msg.as_string())
     except Exception as e:
         print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)
 
@@ -2870,17 +3257,15 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
 
     # ── Email notification (if configured) ─────────────────────────────
     if args.notify == "email":
-        if getattr(args, "check", False):
-            # Full re-verify: always notify with the appropriate state.
-            failed_details = db.failed_files() if result.failed > 0 else []
-            _send_email_notification(target_dir, result.failed, count_missing,
-                                     failed_details, errors=result.errors,
-                                     was_interrupted=interrupted[0])
+        suppress = getattr(args, "scheduled", False) and not getattr(args, "full_at", None)
+        if suppress:
+            if not quiet:
+                print("  Skipping email notification (scheduled partial scan)")
         elif result.failed > 0 or count_missing > 0:
-            # Quick scan: only notify on problems (fail state).
             failed_details = db.failed_files() if result.failed > 0 else []
+            freshness = db.freshness_stats(target_dir, due_days) if due_days else None
             _send_email_notification(target_dir, result.failed, count_missing,
-                                     failed_details)
+                                     failed_details, freshness=freshness)
 
     if args.json_output:
         likely_moves = 0
@@ -2939,6 +3324,18 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                       f" the checksum of missing files.")
                 print("  This usually means files were renamed or moved.")
                 print("  Run --accept-all to clear, or --report for details.")
+
+    # --auto-export: write the b2sum-compatible manifest before exit so
+    # the independent backup stays fresh after every full --check. Skip
+    # on interrupt (partial manifests would be misleading) and skip on
+    # quick scans (the checksum set hasn't meaningfully changed).
+    if (getattr(args, "auto_export", False) and args.check
+            and not interrupted[0]):
+        manifest_path = db.db_path + ".manifest"
+        try:
+            _auto_export_manifest(db, manifest_path, args)
+        except OSError as e:
+            print(f"  ! auto-export failed: {e}", file=sys.stderr)
 
     if result.failed > 0:
         print()

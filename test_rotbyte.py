@@ -39,12 +39,14 @@ Excludes (not automatable without mocking or real services):
 """
 
 import hashlib
+import io
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 import time
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -1599,3 +1601,1082 @@ class TestExportImportRoundTrip:
         data = _extract_json(out)
         assert data["failed"] == 0
         assert data["verified_ok"] == 4
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 41. --verify-file
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestVerifyFile:
+    def test_verify_ok(self, tmp):
+        """File that matches baseline exits 0 and prints OK."""
+        _run_cli(str(tmp))
+        rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
+        assert rc == 0
+        assert "OK" in out
+
+    def test_verify_mismatch_exit_2(self, tmp):
+        """Bit-rotted file (content changed, same mtime) exits 2."""
+        _run_cli(str(tmp))
+        _corrupt_file(tmp / "a.txt")
+        rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
+        assert rc == 2
+        assert "FAILED" in err
+
+    def test_verify_not_tracked_exit_1(self, tmp):
+        """File that exists on disk but is not in the DB exits 1."""
+        _run_cli(str(tmp))
+        untracked = tmp / "untracked.txt"
+        untracked.write_text("not indexed")
+        rc, out, err = _run_cli("--verify-file", str(untracked), str(tmp))
+        assert rc == 1
+        assert "not tracked" in err
+
+    def test_verify_missing_from_disk_exit_1(self, tmp):
+        """File tracked in DB but deleted from disk exits 1."""
+        _run_cli(str(tmp))
+        (tmp / "a.txt").unlink()
+        rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
+        assert rc == 1
+        assert "not found" in err.lower()
+
+    def test_verify_updates_last_verified(self, tmp, db_path):
+        """Successful verify updates last_verified in the database."""
+        _run_cli(str(tmp))
+        db = rotbyte.ChecksumDB(db_path)
+        file_path = str(os.path.realpath(str(tmp / "a.txt")))
+        before = db.get_file_record(file_path)["last_verified"]
+        db.close()
+
+        time.sleep(1.1)
+        _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
+
+        db = rotbyte.ChecksumDB(db_path)
+        after = db.get_file_record(file_path)["last_verified"]
+        db.close()
+        assert after > before
+
+    def test_discover_db_in_cwd(self, tmp, tmp_path):
+        """DB is found when cwd contains a matching .{dirname}_checksums.db."""
+        # Index from cwd == tmp so the DB is created there
+        _run_cli(str(tmp))
+        # Run --verify-file using cwd=tmp so _discover_db_for_file finds it there
+        rc, out, err = _run_cli("--verify-file", str(tmp / "b.txt"), cwd=str(tmp))
+        assert rc == 0
+        assert "OK" in out
+
+    def test_discover_db_walk_up(self, tmp):
+        """DB is discovered by walking up from a deeply nested file."""
+        _run_cli(str(tmp))
+        deep_file = tmp / "sub" / "d.txt"
+        # cwd is a temp dir that has no DB — forces walk-up from deep_file
+        rc, out, err = _run_cli("--verify-file", str(deep_file), cwd="/tmp")
+        assert rc == 0
+        assert "OK" in out
+
+    def test_discover_db_not_found_exit_1(self, tmp):
+        """No database anywhere in the tree exits 1 with a helpful error."""
+        orphan = tmp / "orphan.txt"
+        orphan.write_text("no db for me")
+        # No prior run, so no DB exists; cwd=/tmp has no DB either
+        rc, out, err = _run_cli("--verify-file", str(orphan), cwd="/tmp")
+        assert rc == 1
+        assert "database" in err.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 42. Freshness stats — ChecksumDB.freshness_stats()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFreshnessStats:
+    def test_all_files_verified_within_window(self, tmp, db_path):
+        """All files just indexed are within any reasonable window."""
+        _run_cli(str(tmp))  # indexes 4 files; sets last_verified = now
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            total, verified, due = db.freshness_stats(str(tmp), 30)
+        finally:
+            db.close()
+        assert total == 4
+        assert verified == 4
+        assert due == 0
+
+    def test_files_past_window_counted_as_due(self, tmp, db_path):
+        """Files with last_verified older than the window appear as due."""
+        _run_cli(str(tmp))
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            # Back-date last_verified for all files by 40 days
+            db.conn.execute(
+                "UPDATE checksums SET last_verified = datetime('now', '-40 days')"
+            )
+            db.conn.commit()
+            total, verified, due = db.freshness_stats(str(tmp), 30)
+        finally:
+            db.close()
+        assert total == 4
+        assert verified == 0
+        assert due == 4
+
+    def test_mixed_freshness(self, tmp, db_path):
+        """Some files within window, others outside."""
+        _run_cli(str(tmp))
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            # Back-date two files by 40 days
+            rows = db.conn.execute(
+                "SELECT file_path FROM checksums ORDER BY file_path LIMIT 2"
+            ).fetchall()
+            for row in rows:
+                db.conn.execute(
+                    "UPDATE checksums SET last_verified = datetime('now', '-40 days') "
+                    "WHERE file_path = ?",
+                    (row["file_path"],),
+                )
+            db.conn.commit()
+            total, verified, due = db.freshness_stats(str(tmp), 30)
+        finally:
+            db.close()
+        assert total == 4
+        assert verified == 2
+        assert due == 2
+
+    def test_missing_files_excluded(self, tmp, db_path):
+        """MISSING files are not counted in freshness stats."""
+        _run_cli(str(tmp))
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            # Mark one file as MISSING
+            db.conn.execute(
+                "UPDATE checksums SET status = 'MISSING' "
+                "WHERE file_path = (SELECT file_path FROM checksums LIMIT 1)"
+            )
+            db.conn.commit()
+            total, verified, due = db.freshness_stats(str(tmp), 30)
+        finally:
+            db.close()
+        assert total == 3  # 4 files minus the 1 MISSING one
+
+    def test_empty_database(self, tmp_path):
+        """freshness_stats on an empty database returns all zeros."""
+        db_name = "." + tmp_path.name + rotbyte.DB_FILENAME_SUFFIX
+        db = rotbyte.ChecksumDB(str(tmp_path / db_name))
+        try:
+            total, verified, due = db.freshness_stats(str(tmp_path), 30)
+        finally:
+            db.close()
+        assert total == 0
+        assert verified == 0
+        assert due == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 43. Freshness stats in --status output
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStatusFreshness:
+    def _make_tracked(self, target_dir: str, due: str) -> dict:
+        """Build a minimal _discover_tracked() return value with --due configured."""
+        return {
+            target_dir: {
+                "quick": {"interval": 3600, "active": True},
+                "full": {
+                    "times": [(2, 0)],
+                    "active": True,
+                    "due": due,
+                    "budget": None,
+                    "workers": None,
+                    "notify": None,
+                },
+            }
+        }
+
+    def test_freshness_shown_when_due_configured(self, tmp, db_path):
+        """--status shows freshness stats when --due is in the tracked config."""
+        _run_cli(str(tmp))  # create database with 4 files verified now
+
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=self._make_tracked(str(tmp), "30d")), \
+             unittest.mock.patch("rotbyte._platform") as mock_plat:
+            mock_plat.system.return_value = "Linux"
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stdout", captured):
+                rotbyte._run_status()
+
+        out = captured.getvalue()
+        assert "Fresh" in out
+        assert "30d window" in out
+        assert "files verified" in out
+        assert "files due for re-verification" in out
+
+    def test_freshness_values_correct(self, tmp, db_path):
+        """Freshness line shows correct counts (all 4 files verified within window)."""
+        _run_cli(str(tmp))
+
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=self._make_tracked(str(tmp), "30d")), \
+             unittest.mock.patch("rotbyte._platform") as mock_plat:
+            mock_plat.system.return_value = "Linux"
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stdout", captured):
+                rotbyte._run_status()
+
+        out = captured.getvalue()
+        assert "4 / 4" in out
+
+    def test_freshness_shows_overdue_count(self, tmp, db_path):
+        """Freshness line shows correct counts when some files are past the window."""
+        _run_cli(str(tmp))  # indexes 4 files with last_verified = now
+
+        # Back-date 2 of the 4 files past the 30-day window
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            rows = db.conn.execute(
+                "SELECT file_path FROM checksums ORDER BY file_path LIMIT 2"
+            ).fetchall()
+            for row in rows:
+                db.conn.execute(
+                    "UPDATE checksums SET last_verified = datetime('now', '-40 days') "
+                    "WHERE file_path = ?",
+                    (row["file_path"],),
+                )
+            db.conn.commit()
+        finally:
+            db.close()
+
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=self._make_tracked(str(tmp), "30d")), \
+             unittest.mock.patch("rotbyte._platform") as mock_plat:
+            mock_plat.system.return_value = "Linux"
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stdout", captured):
+                rotbyte._run_status()
+
+        out = captured.getvalue()
+        assert "2 / 4" in out        # 2 verified, 4 total
+        assert "50.0%" in out        # 2/4 = 50%
+        assert "2 files due" in out  # 2 overdue
+
+    def test_freshness_absent_when_no_due(self, tmp, db_path):
+        """--status does not show freshness section when --due is not configured."""
+        _run_cli(str(tmp))
+
+        tracked = {
+            str(tmp): {
+                "quick": {"interval": 3600, "active": True},
+                "full": {
+                    "times": [(2, 0)],
+                    "active": True,
+                    "budget": None,
+                    "workers": None,
+                    "notify": None,
+                },
+            }
+        }
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=tracked), \
+             unittest.mock.patch("rotbyte._platform") as mock_plat:
+            mock_plat.system.return_value = "Linux"
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stdout", captured):
+                rotbyte._run_status()
+
+        out = captured.getvalue()
+        assert "Fresh" not in out
+        assert "due for re-verification" not in out
+
+    def test_freshness_absent_when_no_full_scan(self, tmp, db_path):
+        """--status does not show freshness when only quick scan is configured."""
+        _run_cli(str(tmp))
+
+        tracked = {
+            str(tmp): {
+                "quick": {"interval": 3600, "active": True},
+            }
+        }
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=tracked), \
+             unittest.mock.patch("rotbyte._platform") as mock_plat:
+            mock_plat.system.return_value = "Linux"
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stdout", captured):
+                rotbyte._run_status()
+
+        out = captured.getvalue()
+        assert "Fresh" not in out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 44. Freshness stats in --notify email body
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNotifyFreshness:
+    def _capture_email_body(self, freshness=None):
+        """Call _send_email_notification with a mocked SMTP and return the body."""
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg["email"] = {
+            "smtp_host": "smtp.example.com",
+            "smtp_port": "587",
+            "username": "user@example.com",
+            "password": "secret",
+            "to": "user@example.com",
+        }
+
+        sent_messages = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def starttls(self):
+                pass
+            def login(self, user, pwd):
+                pass
+            def sendmail(self, frm, to, msg):
+                sent_messages.append(msg)
+
+        with unittest.mock.patch("rotbyte._load_notify_config", return_value=cfg), \
+             unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
+            rotbyte._send_email_notification(
+                "/data/photos", failed=1, count_missing=0,
+                failed_files=[{"file_path": "/data/photos/img.jpg"}],
+                freshness=freshness,
+            )
+
+        assert sent_messages, "No email was sent"
+        # Parse the raw RFC 2822 message and return the decoded text body
+        import email as _email_mod
+        msg_obj = _email_mod.message_from_string(sent_messages[0])
+        payload = msg_obj.get_payload(decode=True)
+        charset = msg_obj.get_content_charset() or "utf-8"
+        return payload.decode(charset)
+
+    def test_freshness_present_when_provided(self):
+        """Email body includes freshness summary when freshness tuple is supplied."""
+        body = self._capture_email_body(freshness=(100, 87, 13))
+        assert "Verification freshness" in body
+        assert "87 / 100" in body
+        assert "13 due" in body
+
+    def test_freshness_percentage_correct(self):
+        """Freshness percentage is computed correctly."""
+        body = self._capture_email_body(freshness=(200, 150, 50))
+        assert "75.0%" in body
+
+    def test_freshness_absent_when_none(self):
+        """Email body has no freshness section when freshness=None."""
+        body = self._capture_email_body(freshness=None)
+        assert "Verification freshness" not in body
+        assert "due for re-verification" not in body
+
+    def test_freshness_zero_total(self):
+        """freshness with zero total files does not divide by zero."""
+        body = self._capture_email_body(freshness=(0, 0, 0))
+        assert "Verification freshness" in body
+        assert "0.0%" in body
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 45. --notify suppression controlled by --scheduled + --full-at
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNotifyPartialScan:
+    """Verify email notification rules for scheduled vs. untracked runs."""
+
+    def _make_args(self, notify="email", budget=None, due=None,
+                   scheduled=False, full_at=None):
+        import argparse
+        args = argparse.Namespace(
+            notify=notify,
+            budget=budget,
+            due=due,
+            budget_seconds=1800 if budget else None,
+            due_days=30 if due else None,
+            scheduled=scheduled,
+            full_at=full_at,
+            quiet=True,
+            json_output=False,
+            check=True,
+            workers=1,
+            include_hidden=False,
+            exclude_dirs=[],
+            skip_missing=False,
+        )
+        return args
+
+    def _run_phases_with_mock(self, tmp_path, args):
+        """Run _run_phases against a real (indexed) tmp dir and return send call count."""
+        target_dir = str(tmp_path)
+        db_name = "." + tmp_path.name + rotbyte.DB_FILENAME_SUFFIX
+        db_path = str(tmp_path / db_name)
+
+        # First index the directory
+        db = rotbyte.ChecksumDB(db_path)
+        interrupted = [False]
+        index_args = self._make_args(notify=None, budget=None, due=None)
+        with unittest.mock.patch("rotbyte._send_email_notification"):
+            with pytest.raises(SystemExit):
+                rotbyte._run_phases(db, target_dir, index_args, interrupted)
+        db.close()
+
+        # Corrupt a file to force a failure on the next run
+        for f in tmp_path.iterdir():
+            if f.suffix == ".txt":
+                _corrupt_file(f)
+                break
+
+        # Now run with the test args and capture send calls
+        db = rotbyte.ChecksumDB(db_path)
+        interrupted = [False]
+        with unittest.mock.patch("rotbyte._send_email_notification") as mock_send:
+            with pytest.raises(SystemExit):
+                rotbyte._run_phases(db, target_dir, args, interrupted)
+        db.close()
+        return mock_send.call_count
+
+    def test_untracked_run_always_sends_email(self, tmp):
+        """Manual run with --notify + --budget sends email (no --scheduled)."""
+        args = self._make_args(notify="email", budget="30m", scheduled=False)
+        call_count = self._run_phases_with_mock(tmp, args)
+        assert call_count == 1, "Expected email on untracked run even with --budget"
+
+    def test_scheduled_without_full_at_suppresses(self, tmp):
+        """--scheduled without --full-at suppresses the notification."""
+        args = self._make_args(notify="email", scheduled=True, full_at=None)
+        call_count = self._run_phases_with_mock(tmp, args)
+        assert call_count == 0, "Expected no email for scheduled partial scan"
+
+    def test_scheduled_with_full_at_sends_email(self, tmp):
+        """--scheduled + --full-at sends email."""
+        args = self._make_args(notify="email", scheduled=True, full_at=["2h"])
+        call_count = self._run_phases_with_mock(tmp, args)
+        assert call_count == 1, "Expected email for scheduled full scan"
+
+    def test_scheduled_full_at_budget_interrupted_sends_email(self, tmp):
+        """--scheduled + --full-at + --budget still sends email."""
+        args = self._make_args(notify="email", budget="30m",
+                               scheduled=True, full_at=["2h"])
+        call_count = self._run_phases_with_mock(tmp, args)
+        assert call_count == 1, "Expected email for budget-interrupted full scan"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# --track-setup wizard
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrackSetup:
+    """Verify _run_track_setup() parses prompts correctly and delegates to
+    _run_track() with the expected arguments. _run_track itself is mocked so
+    the tests don't touch launchd/systemd."""
+
+    def _run_wizard(self, tmp, inputs, notify_cfg_exists=False):
+        """Feed `inputs` (a list of strings, one per input() call) to the
+        wizard and return the kwargs-equivalent tuple captured from the
+        mocked _run_track call, or None if _run_track wasn't called."""
+        captured = {}
+
+        def fake_run_track(target_dir, every_seconds, full_at,
+                           budget_seconds, rotbyte_exe, workers=None,
+                           due_days=None, notify=None):
+            captured.update(
+                target_dir=target_dir,
+                every_seconds=every_seconds,
+                full_at=full_at,
+                budget_seconds=budget_seconds,
+                workers=workers,
+                due_days=due_days,
+                notify=notify,
+            )
+
+        # os.path.exists is patched only for the notify-config check. The
+        # wizard's os.path.isdir / os.path.realpath calls are unaffected.
+        real_exists = os.path.exists
+        notify_cfg = rotbyte._notify_config_path()
+
+        def fake_exists(p):
+            if p == notify_cfg:
+                return notify_cfg_exists
+            return real_exists(p)
+
+        with unittest.mock.patch.object(rotbyte, "_run_track",
+                                        side_effect=fake_run_track) as m, \
+             unittest.mock.patch.object(rotbyte, "_find_rotbyte_executable",
+                                        return_value="rotbyte"), \
+             unittest.mock.patch("os.path.exists", side_effect=fake_exists), \
+             unittest.mock.patch("builtins.input", side_effect=inputs):
+            rotbyte._run_track_setup(str(tmp))
+
+        return captured if m.called else None
+
+    def test_all_defaults_install(self, tmp):
+        """Empty inputs → 60m every, no full-at, no budget, no due, no notify."""
+        inputs = [
+            "",     # target dir (accept default)
+            "",     # every (accept default 60m)
+            "",     # full-at (none)
+            "",     # due (none)
+            "",     # notify (no)
+            "",     # install confirm (Y default)
+        ]
+        captured = self._run_wizard(tmp, inputs)
+        assert captured is not None, "Expected _run_track to be called"
+        assert captured["every_seconds"] == 3600
+        assert captured["full_at"] is None
+        assert captured["budget_seconds"] is None
+        assert captured["due_days"] is None
+        assert captured["notify"] is None
+        assert captured["target_dir"] == os.path.realpath(str(tmp))
+
+    def test_full_schedule_with_budget_and_due(self, tmp):
+        """All fields provided — budget prompt appears only because full-at set."""
+        inputs = [
+            "",         # target dir
+            "30m",      # every
+            "2h 14h",   # full-at
+            "2h",       # budget
+            "30d",      # due
+            "n",        # notify
+            "",         # install confirm
+        ]
+        captured = self._run_wizard(tmp, inputs)
+        assert captured["every_seconds"] == 1800
+        assert captured["full_at"] == [(2, 0), (14, 0)]
+        assert captured["budget_seconds"] == 7200
+        assert captured["due_days"] == 30
+        assert captured["notify"] is None
+
+    def test_invalid_duration_reprompts(self, tmp):
+        """Bad --every value re-prompts rather than crashing."""
+        inputs = [
+            "",         # target dir
+            "bogus",    # every → invalid
+            "30m",      # every → valid
+            "",         # full-at
+            "",         # due
+            "",         # notify
+            "",         # install
+        ]
+        captured = self._run_wizard(tmp, inputs)
+        assert captured["every_seconds"] == 1800
+
+    def test_abort_at_confirmation_skips_install(self, tmp):
+        """Answering 'n' at the install prompt must not call _run_track."""
+        inputs = [
+            "",         # target dir
+            "",         # every
+            "",         # full-at
+            "",         # due
+            "",         # notify
+            "n",        # install → abort
+        ]
+        captured = self._run_wizard(tmp, inputs)
+        assert captured is None or captured == {}, \
+            "Expected _run_track to NOT be called on abort"
+
+    def test_notify_without_config_continues_without_email(self, tmp):
+        """Answering yes to notify but with no config file → notify stays None."""
+        inputs = [
+            "",     # target dir
+            "",     # every
+            "",     # full-at
+            "",     # due
+            "y",    # notify yes
+            "",     # install
+        ]
+        captured = self._run_wizard(tmp, inputs, notify_cfg_exists=False)
+        assert captured["notify"] is None, \
+            "Wizard should skip email when config is missing"
+
+    def test_notify_with_config_enables_email(self, tmp):
+        """Answering yes with a config file present → notify='email'."""
+        inputs = [
+            "",     # target dir
+            "",     # every
+            "",     # full-at
+            "",     # due
+            "y",    # notify yes
+            "",     # install
+        ]
+        captured = self._run_wizard(tmp, inputs, notify_cfg_exists=True)
+        assert captured["notify"] == "email"
+
+    def test_budget_prompt_skipped_without_full_at(self, tmp):
+        """No full-at means the wizard never asks for a budget."""
+        # Only 6 inputs — if the wizard asked for budget, input() would raise
+        # StopIteration and the test would fail.
+        inputs = [
+            "",     # target dir
+            "",     # every
+            "",     # full-at (none → skip budget)
+            "",     # due
+            "",     # notify
+            "",     # install
+        ]
+        captured = self._run_wizard(tmp, inputs)
+        assert captured["budget_seconds"] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Platform portability — Windows
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Tests in this block split into two groups:
+#
+#    1. Platform-agnostic: pure functions (XML generation, argument quoting,
+#       ISO duration parsing) and the _IS_WINDOWS constant. These run on every
+#       platform because they exercise code paths whose logic is identical
+#       regardless of host OS.
+#
+#    2. Windows-only: anything that shells out to schtasks.exe or relies on
+#       msvcrt locking semantics. Gated with @pytest.mark.skipif(not is_windows)
+#       so the suite stays green on macOS/Linux CI but is ready to run the
+#       moment a windows-latest runner is added.
+#
+#  When the CI matrix gains a windows-latest job, the skipped tests activate
+#  automatically — no selector flags needed.
+
+_IS_WINDOWS_HOST = sys.platform == "win32"
+_skip_not_windows = pytest.mark.skipif(
+    not _IS_WINDOWS_HOST, reason="Windows-only: requires schtasks.exe / msvcrt"
+)
+_skip_windows = pytest.mark.skipif(
+    _IS_WINDOWS_HOST, reason="POSIX-only behavior"
+)
+
+
+class TestPlatformConstant:
+    """The module-level _IS_WINDOWS flag should mirror sys.platform."""
+
+    def test_flag_matches_sys_platform(self):
+        assert rotbyte._IS_WINDOWS is (sys.platform == "win32")
+
+
+class TestQuoteWindowsArgs:
+    """Pure function — round-trippable on any platform."""
+
+    def test_empty_list(self):
+        assert rotbyte._quote_windows_args([]) == ""
+
+    def test_simple_args_not_quoted(self):
+        assert rotbyte._quote_windows_args(["--check", "--quiet"]) == "--check --quiet"
+
+    def test_arg_with_space_is_quoted(self):
+        out = rotbyte._quote_windows_args(["--path", "C:\\Program Files\\Media"])
+        assert out == '--path "C:\\\\Program Files\\\\Media"'
+
+    def test_empty_string_becomes_empty_quotes(self):
+        # Preserves argv position for deliberately empty arguments.
+        assert rotbyte._quote_windows_args([""]) == '""'
+
+    def test_embedded_quote_is_escaped(self):
+        out = rotbyte._quote_windows_args(['say "hi"'])
+        assert out.startswith('"') and out.endswith('"')
+        assert '\\"hi\\"' in out
+
+    def test_tab_triggers_quoting(self):
+        out = rotbyte._quote_windows_args(["a\tb"])
+        assert out.startswith('"') and out.endswith('"')
+
+
+class TestIsoDuration:
+    """Round-trip between seconds and ISO 8601 duration strings."""
+
+    def test_hours_only(self):
+        assert rotbyte._iso_duration(7200) == "PT2H"
+
+    def test_minutes_only(self):
+        assert rotbyte._iso_duration(1800) == "PT30M"
+
+    def test_hours_and_minutes(self):
+        assert rotbyte._iso_duration(5400) == "PT1H30M"
+
+    def test_sub_minute_falls_back_to_seconds(self):
+        # Less than a minute: we emit seconds rather than a zero-length duration.
+        assert rotbyte._iso_duration(30) == "PT30S"
+
+    def test_zero_yields_safe_default(self):
+        # Never emit PT (invalid) — the scheduler would reject it.
+        assert rotbyte._iso_duration(0) == "PT1M"
+
+    def test_negative_clamped_to_safe_default(self):
+        assert rotbyte._iso_duration(-5) == "PT1M"
+
+    def test_roundtrip_hours(self):
+        assert rotbyte._parse_iso_duration(rotbyte._iso_duration(7200)) == 7200
+
+    def test_roundtrip_mixed(self):
+        assert rotbyte._parse_iso_duration(rotbyte._iso_duration(5400)) == 5400
+
+    def test_parse_none_returns_none(self):
+        assert rotbyte._parse_iso_duration(None) is None
+
+    def test_parse_malformed_returns_none(self):
+        assert rotbyte._parse_iso_duration("not a duration") is None
+
+    def test_parse_seconds_component(self):
+        assert rotbyte._parse_iso_duration("PT45S") == 45
+
+
+class TestGenerateTaskXML:
+    """The generated XML is Task Scheduler's wire format — structural assertions."""
+
+    def _triggers(self):
+        return (
+            '<Triggers>\n'
+            '    <TimeTrigger>\n'
+            '      <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n'
+            '      <Enabled>true</Enabled>\n'
+            '      <Repetition>\n'
+            '        <Interval>PT1H</Interval>\n'
+            '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
+            '      </Repetition>\n'
+            '    </TimeTrigger>\n'
+            '  </Triggers>'
+        )
+
+    def _parse(self, xml_str):
+        """Parse the generated XML and return the root element."""
+        import xml.etree.ElementTree as ET
+        return ET.fromstring(xml_str)
+
+    def test_battery_disallow_default(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["python.exe", "rotbyte.py", "D:\\Media"],
+            self._triggers(), run_on_battery=False,
+        )
+        assert "<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>" in xml
+        assert "<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>" in xml
+
+    def test_run_on_battery_flips_both_flags(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["python.exe", "rotbyte.py", "D:\\Media"],
+            self._triggers(), run_on_battery=True,
+        )
+        assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml
+        assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml
+
+    def test_execution_time_limit_honored(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte full scan (D:\\Media)",
+            ["python.exe", "rotbyte.py", "--check", "D:\\Media"],
+            self._triggers(), run_on_battery=False,
+            execution_time_limit="PT2H",
+        )
+        assert "<ExecutionTimeLimit>PT2H</ExecutionTimeLimit>" in xml
+
+    def test_default_time_limit_when_unspecified(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["python.exe", "rotbyte.py", "D:\\Media"],
+            self._triggers(), run_on_battery=False,
+        )
+        # Default prevents hung tasks from blocking the next schedule.
+        assert "<ExecutionTimeLimit>PT24H</ExecutionTimeLimit>" in xml
+
+    def test_xml_is_parseable(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["python.exe", "rotbyte.py", "D:\\Media"],
+            self._triggers(), run_on_battery=False,
+        )
+        root = self._parse(xml)
+        assert root.tag.endswith("}Task")
+
+    def test_command_and_arguments_in_exec(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["C:\\Python\\python.exe", "rotbyte.py", "--quiet", "D:\\Media"],
+            self._triggers(), run_on_battery=False,
+        )
+        assert "<Command>C:\\Python\\python.exe</Command>" in xml
+        assert "<Arguments>" in xml
+        assert "rotbyte.py" in xml
+        assert "D:\\Media" in xml
+
+    def test_argument_with_space_is_quoted_in_xml(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan",
+            ["python.exe", "rotbyte.py", "D:\\My Media"],
+            self._triggers(), run_on_battery=False,
+        )
+        # The path with a space is wrapped in XML-escaped quotes.
+        assert "&quot;D:\\\\My Media&quot;" in xml
+
+    def test_description_is_xml_escaped(self):
+        # Path containing an ampersand must not break XML parsing.
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\A & B)",
+            ["python.exe", "rotbyte.py"],
+            self._triggers(), run_on_battery=False,
+        )
+        assert "D:\\A &amp; B" in xml
+        # And the document is still parseable.
+        self._parse(xml)
+
+    def test_empty_command_rejected(self):
+        with pytest.raises(ValueError):
+            rotbyte._generate_task_xml(
+                "empty", [], self._triggers(), run_on_battery=False,
+            )
+
+    def test_uri_uses_rotbyte_folder(self):
+        xml = rotbyte._generate_task_xml(
+            "rotbyte quick scan (D:\\Media)",
+            ["python.exe", "rotbyte.py"],
+            self._triggers(), run_on_battery=False,
+        )
+        assert "<URI>\\rotbyte\\" in xml
+
+
+class TestLockShim:
+    """The _try_lock/_unlock shim must work the same on every platform."""
+
+    def test_try_lock_acquires_and_unlocks_release(self, tmp):
+        lock_path = os.path.join(str(tmp), "shim.lock")
+        f1 = open(lock_path, "a+b")
+        try:
+            assert rotbyte._try_lock(f1) is True
+            rotbyte._unlock(f1)
+        finally:
+            f1.close()
+
+    def test_contending_acquire_fails_while_held(self, tmp):
+        """Second concurrent acquire must fail fast, not block or succeed."""
+        lock_path = os.path.join(str(tmp), "shim.lock")
+        f1 = open(lock_path, "a+b")
+        f2 = open(lock_path, "a+b")
+        try:
+            assert rotbyte._try_lock(f1) is True
+            # Second process's lock attempt must be refused.
+            assert rotbyte._try_lock(f2) is False
+            rotbyte._unlock(f1)
+            # After release, a new acquire succeeds.
+            assert rotbyte._try_lock(f2) is True
+            rotbyte._unlock(f2)
+        finally:
+            f1.close()
+            f2.close()
+
+    def test_unlock_safe_on_unheld_file(self, tmp):
+        """_unlock must not raise when called on a file that's not locked."""
+        lock_path = os.path.join(str(tmp), "shim.lock")
+        f = open(lock_path, "a+b")
+        try:
+            rotbyte._unlock(f)  # must not raise
+        finally:
+            f.close()
+
+
+class TestAutoExport:
+    """--auto-export writes the manifest only after a successful --check.
+
+    Uses tmp_path directly (not the shared `tmp` fixture) so the file set
+    is controlled per-test and manifest line counts are deterministic.
+    """
+
+    def test_no_manifest_on_plain_scan(self, tmp_path):
+        (tmp_path / "a.txt").write_text("hello")
+        rc, _, _ = _run_cli("--auto-export", str(tmp_path))
+        assert rc == 0
+        manifests = list(tmp_path.glob(".*.manifest"))
+        # Plain scan without --check must never auto-export.
+        assert manifests == []
+
+    def test_manifest_written_after_check(self, tmp_path):
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "b.txt").write_text("world")
+        _run_cli(str(tmp_path))  # initial indexing
+        rc, out, _ = _run_cli("--check", "--auto-export", str(tmp_path))
+        assert rc == 0
+        manifests = list(tmp_path.glob(".*.manifest"))
+        assert len(manifests) == 1
+        text = manifests[0].read_text()
+        # Two b2sum-format lines, one per file.
+        lines = [l for l in text.splitlines() if l.strip()]
+        assert len(lines) == 2
+        for line in lines:
+            digest, _path = line.split("  ", 1)
+            assert len(digest) == 128
+            assert all(c in "0123456789abcdef" for c in digest)
+
+    def test_manifest_refreshed_on_subsequent_checks(self, tmp_path):
+        """A later run replaces the manifest, not appending to it."""
+        (tmp_path / "a.txt").write_text("hello")
+        _run_cli(str(tmp_path))
+        _run_cli("--check", "--auto-export", str(tmp_path))
+        manifest = next(tmp_path.glob(".*.manifest"))
+        first_text = manifest.read_text()
+
+        # Add a file, rerun — manifest should now contain both files.
+        (tmp_path / "b.txt").write_text("world")
+        _run_cli(str(tmp_path))
+        _run_cli("--check", "--auto-export", str(tmp_path))
+        second_text = manifest.read_text()
+
+        assert first_text != second_text
+        assert len(second_text.splitlines()) == 2
+
+    def test_flags_registered_in_argparse(self):
+        """Regression: both new flags must appear in --help output."""
+        rc, out, _ = _run_cli("--help")
+        assert rc == 0
+        assert "--auto-export" in out
+        assert "--run-on-battery" in out
+
+
+class TestIntegrityExitCode:
+    """Corrupted DB must exit 4, not 1, with clear recovery instructions."""
+
+    def test_corrupt_header_exits_4(self, tmp):
+        (tmp / "a.txt").write_text("hello")
+        _run_cli(str(tmp))
+        # Overwrite bytes in the SQLite header region.
+        db_path = next(tmp.glob(".*_checksums.db"))
+        with open(db_path, "r+b") as f:
+            f.seek(100)
+            f.write(b"\x00" * 4000)
+        rc, _, err = _run_cli(str(tmp))
+        assert rc == 4
+        assert "integrity" in err.lower() or "corrupt" in err.lower()
+        # Recovery instructions should be present so users aren't stranded.
+        assert "Restore" in err or "restore" in err
+
+
+class TestDBOnSeparateVolume:
+    """The informational one-liner for cross-volume DB placement."""
+
+    def test_silent_when_same_volume(self, tmp):
+        (tmp / "a.txt").write_text("hello")
+        rc, out, _ = _run_cli(str(tmp))
+        assert rc == 0
+        # Nothing about 'separate volume' when DB lives next to the data.
+        assert "separate volume" not in out
+
+    def test_message_shown_when_different_device(self, tmp, monkeypatch):
+        """Simulate st_dev difference via monkeypatched os.stat.
+
+        Runs rotbyte in-process rather than as a subprocess so the patch
+        takes effect. Exercises _run directly at the module level.
+        """
+        (tmp / "a.txt").write_text("hello")
+        # Do an initial index as a subprocess (can't be patched).
+        _run_cli(str(tmp))
+
+        # Now re-invoke in-process with patched stat to trigger the info line.
+        real_stat = os.stat
+        target_real = os.path.realpath(str(tmp))
+        db_path = str(next(tmp.glob(".*_checksums.db")))
+
+        def fake_stat(path, *a, **kw):
+            s = real_stat(path, *a, **kw)
+            # Pretend the target dir and the DB file are on different devices.
+            if os.path.realpath(path) == target_real:
+                # Wrap in a simple object exposing st_dev only for our check.
+                class Wrapped:
+                    st_dev = s.st_dev + 1
+                    def __getattr__(self, k):
+                        return getattr(s, k)
+                return Wrapped()
+            return s
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+        # The message is printed from _run during a normal scan. Capture stdout.
+        import io, contextlib
+        buf = io.StringIO()
+        # We can't easily drive the full CLI in-process without sys.exit firing,
+        # so just verify the string is present in the source's output shape.
+        # This test serves as documentation for the intended behavior; the
+        # end-to-end path is covered by the subprocess "silent" test above.
+        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+            sys.argv = ["rotbyte", str(tmp)]
+            rotbyte.main()
+        assert "separate volume" in buf.getvalue()
+
+
+# ── Windows-only integration (skipped off-platform) ──────────────────────────
+
+@_skip_not_windows
+class TestWindowsSchtasksRoundtrip:
+    """schtasks.exe install → discover → uninstall.
+
+    Runs only on Windows. Uses a disposable target directory hash so
+    repeated test runs don't stomp on real rotbyte tasks the user may
+    have installed. Cleans up on both success and failure.
+    """
+
+    def _cleanup(self, task_names):
+        import subprocess as _sp
+        for name in task_names:
+            _sp.run(
+                ["schtasks.exe", "/Delete", "/TN", name, "/F"],
+                capture_output=True,
+            )
+
+    def test_install_and_discover(self, tmp):
+        # Use a unique dir so the hash doesn't collide with anything real.
+        target = tmp / "windows_scan_target"
+        target.mkdir()
+        (target / "a.txt").write_text("hello")
+
+        dhash = rotbyte._dir_hash(str(target))
+        task_names = [f"\\rotbyte\\rotbyte-quick-{dhash}",
+                      f"\\rotbyte\\rotbyte-full-{dhash}"]
+        try:
+            rotbyte._install_schtasks(
+                target_dir=str(target),
+                dhash=dhash,
+                quick_cmd=[sys.executable, "-c", "pass"],
+                every_seconds=3600,
+                full_cmd=[sys.executable, "-c", "pass"],
+                full_at=[(2, 0)],
+                budget_seconds=7200,
+                run_on_battery=False,
+            )
+            discovered = rotbyte._discover_schtasks()
+            # Our target must now appear, with the schedule we requested.
+            assert str(target) in discovered or os.path.realpath(str(target)) in discovered
+        finally:
+            self._cleanup(task_names)
+
+    def test_run_on_battery_flag_reaches_xml(self, tmp):
+        target = tmp / "battery_target"
+        target.mkdir()
+        dhash = rotbyte._dir_hash(str(target))
+        task_names = [f"\\rotbyte\\rotbyte-quick-{dhash}"]
+        try:
+            rotbyte._install_schtasks(
+                target_dir=str(target),
+                dhash=dhash,
+                quick_cmd=[sys.executable, "-c", "pass"],
+                every_seconds=3600,
+                full_cmd=None,
+                full_at=None,
+                run_on_battery=True,
+            )
+            # Query the installed task's XML back.
+            import subprocess as _sp
+            r = _sp.run(
+                ["schtasks.exe", "/Query", "/TN", task_names[0], "/XML"],
+                capture_output=True, text=True,
+            )
+            assert "DisallowStartIfOnBatteries>false" in r.stdout
+        finally:
+            self._cleanup(task_names)
+
+
+@_skip_not_windows
+class TestWindowsPaths:
+    """Sanity checks for path handling on Windows filesystems."""
+
+    def test_backslash_paths_accepted(self, tmp):
+        nested = tmp / "sub" / "deep"
+        nested.mkdir(parents=True)
+        (nested / "file.txt").write_text("x")
+        rc, _, _ = _run_cli(str(nested))
+        assert rc == 0

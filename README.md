@@ -4,11 +4,38 @@ Guard your files against silent data corruption.
 
 Bit rot flips bits without touching timestamps or file sizes. By the time you notice, your backups may have already rotated out the good copy. **rotbyte** keeps a database of checksums and tells you the moment something doesn't match.
 
+Hashes are BLAKE2b-512 — cryptographically strong and faster than SHA-256 on modern CPUs, so full re-verifies stay I/O-bound rather than CPU-bound.
+
+## rotbyte and backups
+
+rotbyte is a **tripwire, not a backup**. It tells you *that* a file has rotted; it can't recover the original bytes. Pair it with a real backup strategy (ideally 3-2-1: three copies, two media, one offsite) so that when rotbyte raises an alarm, you have a known-good copy to restore from.
+
+A nice side effect of rotbyte's design: the checksum database is just a file, and `--export` writes a portable b2sum-compatible manifest. Keep a copy of the database (or an exported manifest) on your backup target alongside the data. If the source drive's database is lost or itself corrupted, the backup's copy lets you pick up where you left off — and running rotbyte against the backup gives you an independent integrity check of the backup itself.
+
+### Protecting the database itself
+
+rotbyte's database is one more file on your drive, so the same failure modes that threaten your data can threaten the tripwire. Recommended practices, in order of how much effort they take:
+
+- **Put the database on a different volume than the data.** Use `--db /path/on/another/drive/media.db` (or point it at your backup target). rotbyte prints `DB on separate volume: ✓` at startup when this is the case. If the source drive fails, the database survives.
+- **Enable `--auto-export`** on full scans. After every `--check`, rotbyte writes `<db_path>.manifest` — a plain-text, b2sum-compatible copy of all current checksums. It's resilient to SQLite-level problems and trivially diffable:
+  ```bash
+  rotbyte --check --auto-export /Volumes/Media
+  ```
+  When combined with `--track`, the flag persists into the scheduled command, so every scheduled full scan refreshes the manifest automatically.
+- **Include the database (and manifest) in your backups.** The DB is small relative to what it tracks. Backing it up alongside the data means either copy — source or backup — can bootstrap the other.
+- **Let rotbyte catch DB rot itself.** Every invocation runs `PRAGMA integrity_check` against the database before doing anything. A corrupt DB causes rotbyte to exit immediately with code **4** and clear recovery instructions — it will never silently produce misleading results off a damaged tripwire.
+
 ## Install
 
-```
+```bash
+# Any platform (macOS, Linux, Windows) — recommended
+pipx install rotbyte
+
+# macOS via Homebrew — also installs the man page and shell completions
 brew install rotbyte
 ```
+
+`pipx` gives you an isolated, self-updating install on any platform. The Homebrew formula is a thin wrapper that additionally places `rotbyte.1` and shell completions where your shell will find them; pipx users who want completions can copy them out of the [`completions/`](completions/) directory manually.
 
 ## Quick start
 
@@ -81,6 +108,12 @@ rotbyte --track \
 
 `--budget 2h` processes the stalest files first so successive runs gradually cover the entire archive. `--notify email` requires one-time setup via `--notify-setup email`.
 
+If you'd rather be walked through the options one at a time, `--track-setup` runs an interactive wizard that prompts for each value, validates it, echoes the equivalent `--track` command, and installs the timer:
+
+```bash
+rotbyte --track-setup /Volumes/Media
+```
+
 ## Features
 
 - **Fast** — parallel hashing across all cores with a live progress bar and throughput stats.
@@ -94,7 +127,7 @@ rotbyte --track \
 - **Due-based verification** — `--due 30d` targets only files not checked recently, combining naturally with `--budget`.
 - **Email notifications** — `--notify email` sends a health report after every full re-verify and an alert when problems are found on quick scans. Works standalone or with `--track`.
 - **JSON output** — `--json` produces machine-readable results for scripts and monitoring pipelines.
-- **Export** — `--export` writes a b2sum-compatible manifest as an independent backup of your checksums outside the database.
+- **Export** — `--export` writes a b2sum-compatible manifest as an independent backup of your checksums outside the database. Use `--auto-export` to refresh the manifest automatically after every full `--check`.
 - **Directory exclusion** — `--exclude` skips directories you don't want tracked.
 
 ## Scheduling
@@ -112,9 +145,13 @@ rotbyte --track --every 30m --full-at 2h 14h /Volumes/Media
 rotbyte --status
 ```
 
-On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`. Running `--track` without `--full-at` installs only the quick scan; add `--full-at` to also schedule a nightly full re-verify.
+On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`. On Windows it registers Task Scheduler tasks under `\rotbyte\` (user-level, no admin prompt). Running `--track` without `--full-at` installs only the quick scan; add `--full-at` to also schedule a nightly full re-verify. For a guided setup, use `rotbyte --track-setup` — it mirrors `--notify-setup` and walks you through every option.
+
+On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
 > **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [docs/macOS Permissions.md](docs/macOS%20Permissions.md).
+>
+> **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [docs/Windows Task Scheduler.md](docs/Windows%20Task%20Scheduler.md) for uninstall and inspection commands.
 
 You can still use cron if you prefer:
 
@@ -178,6 +215,7 @@ rotbyte --export checksums.txt
 | `1` | Missing files detected |
 | `2` | Bit rot detected |
 | `3` | Interrupted (safe to re-run) |
+| `4` | Database integrity check failed (restore from backup) |
 
 ## All options
 
@@ -189,7 +227,7 @@ Shell completions for bash, zsh, and fish are in the `completions/` directory.
 
 ## Requirements
 
-Python 3.9+ on macOS or Linux.
+Python 3.9+ on macOS, Linux, or Windows. No runtime dependencies outside the standard library.
 
 ## Changelog
 
