@@ -1,0 +1,418 @@
+"""Email notifications and SMTP credential storage.
+
+Passwords are routed through the platform credential store at setup
+time: macOS Keychain (``security``), Windows Credential Manager
+(``cmdkey`` + ``CredReadW`` via ctypes), Linux libsecret (``secret-tool``)
+when available. Falls back to plaintext ``notify.conf`` with chmod 0600
+and a stderr warning when no platform store is usable.
+"""
+
+from __future__ import annotations
+
+import configparser
+import email.mime.text
+import os
+import shutil
+import smtplib
+import subprocess as _subprocess
+import sys
+from typing import Dict, List, Optional, Tuple
+
+from .platform import _IS_MACOS, _IS_WINDOWS
+
+# Service identifier under which we register SMTP passwords with the OS keychain.
+_KEYCHAIN_SERVICE = "rotbyte-notify"
+
+
+def _keychain_account(username: str, smtp_host: str) -> str:
+    """Compose the per-(user, host) keychain account label.
+
+    Distinct identifier per SMTP destination so a user can have separate
+    credentials for, say, work and personal Gmail without collision.
+    """
+    return f"{username}@{smtp_host}"
+
+
+def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
+    """Store ``password`` under ``account`` in the platform credential store.
+
+    Returns ``(stored, backend)`` where ``backend`` is one of ``"keychain"``
+    (macOS), ``"secret-service"`` (Linux libsecret), ``"credential-manager"``
+    (Windows), or ``"plaintext"`` if no platform store was usable.
+
+    Shells out to platform tools so rotbyte stays stdlib-only:
+      - macOS:   ``security add-generic-password -U``
+      - Linux:   ``secret-tool store`` (from libsecret-tools, optional)
+      - Windows: ``cmdkey /generic:...``
+    """
+    if _IS_MACOS:
+        try:
+            _subprocess.run(
+                ["security", "add-generic-password",
+                 "-U", "-a", account, "-s", _KEYCHAIN_SERVICE,
+                 "-w", password],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return True, "keychain"
+        except (FileNotFoundError, _subprocess.CalledProcessError,
+                _subprocess.TimeoutExpired):
+            return False, "plaintext"
+    if _IS_WINDOWS:
+        target = f"{_KEYCHAIN_SERVICE}:{account}"
+        try:
+            _subprocess.run(
+                ["cmdkey", f"/generic:{target}", f"/user:{account}",
+                 f"/pass:{password}"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return True, "credential-manager"
+        except (FileNotFoundError, _subprocess.CalledProcessError,
+                _subprocess.TimeoutExpired):
+            return False, "plaintext"
+    # Linux (and any other POSIX): try libsecret if present, else plaintext.
+    if shutil.which("secret-tool"):
+        try:
+            _subprocess.run(
+                ["secret-tool", "store", "--label=rotbyte SMTP",
+                 "service", _KEYCHAIN_SERVICE, "account", account],
+                input=password, check=True, capture_output=True,
+                text=True, timeout=10,
+            )
+            return True, "secret-service"
+        except (FileNotFoundError, _subprocess.CalledProcessError,
+                _subprocess.TimeoutExpired):
+            pass
+    return False, "plaintext"
+
+
+def _keychain_get(account: str) -> Optional[str]:
+    """Look up the password for ``account``. Returns None if not stored."""
+    if _IS_MACOS:
+        try:
+            result = _subprocess.run(
+                ["security", "find-generic-password",
+                 "-a", account, "-s", _KEYCHAIN_SERVICE, "-w"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            # `security -w` prints the password followed by a newline.
+            return result.stdout.rstrip("\n")
+        except (FileNotFoundError, _subprocess.CalledProcessError,
+                _subprocess.TimeoutExpired):
+            return None
+    if _IS_WINDOWS:
+        # Windows: cmdkey doesn't expose a read interface. Use the Win32
+        # CredReadW API via ctypes; the credential blob is stored as
+        # UTF-16-LE bytes.
+        return _windows_credential_get(f"{_KEYCHAIN_SERVICE}:{account}")
+    if shutil.which("secret-tool"):
+        try:
+            result = _subprocess.run(
+                ["secret-tool", "lookup",
+                 "service", _KEYCHAIN_SERVICE, "account", account],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            # `secret-tool lookup` prints the secret with no trailing newline,
+            # but tolerate one anyway in case future versions add it.
+            return result.stdout.rstrip("\n")
+        except (FileNotFoundError, _subprocess.CalledProcessError,
+                _subprocess.TimeoutExpired):
+            return None
+    return None
+
+
+def _windows_credential_get(target: str) -> Optional[str]:
+    """Read a Windows generic credential by target name via Win32 CredReadW.
+
+    Returns the credential's password as a string, or None if the target
+    is not present or the API call fails. ctypes is stdlib so this keeps
+    rotbyte's zero-runtime-deps guarantee on Windows.
+    """
+    if not _IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    CRED_TYPE_GENERIC = 1
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredReadW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(CREDENTIAL)),
+    ]
+    advapi32.CredFree.restype = None
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+
+    cred_ptr = ctypes.POINTER(CREDENTIAL)()
+    if not advapi32.CredReadW(target, CRED_TYPE_GENERIC, 0, ctypes.byref(cred_ptr)):
+        return None
+    try:
+        cred = cred_ptr.contents
+        size = int(cred.CredentialBlobSize)
+        if size <= 0:
+            return ""
+        blob = ctypes.string_at(cred.CredentialBlob, size)
+        # cmdkey stores generic credentials as UTF-16-LE.
+        try:
+            return blob.decode("utf-16-le").rstrip("\x00")
+        except UnicodeDecodeError:
+            return None
+    finally:
+        advapi32.CredFree(cred_ptr)
+
+
+def _notify_config_path() -> str:
+    """Return the platform-appropriate path for the notify config file."""
+    if _IS_MACOS:
+        base = os.path.expanduser("~/Library/Application Support/rotbyte")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        base = os.path.join(base, "rotbyte")
+    return os.path.join(base, "notify.conf")
+
+
+def _load_notify_config() -> configparser.ConfigParser:
+    """Load and return the notification config, or exit with an error.
+
+    The on-disk config never contains the SMTP password directly when a
+    keychain backend was usable at setup time — instead it carries a
+    ``password_backend`` field naming the platform store. The password is
+    fetched lazily here and merged back into the in-memory config object
+    so callers can keep treating ``config["email"]["password"]`` as the
+    single source of truth.
+    """
+    path = _notify_config_path()
+    if not os.path.isfile(path):
+        print(f"Error: No notification config found at {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
+        sys.exit(1)
+    config = configparser.ConfigParser()
+    config.read(path)
+    if "email" not in config:
+        print(f"Error: No [email] section in {path}", file=sys.stderr)
+        print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+        sys.exit(1)
+    for key in ("smtp_host", "smtp_port", "username", "to"):
+        if key not in config["email"]:
+            print(f"Error: Missing '{key}' in [email] section of {path}", file=sys.stderr)
+            print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
+            sys.exit(1)
+
+    section = config["email"]
+    if "password" not in section:
+        backend = section.get("password_backend", "")
+        if backend in ("keychain", "credential-manager", "secret-service"):
+            account = _keychain_account(section["username"], section["smtp_host"])
+            secret = _keychain_get(account)
+            if secret is None:
+                print(f"Error: Could not read SMTP password from {backend} for {account}",
+                      file=sys.stderr)
+                print("  Run `rotbyte --notify-setup email` to reconfigure.",
+                      file=sys.stderr)
+                sys.exit(1)
+            section["password"] = secret
+        else:
+            print(f"Error: Missing 'password' in [email] section of {path}",
+                  file=sys.stderr)
+            print("  Run `rotbyte --notify-setup email` to reconfigure.",
+                  file=sys.stderr)
+            sys.exit(1)
+    return config
+
+
+def _run_notify_setup():
+    """Interactive setup for email notifications."""
+    print("═" * 60)
+    print("  rotbyte — Email notification setup")
+    print("═" * 60)
+    print()
+    print("  You'll need SMTP credentials for your email provider.")
+    print("  For Gmail, use an App Password (not your account password).")
+    print("  See: https://support.google.com/accounts/answer/185833")
+    print()
+
+    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
+    if not smtp_host:
+        print("Error: SMTP host is required.", file=sys.stderr)
+        sys.exit(1)
+
+    smtp_port_str = input("  SMTP port [587]: ").strip()
+    smtp_port = int(smtp_port_str) if smtp_port_str else 587
+
+    username = input("  Username (your email address): ").strip()
+    if not username:
+        print("Error: Username is required.", file=sys.stderr)
+        sys.exit(1)
+
+    password = input("  Password / app password: ").strip()
+    if not password:
+        print("Error: Password is required.", file=sys.stderr)
+        sys.exit(1)
+
+    to_addr = input(f"  Send alerts to [{username}]: ").strip()
+    if not to_addr:
+        to_addr = username
+
+    # Test the connection
+    print()
+    print("  Testing connection...", end="", flush=True)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(username, password)
+
+            msg = email.mime.text.MIMEText(
+                "This is a test notification from rotbyte.\n\n"
+                "If you received this, email notifications are working correctly.\n"
+            )
+            msg["Subject"] = "rotbyte: test notification"
+            msg["From"] = username
+            msg["To"] = to_addr
+            server.sendmail(username, [to_addr], msg.as_string())
+    except Exception as e:  # noqa: BLE001 — SMTP raises a zoo of types
+        # smtplib can raise SMTPException, TimeoutError, socket.gaierror,
+        # ConnectionRefusedError, ssl.SSLError, and OSError. Catch the
+        # common-ancestor so the user sees a readable one-liner instead
+        # of a traceback during interactive setup.
+        print(f" failed.\n\n  Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(" ok.")
+
+    # Write config — try the platform credential store first so the
+    # password never lands in the config file. Fall back to plaintext +
+    # 0600 if no usable store is available (e.g. Linux without
+    # libsecret-tools installed).
+    config_path = _notify_config_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    account = _keychain_account(username, smtp_host)
+    stored, backend = _keychain_set(account, password)
+
+    config = configparser.ConfigParser()
+    email_section: Dict[str, str] = {
+        "smtp_host": smtp_host,
+        "smtp_port": str(smtp_port),
+        "username": username,
+        "to": to_addr,
+    }
+    if stored:
+        email_section["password_backend"] = backend
+    else:
+        email_section["password"] = password
+        email_section["password_backend"] = "plaintext"
+    config["email"] = email_section
+    with open(config_path, "w") as f:
+        config.write(f)
+    os.chmod(config_path, 0o600)
+
+    print(f"  Config saved to {config_path}")
+    if stored:
+        print(f"  Password stored in {backend} (account: {account})")
+    else:
+        print(f"  Warning: no platform credential store available — password "
+              f"saved plaintext at {config_path} (chmod 0600).",
+              file=sys.stderr)
+        print("  Use an app-specific password (Gmail App Password etc.) for "
+              "this account, never your primary password.",
+              file=sys.stderr)
+    print(f"  Test email sent to {to_addr} — check your inbox.")
+    print()
+    print("  Usage:")
+    print("    rotbyte --check --notify email /Volumes/Media")
+    print("    rotbyte --track --notify email --every 1h /Volumes/Media")
+
+
+def _send_email_notification(target_dir: str, failed: int, count_missing: int,
+                             failed_files: List[Dict],
+                             freshness: Optional[tuple] = None):
+    """Send an email notification about scan problems.
+
+    Best-effort: prints a warning on failure but never prevents the scan
+    from completing with its normal exit code.
+
+    freshness, if provided, is a (total, verified_within, due) tuple from
+    ChecksumDB.freshness_stats() and is appended as a summary line.
+    """
+    try:
+        config = _load_notify_config()
+    except SystemExit:
+        # _load_notify_config calls sys.exit on error; during notification
+        # we want to warn, not abort.
+        print("  Warning: could not load email config — skipping notification.",
+              file=sys.stderr)
+        return
+
+    section = config["email"]
+
+    # Build subject
+    parts = []
+    if failed > 0:
+        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
+
+    # Build body
+    lines = [
+        f"rotbyte detected problems in {target_dir}:\n",
+    ]
+    if failed > 0:
+        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        lines.append(f"  Missing files:    {count_missing}")
+    lines.append("")
+
+    if failed_files:
+        lines.append("Affected files:")
+        for f in failed_files[:50]:
+            lines.append(f"  ✗ {f['file_path']}")
+        if len(failed_files) > 50:
+            lines.append(f"  ... and {len(failed_files) - 50} more")
+        lines.append("")
+
+    if freshness is not None:
+        f_total, f_verified, f_due = freshness
+        f_pct = (f_verified / f_total * 100) if f_total else 0.0
+        lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} files verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
+        lines.append("")
+
+    lines.append("Run `rotbyte --report` for full details.")
+    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
+
+    body = "\n".join(lines)
+
+    try:
+        msg = email.mime.text.MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = section["username"]
+        msg["To"] = section["to"]
+
+        with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
+                          timeout=30) as server:
+            server.starttls()
+            server.login(section["username"], section["password"])
+            server.sendmail(section["username"], [section["to"]], msg.as_string())
+    except Exception as e:  # noqa: BLE001 — best-effort notification
+        # smtplib/socket/ssl can raise across an entire type hierarchy.
+        # Email delivery is best-effort: log and continue so a transient
+        # SMTP blip never masks the real scan exit code.
+        print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)

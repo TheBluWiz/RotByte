@@ -41,8 +41,10 @@ Changelog = "https://github.com/rotbyte/rotbyte/blob/main/CHANGELOG.md"
 rotbyte = "rotbyte:main"
 
 [tool.setuptools]
-# Single-file module layout — rotbyte.py lives at the repo root.
+# rotbyte.py is a thin entry point at the repo root; implementation
+# lives in the _rotbyte internal package. Both need to ship.
 py-modules = ["rotbyte"]
+packages = ["_rotbyte", "_rotbyte.scheduler"]
 
 # Auxiliary files (man page, shell completions) are installed for system-wide
 # installs (pip with --prefix) but are not placed in pipx's isolated venv.

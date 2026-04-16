@@ -218,14 +218,33 @@ rotbyte --export checksums.txt
 | `2` | Bit rot detected |
 | `3` | Interrupted (safe to re-run) |
 | `4` | Database integrity check failed (restore from backup) |
+| `5` | Database locked by another rotbyte process (retry later) |
+| `6` | I/O error (target directory unreachable, permission denied) |
+| `7` | Internal error (worker pool died, unexpected exception) |
 
 ## All options
 
 Run `rotbyte --help` for the full reference, or `man rotbyte` after installing via Homebrew.
 
-Additional tuning flags available via `--help`: `--workers` (parallel hashing workers), `--db` (custom database path), `--skip-missing` (skip missing-file detection), `--include-hidden` (include dotfiles and hidden directories).
+Additional tuning flags available via `--help`: `--workers` (parallel hashing workers), `--db` (custom database path), `--skip-missing` (skip missing-file detection), `--include-hidden` (include dotfiles and hidden directories), `--case-insensitive` (normalise file paths to lowercase for macOS APFS / Windows NTFS users who rename by case).
 
 Shell completions for bash, zsh, and fish are in the `completions/` directory.
+
+## Known limitations
+
+- **Hardlinks are hashed once per link.** rotbyte does not dedupe by
+  `(st_dev, st_ino)`, so a file present under two names on the same
+  volume is hashed twice and stored as two separate rows. This rarely
+  matters for the media/archive trees rotbyte targets, but if you have
+  a deduplicated backup where many files are hardlinked, the first
+  full scan will take roughly `O(paths)` wall time rather than
+  `O(unique inodes)`.
+- **Case-insensitive filesystems** (macOS APFS by default, Windows NTFS)
+  can produce phantom `MISSING` records if a file is renamed only by
+  case (`foo.mkv` → `Foo.mkv`) — the database still stores the old
+  casing. Pass `--case-insensitive` to opt into lowercase path
+  normalisation; note that flipping this flag on an existing database
+  will rewrite every tracked path to lower case on the next scan.
 
 ## Requirements
 

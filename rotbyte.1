@@ -282,6 +282,18 @@ Bit rot detected (checksum mismatch).
 .TP
 .B 3
 Run was interrupted (safe to re-run).
+.TP
+.B 4
+Database integrity check failed (restore from backup).
+.TP
+.B 5
+Database locked by another rotbyte process (retry later).
+.TP
+.B 6
+I/O error (target directory unreachable, permission denied).
+.TP
+.B 7
+Internal error (worker pool died, unexpected exception).
 .SH FILE STATUSES
 .TP
 .B OK

@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Security
+- launchd plist generation now uses `plistlib.dumps()`; target paths containing `<`, `>`, `&`, or `"` can no longer produce malformed or injected XML
+- systemd `ExecStart=` now quotes each argument per `systemd.service(5)` C-escape rules; paths with spaces no longer silently split into multiple arguments
+- systemd `Description=` strips CR/LF so a newline in a target path can't inject another directive
+- Task Scheduler XML `<URI>` now built from the actual task name and passed through `_xml_escape` consistently with the other user-controlled fields
+- `FileLock` opens the lock file with `O_NOFOLLOW` on POSIX; a symlink at `<db>.lock` can no longer redirect the PID-record write
+- SMTP credentials now stored in the OS credential store by default: macOS Keychain (`security`), Windows Credential Manager (`cmdkey` + `CredReadW` via ctypes), or Linux libsecret (`secret-tool`) when available — plaintext `notify.conf` (chmod 0600) is used only as a fallback and prints a stderr warning when it happens
+
+### Added
+- `--case-insensitive` opt-in flag normalises scanned paths to lowercase so a rename-by-case on APFS or NTFS doesn't produce phantom MISSINGs; flipping it on an existing database rewrites every tracked path on the next scan (one-way migration, documented)
+- Exit codes 5 (`DB_LOCKED` — another rotbyte process holds the lock), 6 (`IO` — target unreachable, permission denied), and 7 (`INTERNAL` — worker pool died, unexpected exception). **Minor breaking change** for callers that treated any non-zero as "corruption detected"
+- Windows `FILE_ATTRIBUTE_HIDDEN` is now honored by `--include-hidden`; the flag no longer skips only POSIX dotfiles on Windows
+- Named `EXIT_*` constants exported from `rotbyte` for programmatic callers
+
+### Changed
+- `rotbyte.py` is now a thin entry point (≈1,400 lines, down from ≈3,500); implementation lives in a new internal `_rotbyte/` package (`platform`, `helpers`, `progress`, `database`, `hashing`, `notify`, `scheduler/{launchd,systemd,schtasks}`). The public `rotbyte.X` symbol surface used by integrations and tests is unchanged
+- launchd log files moved from `/tmp/com.rotbyte.*.log` (volatile, unbounded) to `~/Library/Logs/rotbyte/` (persistent, size-rotated); logs over 10 MB are rotated at `--track` install time with 3 generations kept
+- `hash_file()` now returns an error message on failure; the parent process aggregates per-file read errors and prints the first 10 inline with a "... N more suppressed" summary, instead of each worker spamming stderr
+- `os.path.realpath()` is now cached process-wide via `functools.lru_cache` (`_resolve` in `_rotbyte.helpers`); rotbyte is one-shot so the cache is bounded
+- `os.walk()` now passes an `onerror` callback so a network drive vanishing mid-scan surfaces as a stderr warning and the scan continues with what was collected, rather than aborting
+- `ChecksumDB` gained a `transaction()` context manager; `run_hashing`, `detect_missing`, and `_run_accept_all` use it instead of hand-rolled begin/commit/rollback blocks
+- Platform detection consolidated behind `_IS_WINDOWS` / `_IS_MACOS` / `_IS_LINUX` constants; `sys.platform` and `platform.system()` calls are no longer mixed across the codebase
+- Late mid-file imports of `re`/`glob`/`plistlib`/`platform`/`subprocess`/`textwrap` hoisted to the module top
+- `hash_file()` return shape changed from 4-tuple to 5-tuple (trailing error slot); direct callers must unpack the extra field
+
+### Fixed
+- Files that vanish between the prescan and hash phases are now routed to `MISSING` (which is what they are) instead of counted as read errors
+- Windows Task Scheduler XML `<URI>` element no longer contains the free-form description string; it matches the registered task path
+- README and man page exit-status tables updated for codes 4–7
+
+### Documented
+- Hardlinks are hashed once per link (no `(st_dev, st_ino)` dedup) — added to README as a known limitation rather than changing schema semantics
+- `--case-insensitive` migration behaviour and its one-way nature called out in README
+- SMTP credential storage paths (Keychain / Credential Manager / libsecret / plaintext) surfaced in `rotbyte --notify-setup` output
+
+---
+
 **Database rename and indexing**
 - Default database file renamed from `.{dirname}_checksums.db` to `.{dirname}_rotbyte.db` for clearer tool attribution, especially on backup drives where multiple DBs may sit side by side
 - Leading dot preserved (hidden on POSIX); dirname prefix retained so DBs remain distinguishable when copied

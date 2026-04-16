@@ -31,1270 +31,133 @@ version — the DB plus its .lock / WAL / SHM / .manifest sidecars are
 atomically renamed, with history preserved.
 
 Requires Python 3.9+ on macOS, Linux, or Windows.
+
+This module is a thin entry point. The actual pipeline lives in the
+:mod:`_rotbyte` internal package (database, hashing, scheduler, notify,
+progress, platform). Symbols are re-exported here so the historical
+``rotbyte.X`` API used by the test suite continues to work.
 """
+
+from __future__ import annotations
 
 import argparse
-import configparser
-import email.mime.text
-import hashlib
 import json
 import os
-import shutil
 import signal
-import smtplib
 import sqlite3
 import sys
-import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed, BrokenExecutor
+from typing import List, Optional, Set
 
-# Platform-specific locking primitives. rotbyte uses an advisory file lock
-# to prevent two processes from writing to the same database concurrently.
-# POSIX systems (macOS/Linux) use fcntl.flock; Windows uses msvcrt.locking
-# on a byte-range at the start of the lock file.
-_IS_WINDOWS = sys.platform == "win32"
-if _IS_WINDOWS:
-    import msvcrt  # type: ignore[import-not-found]
-else:
-    import fcntl
+# ── Re-exports from the _rotbyte package ──────────────────────────────────────
+# Keep the `rotbyte.X` surface that tests and users depend on. Anything
+# that should be callable via ``rotbyte.X`` lives here.
 
-def _try_lock(fileobj) -> bool:
-    """Non-blocking exclusive lock. Returns True on success, False if held."""
-    try:
-        if _IS_WINDOWS:
-            msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(fileobj, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except (OSError, IOError):
-        return False
+from _rotbyte.database import (
+    ChecksumDB,
+    DB_FILENAME_SUFFIX,
+    LEGACY_DB_FILENAME_SUFFIX,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+    _migrate_legacy_db_name,
+)
+from _rotbyte.hashing import (
+    BATCH_SIZE,
+    FileEntry,
+    HASH_BUFFER_SIZE,
+    HashResult,
+    _is_windows_hidden,
+    detect_missing,
+    hash_file,
+    prescan_files,
+    run_hashing,
+    scan_files,
+)
+from _rotbyte.helpers import (
+    _format_clock_time,
+    _format_duration,
+    _format_size,
+    _is_tty,
+    _mtime_iso,
+    _now,
+    _resolve,
+    _term_width,
+    _utc_to_local,
+    parse_clock_time,
+    parse_days,
+    parse_duration,
+)
+from _rotbyte.notify import (
+    _keychain_account,
+    _keychain_get,
+    _keychain_set,
+    _load_notify_config,
+    _notify_config_path,
+    _run_notify_setup,
+    _send_email_notification,
+    _windows_credential_get,
+)
+from _rotbyte.platform import (
+    _IS_LINUX,
+    _IS_MACOS,
+    _IS_WINDOWS,
+    FileLock,
+    _try_lock,
+    _unlock,
+)
+from _rotbyte.progress import ProgressBar, Spinner
+from _rotbyte.scheduler import (
+    _dir_hash,
+    _discover_tracked,
+    _find_rotbyte_executable,
+    _parse_cmd_flags,
+    _run_track,
+)
+from _rotbyte.scheduler.launchd import (
+    _discover_launchd,
+    _generate_launchd_plist,
+    _install_launchd,
+    _launchd_log_path,
+    _rotate_launchd_log,
+)
+from _rotbyte.scheduler.schtasks import (
+    _discover_schtasks,
+    _generate_task_xml,
+    _install_schtasks,
+    _iso_duration,
+    _parse_iso_duration,
+    _quote_windows_args,
+    _xml_escape,
+)
+from _rotbyte.scheduler.systemd import (
+    _discover_systemd,
+    _generate_systemd_timer,
+    _generate_systemd_unit,
+    _install_systemd,
+    _systemd_escape_arg,
+    _systemd_escape_description,
+)
 
-def _unlock(fileobj) -> None:
-    """Release a lock acquired via _try_lock. Safe to call if not held."""
-    try:
-        if _IS_WINDOWS:
-            msvcrt.locking(fileobj.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(fileobj, fcntl.LOCK_UN)
-    except OSError:
-        pass
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+# Kept available for tests that poke at it via ``rotbyte.smtplib``.
+import smtplib  # noqa: F401
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
-# Database schema: two tables.
-#   checksums  — one row per tracked file with its hash, metadata, and status.
-#   last_run   — single row tracking whether the previous run completed,
-#                so we can warn if it was interrupted.
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS checksums (
-    file_path       TEXT    PRIMARY KEY,
-    file_name       TEXT    NOT NULL,
-    file_size       INTEGER NOT NULL,
-    file_mtime      TEXT    NOT NULL,
-    checksum        TEXT    NOT NULL,
-    baseline_checksum TEXT,
-    algorithm       TEXT    NOT NULL DEFAULT 'BLAKE2b',
-    status          TEXT    NOT NULL DEFAULT 'NEW',
-    first_seen      TEXT    NOT NULL,
-    last_verified   TEXT    NOT NULL,
-    notes           TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_status        ON checksums(status);
-CREATE INDEX IF NOT EXISTS idx_last_verified ON checksums(last_verified);
-CREATE INDEX IF NOT EXISTS idx_file_name     ON checksums(file_name);
-CREATE INDEX IF NOT EXISTS idx_file_size     ON checksums(file_size);
--- idx_baseline_checksum is created in _ensure_indexes() rather than here
--- because legacy v1 databases don't have the baseline_checksum column
--- until _migrate() adds it. Running CREATE INDEX here would fail on
--- pre-migration open.
-
-CREATE TABLE IF NOT EXISTS last_run (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    started_at  TEXT    NOT NULL,
-    finished_at TEXT,
-    target_dir  TEXT    NOT NULL,
-    status      TEXT    NOT NULL DEFAULT 'RUNNING'
-);
-
-CREATE TABLE IF NOT EXISTS schema_version (
-    id      INTEGER PRIMARY KEY CHECK (id = 1),
-    version INTEGER NOT NULL DEFAULT 1
-);
-"""
-
-SCHEMA_VERSION = 3
+# ── Version and process exit codes ────────────────────────────────────────────
 
 VERSION = "1.0.0"
-# Current DB filename shape: ".{dirname}_rotbyte.db". The leading dot keeps
-# the file hidden on POSIX; the {dirname} prefix keeps DBs distinguishable
-# when users copy them side-by-side onto a backup target.
-DB_FILENAME_SUFFIX = "_rotbyte.db"
-# Prior name, retained so existing users are auto-migrated on first run of
-# a version that ships the rename. See _migrate_legacy_db_name().
-LEGACY_DB_FILENAME_SUFFIX = "_checksums.db"
-HASH_BUFFER_SIZE = 1024 * 1024  # 1 MiB — balances syscall overhead vs memory
-BATCH_SIZE = 200                # DB writes per transaction before committing
 
-
-# ── Hashing (runs in worker processes) ─────────────────────────────────────────
-
-def hash_file(file_path: str) -> Tuple[str, Optional[str], Optional[int], Optional[str]]:
-    """Compute BLAKE2b-512 hash of a file.
-
-    Returns (path, hex_digest, size, mtime_iso) on success or
-    (path, None, None, None) on read error.
-
-    Metadata is captured via fstat() on the open file descriptor so that
-    the recorded size and mtime correspond to the exact bytes that were
-    hashed — no TOCTOU gap between stat() and read().
-
-    This function runs in a worker process via ProcessPoolExecutor and
-    must not access the database or any shared mutable state.
-    """
-    try:
-        h = hashlib.blake2b()
-        with open(file_path, "rb") as f:
-            st = os.fstat(f.fileno())
-            while True:
-                chunk = f.read(HASH_BUFFER_SIZE)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return file_path, h.hexdigest(), st.st_size, _mtime_iso(st)
-    except OSError as e:
-        print(f"\n  ! Error reading {file_path}: {e}", file=sys.stderr)
-        return file_path, None, None, None
-
-
-# ── Database ───────────────────────────────────────────────────────────────────
-
-class ChecksumDB:
-    """SQLite database wrapper.
-
-    All queries use parameterized placeholders (?) to prevent SQL injection
-    from filenames. WAL journal mode allows concurrent reads during writes.
-    Manual transaction control (begin/commit/rollback) enables batching
-    many writes into a single transaction for performance.
-    """
-
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, isolation_level=None)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA cache_size=-64000")   # 64 MB cache
-        self.conn.execute("PRAGMA busy_timeout=5000")    # wait up to 5s on lock
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA_SQL)
-        self._migrate()
-        self._ensure_indexes()
-
-    def _ensure_indexes(self):
-        """Create indexes that depend on columns added by migrations.
-
-        Runs after _migrate() so legacy v1 databases (which lack
-        baseline_checksum until the 1→2 migration adds it) can open
-        cleanly before the index exists. Idempotent.
-        """
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_baseline_checksum "
-            "ON checksums(baseline_checksum)"
-        )
-
-    def _migrate(self):
-        """Run any pending schema migrations.
-
-        Existing databases without a schema_version table are treated as
-        version 1. Migrations are applied sequentially up to SCHEMA_VERSION.
-        """
-        row = self.conn.execute(
-            "SELECT version FROM schema_version WHERE id = 1"
-        ).fetchone()
-
-        if row is None:
-            # New database or pre-versioning database. Check whether the
-            # checksums table has data to distinguish the two cases.
-            has_data = self.conn.execute(
-                "SELECT 1 FROM checksums LIMIT 1"
-            ).fetchone()
-            current = 1 if has_data else SCHEMA_VERSION
-            self.conn.execute(
-                "INSERT INTO schema_version (id, version) VALUES (1, ?)",
-                (current,),
-            )
-            if not has_data:
-                return  # Fresh database, schema is already current
-        else:
-            current = row["version"]
-
-        if current >= SCHEMA_VERSION:
-            return
-
-        # ── Migration 1 → 2: add baseline_checksum column ────────────
-        if current < 2:
-            # Check if column already exists (defensive)
-            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(checksums)")}
-            if "baseline_checksum" not in cols:
-                self.conn.execute(
-                    "ALTER TABLE checksums ADD COLUMN baseline_checksum TEXT"
-                )
-            # For FAILED rows, the current checksum column holds the
-            # known-good hash (old behavior). Move it to baseline_checksum.
-            # For all other rows, baseline = checksum (they're the same).
-            self.conn.execute(
-                "UPDATE checksums SET baseline_checksum = checksum"
-            )
-            current = 2
-
-        # ── Migration 2 → 3: index baseline_checksum for move detection ──
-        # Without this index, looking up MISSING rows by checksum when new
-        # files arrive is O(n) per lookup and O(n²) for large reshuffles
-        # (e.g. a media-library reorganization). The index is ~64 bytes per
-        # row and pays for itself the first time a user reorganizes.
-        if current < 3:
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_baseline_checksum "
-                "ON checksums(baseline_checksum)"
-            )
-            current = 3
-
-        self.conn.execute(
-            "UPDATE schema_version SET version = ? WHERE id = 1",
-            (current,),
-        )
-
-    def verify_integrity(self) -> bool:
-        """Quick integrity check on the database file itself."""
-        result = self.conn.execute("PRAGMA quick_check").fetchone()
-        return result is not None and result[0] == "ok"
-
-    def close(self):
-        # PRAGMA optimize refreshes query-planner statistics on indexes
-        # touched during this session. Cheap (milliseconds) and keeps
-        # plans accurate as the database grows. SQLite's recommended
-        # close-time hygiene as of 3.18.
-        try:
-            self.conn.execute("PRAGMA optimize")
-        except sqlite3.Error:
-            pass
-        self.conn.close()
-
-    @staticmethod
-    def _escape_like(prefix: str) -> str:
-        """Escape SQL LIKE wildcards (%, _, \\) in a directory prefix.
-
-        Ensures the prefix ends with os.sep so that '/Volumes/Media'
-        does not match '/Volumes/Media2'.
-        """
-        if not prefix.endswith(os.sep):
-            prefix += os.sep
-        return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-    # ── Run tracking (single row, updated in place) ───────────────────────
-
-    def check_interrupted_run(self):
-        """Warn if the previous run was interrupted (status still RUNNING)."""
-        row = self.conn.execute(
-            "SELECT started_at FROM last_run WHERE id = 1 AND status = 'RUNNING'"
-        ).fetchone()
-        if row:
-            print(f"  Note: A previous run from {row['started_at']} was interrupted.")
-            print("  This run will re-check any files that were skipped.")
-            print()
-
-    def start_run(self, target_dir: str):
-        """Mark a run as in progress. Overwrites any previous record."""
-        self.conn.execute(
-            "INSERT OR REPLACE INTO last_run (id, started_at, finished_at, target_dir, status) "
-            "VALUES (1, ?, NULL, ?, 'RUNNING')",
-            (_now(), target_dir),
-        )
-
-    def finish_run(self):
-        """Mark the current run as complete."""
-        self.conn.execute(
-            "UPDATE last_run SET finished_at = ?, status = 'COMPLETE' WHERE id = 1",
-            (_now(),),
-        )
-
-    # ── Bulk lookups ──────────────────────────────────────────────────────
-
-    def load_all_records(self, prefix: str) -> Dict[str, Tuple[str, int, str, str]]:
-        """Load all tracked records under a directory prefix.
-
-        Returns {file_path: (baseline_checksum, file_size, file_mtime, status)}.
-        Uses baseline_checksum for comparisons since it holds the known-good
-        hash. Includes MISSING records so re-added files are verified against
-        their baseline. Escapes SQL LIKE wildcards.
-        """
-        escaped = self._escape_like(prefix)
-        rows = self.conn.execute(
-            "SELECT file_path, baseline_checksum, file_size, file_mtime, status FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\'",
-            (escaped + "%",),
-        ).fetchall()
-        return {r["file_path"]: (r["baseline_checksum"], r["file_size"], r["file_mtime"], r["status"]) for r in rows}
-
-    def get_missing_paths(self, prefix: str) -> Set[str]:
-        """Return all file paths currently marked MISSING under a prefix."""
-        escaped = self._escape_like(prefix)
-        rows = self.conn.execute(
-            "SELECT file_path FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\' AND status = 'MISSING'",
-            (escaped + "%",),
-        ).fetchall()
-        return {r["file_path"] for r in rows}
-
-    # ── Transaction helpers ───────────────────────────────────────────────
-
-    def begin(self):
-        self.conn.execute("BEGIN")
-
-    def commit(self):
-        self.conn.execute("COMMIT")
-
-    def rollback(self):
-        try:
-            self.conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass  # No active transaction
-
-    # ── Writes ────────────────────────────────────────────────────────────
-
-    def upsert_file(self, file_path: str, file_name: str, file_size: int,
-                    file_mtime: str, checksum: str, old_checksum: Optional[str],
-                    status: str, now: str):
-        """Insert a new file or update an existing one.
-
-        If old_checksum is provided, the file is already tracked — update it.
-        Otherwise insert a new record.
-
-        On FAILED, checksum stores the bad hash and baseline_checksum is
-        left unchanged (preserving the known-good hash for restore
-        verification). On all other statuses, both columns are updated
-        to the current hash.
-        """
-        if old_checksum is not None:
-            if status == "FAILED":
-                self.conn.execute(
-                    """UPDATE checksums
-                       SET checksum = ?, file_size = ?, file_mtime = ?,
-                           status = ?, last_verified = ?
-                     WHERE file_path = ?""",
-                    (checksum, file_size, file_mtime, status, now, file_path),
-                )
-            else:
-                self.conn.execute(
-                    """UPDATE checksums
-                       SET checksum = ?, baseline_checksum = ?,
-                           file_size = ?, file_mtime = ?,
-                           status = ?, last_verified = ?
-                     WHERE file_path = ?""",
-                    (checksum, checksum, file_size, file_mtime, status, now, file_path),
-                )
-        else:
-            self.conn.execute(
-                """INSERT INTO checksums
-                   (file_path, file_name, file_size, file_mtime, checksum,
-                    baseline_checksum, algorithm, status, first_seen, last_verified)
-                   VALUES (?, ?, ?, ?, ?, ?, 'BLAKE2b', ?, ?, ?)""",
-                (file_path, file_name, file_size, file_mtime, checksum,
-                 checksum, status, now, now),
-            )
-
-    def mark_missing(self, file_path: str, now: str):
-        """Mark a tracked file as MISSING (only if not already MISSING)."""
-        self.conn.execute(
-            "UPDATE checksums SET status = 'MISSING', last_verified = ? "
-            "WHERE file_path = ? AND status != 'MISSING'",
-            (now, file_path),
-        )
-
-    def purge_missing(self, prefix: str) -> int:
-        """Delete all MISSING records under a prefix. Returns count removed."""
-        escaped = self._escape_like(prefix)
-        cur = self.conn.execute(
-            "DELETE FROM checksums WHERE file_path LIKE ? ESCAPE '\\' AND status = 'MISSING'",
-            (escaped + "%",),
-        )
-        return cur.rowcount
-
-    def accept_file(self, file_path: str, checksum: str, file_size: int,
-                    file_mtime: str, now: str):
-        """Accept a file's current content as the new known-good baseline."""
-        self.conn.execute(
-            """UPDATE checksums
-               SET checksum = ?, baseline_checksum = ?,
-                   file_size = ?, file_mtime = ?,
-                   status = 'OK', last_verified = ?
-             WHERE file_path = ?""",
-            (checksum, checksum, file_size, file_mtime, now, file_path),
-        )
-
-    def get_failed_paths(self, prefix: str) -> List[str]:
-        """Return all FAILED file paths under a prefix."""
-        escaped = self._escape_like(prefix)
-        rows = self.conn.execute(
-            "SELECT file_path FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\' AND status = 'FAILED'",
-            (escaped + "%",),
-        ).fetchall()
-        return [r["file_path"] for r in rows]
-
-    def get_file_status(self, file_path: str) -> Optional[str]:
-        """Return the status of a single file, or None if not tracked."""
-        row = self.conn.execute(
-            "SELECT status FROM checksums WHERE file_path = ?",
-            (file_path,),
-        ).fetchone()
-        return row["status"] if row else None
-
-    def get_file_record(self, file_path: str) -> Optional[Dict]:
-        """Return the full database record for a file, or None if not tracked."""
-        row = self.conn.execute(
-            "SELECT file_path, baseline_checksum, checksum, file_size, "
-            "file_mtime, status, first_seen, last_verified "
-            "FROM checksums WHERE file_path = ?",
-            (file_path,),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def update_last_verified(self, file_path: str, now: str):
-        """Update last_verified timestamp for a file without changing any other field."""
-        self.conn.execute(
-            "UPDATE checksums SET last_verified = ? WHERE file_path = ?",
-            (now, file_path),
-        )
-
-    def purge_file(self, file_path: str):
-        """Remove a single file's record from the database entirely."""
-        self.conn.execute("DELETE FROM checksums WHERE file_path = ?", (file_path,))
-
-    # ── Reporting queries ─────────────────────────────────────────────────
-
-    def status_summary(self) -> List[Dict]:
-        """Count of files grouped by status (OK, NEW, FAILED, MISSING)."""
-        rows = self.conn.execute(
-            "SELECT status, count(*) as count FROM checksums GROUP BY status ORDER BY count DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def failed_files(self) -> List[Dict]:
-        """Return details for all FAILED files."""
-        rows = self.conn.execute(
-            "SELECT file_path, file_size, checksum, baseline_checksum, last_verified "
-            "FROM checksums WHERE status = 'FAILED'"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def stale_files(self, days: int) -> List[Dict]:
-        """Return files not verified in the given number of days."""
-        rows = self.conn.execute(
-            "SELECT file_path, last_verified FROM checksums "
-            "WHERE last_verified < datetime('now', ?)",
-            (f"-{days} days",),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def stalest_file_paths(self, prefix: str, limit: Optional[int] = None) -> List[str]:
-        """Return file paths ordered by oldest last_verified first.
-
-        Used by --budget mode to prioritize re-verifying the files that
-        haven't been checked in the longest time. Only returns non-MISSING
-        files under the given prefix.
-        """
-        escaped = self._escape_like(prefix)
-        query = (
-            "SELECT file_path FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING' "
-            "ORDER BY last_verified ASC"
-        )
-        params: list = [escaped + "%"]
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(limit)
-        rows = self.conn.execute(query, params).fetchall()
-        return [r["file_path"] for r in rows]
-
-    def due_file_paths(self, prefix: str, days: int) -> Set[str]:
-        """Return paths not verified within the given number of days.
-
-        Used by --due to select only files that are overdue for a full
-        re-verify, avoiding redundant work on recently checked files.
-        """
-        escaped = self._escape_like(prefix)
-        rows = self.conn.execute(
-            "SELECT file_path FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING' "
-            "AND last_verified < datetime('now', ?)",
-            (escaped + "%", f"-{days} days"),
-        ).fetchall()
-        return {r["file_path"] for r in rows}
-
-    def detect_likely_moves(self, prefix: str) -> int:
-        """Count NEW files whose checksum matches a MISSING file.
-
-        A match strongly suggests a rename/move rather than a deletion
-        and a new unrelated file. Returns the count of matches.
-        """
-        escaped = self._escape_like(prefix)
-        row = self.conn.execute(
-            "SELECT count(*) as count FROM checksums c1 "
-            "WHERE c1.file_path LIKE ? ESCAPE '\\' AND c1.status = 'NEW' "
-            "AND EXISTS ("
-            "  SELECT 1 FROM checksums c2 "
-            "  WHERE c2.file_path LIKE ? ESCAPE '\\' AND c2.status = 'MISSING' "
-            "  AND c2.baseline_checksum = c1.baseline_checksum"
-            ")",
-            (escaped + "%", escaped + "%"),
-        ).fetchone()
-        return row["count"] if row else 0
-
-    def all_records(self) -> List[Dict]:
-        """Return all tracked records for manifest export."""
-        rows = self.conn.execute(
-            "SELECT file_path, baseline_checksum, checksum, file_size, "
-            "file_mtime, status, first_seen, last_verified "
-            "FROM checksums ORDER BY file_path"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def last_activity(self) -> Optional[str]:
-        """Return the most recent last_verified timestamp, or None if empty."""
-        row = self.conn.execute(
-            "SELECT max(last_verified) as latest FROM checksums"
-        ).fetchone()
-        return row["latest"] if row and row["latest"] else None
-
-    def status_counts(self) -> Dict[str, int]:
-        """Return {status: count} dict for all tracked files."""
-        rows = self.conn.execute(
-            "SELECT status, count(*) as count FROM checksums GROUP BY status"
-        ).fetchall()
-        return {r["status"]: r["count"] for r in rows}
-
-    def freshness_stats(self, prefix: str, days: int) -> tuple:
-        """Return (total, verified_within, due) counts for non-MISSING files.
-
-        Used to summarize verification coverage when --due is active.
-        'verified_within' counts files whose last_verified is within the
-        given day window; 'due' is the remainder (outside window or NULL).
-        """
-        escaped = self._escape_like(prefix)
-        row = self.conn.execute(
-            "SELECT "
-            "  count(*) as total, "
-            "  sum(CASE WHEN last_verified >= datetime('now', ?) THEN 1 ELSE 0 END) "
-            "    as verified "
-            "FROM checksums "
-            "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING'",
-            (f"-{days} days", escaped + "%"),
-        ).fetchone()
-        total = row["total"] or 0
-        verified = row["verified"] or 0
-        due = total - verified
-        return total, verified, due
-
-
-# ── Legacy database auto-migration ─────────────────────────────────────────────
-
-def _migrate_legacy_db_name(new_db_path: str) -> None:
-    """Rename a pre-1.1 .{dirname}_checksums.db to .{dirname}_rotbyte.db.
-
-    Runs before the lock is taken and before the DB is opened. Scope:
-
-      - Only acts if `new_db_path` ends with the current suffix
-        (.{dirname}_rotbyte.db) AND the new-name file does not yet exist.
-      - Derives the legacy path by swapping the suffix and checks whether
-        that file exists. If both exist, leaves both alone and prints a
-        loud warning — that is an ambiguous state the user must resolve.
-      - Atomically renames the DB and its .lock, -wal, -shm, and
-        .manifest sidecars using os.replace() (atomic on POSIX and
-        Windows when source and target are on the same volume).
-      - Quiet when nothing to do. One informational line when it migrates.
-
-    Users who passed a custom --db path are responsible for their own
-    renames; this helper only handles the default-path layout.
-    """
-    if not new_db_path.endswith(DB_FILENAME_SUFFIX):
-        return  # Custom --db path; out of scope
-    if os.path.exists(new_db_path):
-        return  # Already on the new name
-    legacy_path = new_db_path[:-len(DB_FILENAME_SUFFIX)] + LEGACY_DB_FILENAME_SUFFIX
-    if not os.path.exists(legacy_path):
-        return  # Nothing to migrate
-
-    # Ambiguous state: the legacy file exists but so does something else
-    # at the new path. Covered by the os.path.exists check above, but
-    # guard the sidecars too — if any new-name sidecar exists while the
-    # legacy DB is present, refuse rather than clobber.
-    sidecar_suffixes = (".lock", "-wal", "-shm", ".manifest")
-    for sfx in sidecar_suffixes:
-        if os.path.exists(new_db_path + sfx) and os.path.exists(legacy_path + sfx):
-            print(f"Warning: both legacy and current rotbyte database files present:",
-                  file=sys.stderr)
-            print(f"  legacy : {legacy_path}{sfx}", file=sys.stderr)
-            print(f"  current: {new_db_path}{sfx}", file=sys.stderr)
-            print("  Resolve manually before running rotbyte.", file=sys.stderr)
-            sys.exit(1)
-
-    try:
-        os.replace(legacy_path, new_db_path)
-    except OSError as e:
-        print(f"Warning: could not rename legacy database {legacy_path}: {e}",
-              file=sys.stderr)
-        return
-
-    migrated = [os.path.basename(new_db_path)]
-    for sfx in sidecar_suffixes:
-        src = legacy_path + sfx
-        dst = new_db_path + sfx
-        if os.path.exists(src) and not os.path.exists(dst):
-            try:
-                os.replace(src, dst)
-                migrated.append(os.path.basename(dst))
-            except OSError as e:
-                print(f"Warning: could not rename {src}: {e}", file=sys.stderr)
-
-    print(f"  Renamed legacy database to {os.path.basename(new_db_path)} "
-          f"({len(migrated)} file{'s' if len(migrated) != 1 else ''})",
-          file=sys.stderr)
-
-
-# ── File lock ──────────────────────────────────────────────────────────────────
-
-class FileLock:
-    """Prevents concurrent runs against the same database.
-
-    Uses flock() for atomic locking. If a second instance tries to run
-    against the same database, it will fail immediately rather than
-    corrupt data with concurrent writes.
-    """
-
-    def __init__(self, lock_path: str):
-        self.lock_path = lock_path
-        self.lock_file = None
-
-    def acquire(self) -> bool:
-        try:
-            # "a+b" so Windows msvcrt.locking has a real byte to lock on.
-            self.lock_file = open(self.lock_path, "a+b")
-        except OSError:
-            return False
-        if not _try_lock(self.lock_file):
-            try:
-                self.lock_file.close()
-            finally:
-                self.lock_file = None
-            return False
-        try:
-            self.lock_file.seek(0)
-            self.lock_file.truncate()
-            self.lock_file.write(str(os.getpid()).encode("ascii"))
-            self.lock_file.flush()
-        except OSError:
-            # A write failure doesn't invalidate the lock; the PID record
-            # is informational only.
-            pass
-        return True
-
-    def release(self):
-        if self.lock_file:
-            try:
-                _unlock(self.lock_file)
-                self.lock_file.close()
-            except OSError:
-                pass
-            self.lock_file = None
-            # Best-effort cleanup; on Windows the file may still be in use
-            # by another process briefly, which is harmless.
-            try:
-                os.unlink(self.lock_path)
-            except OSError:
-                pass
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _now() -> str:
-    """Current UTC time as ISO 8601 string."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _mtime_iso(stat_result: os.stat_result) -> str:
-    """Convert a stat result's mtime to ISO 8601 UTC string.
-
-    Uses st_mtime_ns for nanosecond precision when the sub-second part
-    is non-zero. Files with exact-second timestamps keep the old format
-    so upgrading doesn't trigger unnecessary re-hashing of every file.
-    """
-    ns = stat_result.st_mtime_ns
-    secs, frac_ns = divmod(ns, 1_000_000_000)
-    dt = datetime.fromtimestamp(secs, tz=timezone.utc)
-    if frac_ns:
-        return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac_ns:09d}Z"
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _format_size(size_bytes: float) -> str:
-    """Human-readable file size (e.g. 1.5 GB)."""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(size_bytes) < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} PB"
-
-
-def _format_duration(seconds: float) -> str:
-    """Human-readable duration (e.g. 2h 15m 30s)."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    return f"{minutes}m {secs}s"
-
-
-def _is_tty() -> bool:
-    """True when stderr is an interactive terminal (not a pipe or file)."""
-    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-
-
-import re as _re
-
-def parse_duration(s: str) -> int:
-    """Parse a human duration string like '2h30m', '45m', '3h' into seconds.
-
-    Accepted formats: Nh, Nm, NhMm (e.g. '2h', '30m', '2h30m', '90m').
-    Returns total seconds. Raises ValueError on bad input.
-    """
-    m = _re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", s)
-    if not m or (m.group(1) is None and m.group(2) is None):
-        raise ValueError(
-            f"Invalid duration '{s}'. Use formats like '2h', '30m', or '2h30m'."
-        )
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    total = hours * 3600 + minutes * 60
-    if total <= 0:
-        raise ValueError(f"Duration must be positive: '{s}'")
-    return total
-
-
-def parse_clock_time(s: str) -> Tuple[int, int]:
-    """Parse a clock time like '2h30m', '14h', '2h00m' into (hour, minute).
-
-    Accepted formats: Nh, NhMm (e.g. '2h' = 02:00, '14h30m' = 14:30).
-    Returns (hour, minute). Raises ValueError on bad input.
-    """
-    m = _re.fullmatch(r"(\d+)h(?:(\d+)m)?", s)
-    if not m:
-        raise ValueError(
-            f"Invalid clock time '{s}'. Use formats like '2h', '14h30m'."
-        )
-    hour = int(m.group(1))
-    minute = int(m.group(2) or 0)
-    if hour > 23 or minute > 59:
-        raise ValueError(f"Invalid clock time '{s}': hour 0-23, minute 0-59.")
-    return hour, minute
-
-
-def parse_days(s: str) -> int:
-    """Parse a day count like '30d', '7d', '90d' into an integer.
-
-    Raises ValueError on bad input.
-    """
-    m = _re.fullmatch(r"(\d+)d", s)
-    if not m:
-        raise ValueError(
-            f"Invalid day count '{s}'. Use format like '30d', '7d', '90d'."
-        )
-    days = int(m.group(1))
-    if days <= 0:
-        raise ValueError(f"Day count must be positive: '{s}'")
-    return days
-
-
-def _format_clock_time(hour: int, minute: int) -> str:
-    """Format (hour, minute) as a human-readable string like '2:30 AM'."""
-    ampm = "AM" if hour < 12 else "PM"
-    display_hour = hour % 12 or 12
-    if minute:
-        return f"{display_hour}:{minute:02d} {ampm}"
-    return f"{display_hour} {ampm}"
-
-
-def _utc_to_local(utc_iso: str) -> str:
-    """Convert a UTC ISO 8601 timestamp to a local time display string.
-
-    Handles both second-precision ('2026-04-09T14:30:00Z') and
-    nanosecond-precision ('2026-04-09T14:30:00.123456789Z') formats.
-    Returns a human-readable local time like '2026-04-09 7:30 AM PDT'.
-    """
-    # Strip nanosecond fractional part if present (strptime only handles up to 6 digits)
-    clean = utc_iso
-    if "." in clean:
-        clean = clean[:clean.index(".")] + "Z"
-    dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    local = dt.astimezone()
-    # Get timezone abbreviation
-    tz_name = local.strftime("%Z")
-    ampm = "AM" if local.hour < 12 else "PM"
-    display_hour = local.hour % 12 or 12
-    if local.minute:
-        time_str = f"{display_hour}:{local.minute:02d} {ampm}"
-    else:
-        time_str = f"{display_hour} {ampm}"
-    return f"{local.strftime('%Y-%m-%d')} {time_str} {tz_name}"
-
-
-def _term_width() -> int:
-    """Return usable terminal width, clamped to a sane range."""
-    return max(40, min(shutil.get_terminal_size((80, 24)).columns, 200))
-
-
-# ── Spinner & progress bar ─────────────────────────────────────────────────────
-
-class Spinner:
-    """Animated spinner for indeterminate-length blocking operations.
-
-    Usage:
-        with Spinner("Scanning"):
-            do_work()          # spinner animates on a background thread
-        # prints "Scanning  [ done ]" on exit
-
-    Falls back to a static message when stderr is not a tty (pipes, cron).
-    """
-
-    _FRAMES = ("|", "/", "—", "\\")
-    _INTERVAL = 0.12  # seconds between frames
-
-    def __init__(self, message: str, quiet: bool = False):
-        self.message = message
-        self.quiet = quiet
-        self._tty = _is_tty()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._suffix = ""
-
-    def __enter__(self):
-        if self.quiet:
-            return self
-        if self._tty:
-            self._thread = threading.Thread(target=self._spin, daemon=True)
-            self._thread.start()
-        else:
-            print(f"  {self.message}...", end="", file=sys.stderr, flush=True)
-        return self
-
-    def __exit__(self, *exc):
-        self._stop.set()
-        if self._thread:
-            self._thread.join()
-        if not self.quiet:
-            if self._tty:
-                self._clear_line()
-                print(
-                    f"  {self.message}  [ done ]{self._suffix}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(f" done.{self._suffix}", file=sys.stderr, flush=True)
-
-    def set_suffix(self, text: str):
-        """Append text after '[ done ]' when the spinner finishes."""
-        self._suffix = text
-
-    def _spin(self):
-        i = 0
-        while not self._stop.is_set():
-            frame = self._FRAMES[i % len(self._FRAMES)]
-            self._clear_line()
-            print(
-                f"  {self.message}  [ {frame} ]",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
-            i += 1
-            self._stop.wait(self._INTERVAL)
-
-    @staticmethod
-    def _clear_line():
-        print(f"\r\033[2K", end="", file=sys.stderr, flush=True)
-
-
-class ProgressBar:
-    """Compact progress bar for the hashing phase.
-
-    Renders a single self-updating line like:
-        [████████████░░░░░░░░░░░░]  1,204 / 3,891  ·  2.4 GB  @ 312.5 MB/s
-
-    Degrades to periodic line-based updates when not on a tty.
-    """
-
-    _FILL = "█"
-    _EMPTY = "░"
-    _BAR_MIN_WIDTH = 10
-    _NON_TTY_INTERVAL = 5.0  # seconds between updates when piped
-
-    def __init__(self, total: int, quiet: bool = False):
-        self.total = total
-        self.quiet = quiet
-        self._tty = _is_tty()
-        self._processed = 0
-        self._bytes_hashed = 0
-        self._start = time.monotonic()
-        self._last_non_tty = 0.0
-        self._lock = threading.Lock()  # guards counter updates from futures
-
-    def update(self, file_bytes: int):
-        """Advance counters by one file and render."""
-        with self._lock:
-            self._processed += 1
-            self._bytes_hashed += file_bytes
-            self._render()
-
-    def finish(self):
-        """Render the final state and move to the next line."""
-        if self.quiet:
-            return
-        if self._tty:
-            self._render(force=True)
-            print(file=sys.stderr)
-        else:
-            self._render_non_tty(force=True)
-
-    def _render(self, force: bool = False):
-        if self.quiet:
-            return
-        if not self._tty:
-            self._render_non_tty(force=force)
-            return
-
-        cols = _term_width()
-        elapsed = time.monotonic() - self._start
-        rate = self._bytes_hashed / elapsed if elapsed > 0 else 0
-
-        # Build the right-side stats string first to calculate remaining space
-        stats = (
-            f"  {self._processed:,}/{self.total:,}"
-            f"  ·  {_format_size(self._bytes_hashed)}"
-            f"  @ {_format_size(rate)}/s"
-        )
-
-        # Allocate remaining space to the bar (with brackets and padding)
-        #   "  [████░░░░]  stats"
-        bar_overhead = 5  # "  [" + "]"
-        bar_width = cols - len(stats) - bar_overhead
-        bar_width = max(self._BAR_MIN_WIDTH, bar_width)
-
-        if self.total > 0:
-            frac = self._processed / self.total
-        else:
-            frac = 1.0
-        filled = int(bar_width * frac)
-        bar = self._FILL * filled + self._EMPTY * (bar_width - filled)
-
-        line = f"  [{bar}]{stats}"
-        print(f"\r\033[2K{line}", end="", file=sys.stderr, flush=True)
-
-    def _render_non_tty(self, force: bool = False):
-        now = time.monotonic()
-        if not force and (now - self._last_non_tty) < self._NON_TTY_INTERVAL:
-            return
-        self._last_non_tty = now
-        elapsed = now - self._start
-        rate = self._bytes_hashed / elapsed if elapsed > 0 else 0
-        pct = (self._processed / self.total * 100) if self.total > 0 else 100
-        print(
-            f"  {pct:5.1f}%  {self._processed:,}/{self.total:,}"
-            f"  ·  {_format_size(self._bytes_hashed)} @ {_format_size(rate)}/s",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
-# ── Filesystem scanning ───────────────────────────────────────────────────────
-
-def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
-               exclude_dirs: Optional[Set[str]] = None) -> List[str]:
-    """Walk the directory tree and return a sorted list of file paths.
-
-    Skips by default:
-      - Hidden files and directories (names starting with '.')
-      - .b2sum and .b2 hash files (handled separately by --import)
-      - The database file and its SQLite companion files (-wal, -shm, .lock)
-      - Any directories in exclude_dirs
-    Does not follow symlinks to prevent infinite loops.
-    """
-    skip_files = {
-        os.path.realpath(db_path),
-        os.path.realpath(db_path + ".lock"),
-        os.path.realpath(db_path + "-wal"),
-        os.path.realpath(db_path + "-shm"),
-    }
-    exclude = exclude_dirs or set()
-    files = []
-    for root, dirs, filenames in os.walk(target_dir, followlinks=False):
-        if not include_hidden:
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) not in exclude]
-
-        for name in filenames:
-            if not include_hidden and name.startswith("."):
-                continue
-            if name.endswith(".b2sum") or name.endswith(".b2"):
-                continue
-            full = os.path.join(root, name)
-            if os.path.realpath(full) in skip_files:
-                continue
-            files.append(full)
-    files.sort()
-    return files
-
-
-# ── Pre-scan: decide what needs hashing ────────────────────────────────────────
-
-class FileEntry:
-    """Snapshot of a file's metadata at prescan time.
-
-    Used to decide whether a file needs re-hashing (based on size/mtime
-    changes). The actual metadata stored in the database comes from
-    fstat() during hashing to avoid TOCTOU gaps.
-
-    The 'modified' flag records whether size or mtime changed since the
-    last check. This is how rotbyte distinguishes intentional edits
-    (modified=True, hash change is expected) from silent bit rot
-    (modified=False, hash should not have changed).
-    """
-    __slots__ = ("path", "name", "size", "mtime", "old_checksum", "modified")
-
-    def __init__(self, path: str, name: str, size: int, mtime: str,
-                 old_checksum: Optional[str], modified: bool):
-        self.path = path
-        self.name = name
-        self.size = size
-        self.mtime = mtime
-        self.old_checksum = old_checksum
-        self.modified = modified
-
-
-def prescan_files(
-    all_files: List[str],
-    existing: Dict[str, Tuple[str, int, str, str]],
-    force: bool,
-) -> Tuple[List[FileEntry], int]:
-    """Compare files on disk against the database to decide what to hash.
-
-    Returns (files_to_hash, skip_count). Files are skipped (not hashed)
-    only when all of these are true:
-      - Not running with --check (force=False)
-      - File is not marked MISSING or FAILED in the database
-      - File's size and mtime match the stored values
-    """
-    to_hash: List[FileEntry] = []
-    skip_count = 0
-
-    for fpath in all_files:
-        try:
-            st = os.stat(fpath)
-        except OSError:
-            continue
-
-        name = os.path.basename(fpath)
-        size = st.st_size
-        mtime = _mtime_iso(st)
-
-        record = existing.get(fpath)
-        if record:
-            old_checksum, old_size, old_mtime, old_status = record
-            metadata_changed = (old_size != size or old_mtime != mtime)
-
-            # Always re-hash MISSING files (they reappeared — verify against
-            # old checksum) and FAILED files (may have been restored from
-            # backup). Also re-hash if metadata changed or --check is set.
-            if not force and old_status not in ("MISSING", "FAILED") and not metadata_changed:
-                skip_count += 1
-                continue
-            to_hash.append(FileEntry(fpath, name, size, mtime, old_checksum, metadata_changed))
-        else:
-            to_hash.append(FileEntry(fpath, name, size, mtime, None, True))
-
-    return to_hash, skip_count
-
-
-# ── Hashing phase ─────────────────────────────────────────────────────────────
-
-class HashResult:
-    """Counters accumulated during the hashing phase."""
-    __slots__ = ("new", "ok", "updated", "failed", "errors", "bytes_hashed")
-
-    def __init__(self):
-        self.new = 0
-        self.ok = 0
-        self.updated = 0
-        self.failed = 0
-        self.errors = 0
-        self.bytes_hashed = 0
-
-
-def run_hashing(
-    db: ChecksumDB,
-    entries: List[FileEntry],
-    workers: int,
-    now: str,
-    interrupted: List[bool],
-    quiet: bool = False,
-    budget_seconds: Optional[int] = None,
-) -> HashResult:
-    """Hash files in parallel and write results to the database.
-
-    Files are submitted in batches of BATCH_SIZE. Each batch is wrapped
-    in a database transaction with try/finally to guarantee every opened
-    transaction is either committed or rolled back — even on interrupt
-    or worker crash.
-
-    If budget_seconds is set, the elapsed time is checked after every
-    completed file. When the budget is exceeded the current batch's
-    already-completed results are committed and no further batches are
-    started.
-    """
-    result = HashResult()
-    total = len(entries)
-    if total == 0:
-        return result
-
-    processed = 0
-    entry_map = {e.path: e for e in entries}
-    bar = ProgressBar(total, quiet=quiet)
-    budget_start = time.monotonic()
-    budget_exceeded = False
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        for batch_start in range(0, total, BATCH_SIZE):
-            if interrupted[0] or budget_exceeded:
-                break
-
-            batch = entries[batch_start : batch_start + BATCH_SIZE]
-            futures = {executor.submit(hash_file, e.path): e.path for e in batch}
-
-            db.begin()
-            try:
-                for future in as_completed(futures):
-                    if interrupted[0]:
-                        break
-
-                    # Check time budget after each completed file
-                    if budget_seconds is not None and not budget_exceeded:
-                        elapsed = time.monotonic() - budget_start
-                        if elapsed >= budget_seconds:
-                            budget_exceeded = True
-                            remaining = total - processed
-                            if not quiet:
-                                print(f"\n  Time budget reached ({_format_duration(elapsed)})."
-                                      f" Stopping with {remaining:,} files remaining.")
-                            break
-
-                    # Catch worker crashes (OOM, segfault) so one bad file
-                    # doesn't abort the entire run.
-                    try:
-                        fpath, digest, hash_size, hash_mtime = future.result()
-                    except (BrokenExecutor, Exception) as e:
-                        fpath = futures[future]
-                        print(f"\n  ! Worker error for {fpath}: {e}", file=sys.stderr)
-                        result.errors += 1
-                        processed += 1
-                        bar.update(0)
-                        continue
-
-                    processed += 1
-
-                    if digest is None:
-                        result.errors += 1
-                        bar.update(0)
-                        continue
-
-                    entry = entry_map[fpath]
-
-                    # Determine file status based on hash comparison and
-                    # whether the file's metadata changed.
-                    if entry.old_checksum is None:
-                        status = "NEW"
-                        result.new += 1
-                    elif digest == entry.old_checksum:
-                        status = "OK"
-                        result.ok += 1
-                    elif entry.modified:
-                        # Hash changed but so did mtime/size — this is an
-                        # intentional edit, not corruption. Accept it.
-                        status = "OK"
-                        result.updated += 1
-                    else:
-                        # Hash changed with no metadata change — bit rot.
-                        status = "FAILED"
-                        result.failed += 1
-                        print(f"\n  ✗ FAILED: {fpath}")
-
-                    result.bytes_hashed += hash_size
-
-                    db.upsert_file(
-                        fpath, entry.name, hash_size, hash_mtime,
-                        digest, entry.old_checksum, status, now,
-                    )
-
-                    bar.update(hash_size)
-
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-
-    bar.finish()
-    return result
-
-
-# ── Missing file detection ─────────────────────────────────────────────────────
-
-def detect_missing(
-    db: ChecksumDB,
-    target_dir: str,
-    on_disk: Set[str],
-    existing: Dict[str, Tuple[str, int, str, str]],
-    now: str,
-) -> int:
-    """Detect and report all files missing from disk.
-
-    Uses the already-loaded records dict from the prescan phase to avoid
-    a redundant database query. Newly missing files are marked MISSING
-    in the database. Previously known missing files are also reported so
-    every run shows the full picture. Returns total count of all currently
-    missing files.
-    """
-    missing_paths = set(existing.keys()) - on_disk
-    already_missing = db.get_missing_paths(target_dir) - on_disk
-    newly_missing = missing_paths - already_missing
-
-    if newly_missing:
-        db.begin()
-        try:
-            for mpath in sorted(newly_missing):
-                db.mark_missing(mpath, now)
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
-
-    all_missing = newly_missing | already_missing
-    for mpath in sorted(all_missing):
-        print(f"  ? MISSING: {mpath}")
-
-    return len(all_missing)
+# Documented process exit codes. Callers (cron, monitoring, CI) rely on
+# these — keep them stable and add new codes rather than reusing existing
+# ones. The 0–4 range is the public surface from rotbyte 1.0; 5–7 were
+# added to disambiguate "couldn't start cleanly" from "scan completed
+# and found problems."
+EXIT_OK = 0
+EXIT_MISSING = 1            # MISSING files detected
+EXIT_BIT_ROT = 2            # FAILED files detected (silent corruption)
+EXIT_INTERRUPTED = 3        # Ctrl-C or SIGTERM during scan
+EXIT_DB_CORRUPT = 4         # PRAGMA quick_check failed; restore from backup
+EXIT_DB_LOCKED = 5          # Another rotbyte process holds the lock
+EXIT_IO = 6                 # Target dir unreachable / permission denied / I/O failure
+EXIT_INTERNAL = 7           # Worker pool died, unexpected exception
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
@@ -1363,6 +226,7 @@ Examples:
   rotbyte --exclude tmp                  Skip the 'tmp' directory
   rotbyte --exclude tmp cache            Skip multiple directories
   rotbyte --include-hidden               Include hidden files and directories
+  rotbyte --case-insensitive             Normalise paths to lowercase (APFS/NTFS)
   rotbyte --check --budget 2h            Full verify with a 2-hour time limit
   rotbyte --due 30d                       Re-verify files not checked in 30 days
   rotbyte --due 7d --budget 1h           Re-verify week-old files, 1hr budget
@@ -1376,6 +240,9 @@ Exit codes:
   2  Bit rot detected (checksum mismatch)
   3  Run was interrupted (safe to re-run)
   4  Database integrity check failed (restore from backup)
+  5  Database locked by another rotbyte process (retry later)
+  6  I/O error (target directory unreachable, permission denied)
+  7  Internal error (worker pool died, unexpected exception)
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1401,6 +268,14 @@ Exit codes:
                         help="Don't check for files that have been removed")
     parser.add_argument("--include-hidden", action="store_true",
                         help="Include hidden files and directories (excluded by default)")
+    parser.add_argument("--case-insensitive", dest="case_insensitive",
+                        action="store_true",
+                        help="Treat file paths as case-insensitive. Useful on "
+                             "macOS APFS (default) and Windows NTFS where a "
+                             "rename-by-case would otherwise produce phantom "
+                             "MISSING records. Off by default; changing it on "
+                             "an existing database will rewrite paths to lower "
+                             "case on the next scan.")
     parser.add_argument("--exclude", nargs="+", default=[], metavar="PATH",
                         help="Exclude one or more directories (relative to target dir or absolute)")
     parser.add_argument("--db", help="Database path (default: .{dirname}_rotbyte.db inside target dir)")
@@ -1484,7 +359,7 @@ Exit codes:
             print("Error: Another instance is already running against this database.",
                   file=sys.stderr)
             print(f"  If this is a mistake, remove: {lock_path}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_DB_LOCKED)
         try:
             _run(args, target_dir, db_path)
         finally:
@@ -1529,18 +404,18 @@ Exit codes:
         print("Error: --budget with --track requires --full-at.", file=sys.stderr)
         sys.exit(1)
 
-    target_dir = os.path.realpath(args.path)
+    target_dir = _resolve(args.path)
     if not os.path.isdir(target_dir):
         print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_IO)
 
     # Resolve --exclude paths relative to the target directory
     exclude_dirs: Set[str] = set()
     for exc in args.exclude:
         if os.path.isabs(exc):
-            exclude_dirs.add(os.path.realpath(exc))
+            exclude_dirs.add(_resolve(exc))
         else:
-            exclude_dirs.add(os.path.realpath(os.path.join(target_dir, exc)))
+            exclude_dirs.add(_resolve(os.path.join(target_dir, exc)))
     args.exclude_dirs = exclude_dirs
 
     db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
@@ -1585,7 +460,7 @@ Exit codes:
     if not lock.acquire():
         print("Error: Another instance is already running against this database.", file=sys.stderr)
         print(f"  If this is a mistake, remove: {lock_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_DB_LOCKED)
 
     try:
         _run(args, target_dir, db_path)
@@ -1609,7 +484,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
         print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
         print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
-        sys.exit(4)
+        sys.exit(EXIT_DB_CORRUPT)
 
     # Catch subtler corruption that doesn't prevent opening. Runs on every
     # invocation — PRAGMA quick_check is milliseconds even on large DBs.
@@ -1622,7 +497,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
         print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
         db.close()
-        sys.exit(4)
+        sys.exit(EXIT_DB_CORRUPT)
 
     # Informational one-liner when the DB lives on a different volume than
     # the data it tracks — the recommended durability pattern. Silent when
@@ -1677,7 +552,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         if interrupted[0]:
             # Second interrupt — abort immediately
             print("\n  Aborting immediately.\n", file=sys.stderr)
-            sys.exit(3)
+            sys.exit(EXIT_INTERRUPTED)
         interrupted[0] = True
         print("\n\n  Interrupt received — finishing current batch and saving progress...")
         print("  Press Ctrl-C again to abort immediately.\n")
@@ -1700,7 +575,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         db.close()
 
 
-def _auto_export_manifest(db: "ChecksumDB", manifest_path: str,
+def _auto_export_manifest(db: ChecksumDB, manifest_path: str,
                           args: argparse.Namespace) -> None:
     """Write a b2sum-compatible manifest of all non-MISSING tracked files.
 
@@ -1744,7 +619,7 @@ def _run_export(db: ChecksumDB, export_path: str):
                 f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
     except OSError as e:
         print(f"Error: Could not write to {export_path} — {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_IO)
 
     exported = sum(1 for r in records if r["status"] != "MISSING")
     print(f"  ✓ Exported {exported:,} checksums to {export_path}")
@@ -1777,7 +652,7 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
     for root, dirs, filenames in os.walk(target_dir, followlinks=False):
         if not include_hidden:
             dirs[:] = [d for d in dirs if not d.startswith(".")]
-        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) not in exclude]
+        dirs[:] = [d for d in dirs if _resolve(os.path.join(root, d)) not in exclude]
         for name in filenames:
             if name.endswith(HASH_EXTENSIONS) and (include_hidden or not name.startswith(".")):
                 hash_files.append(os.path.join(root, name))
@@ -1814,7 +689,7 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
             continue
 
         # Don't re-import files already tracked (unless MISSING/FAILED)
-        existing_status = db.get_file_status(os.path.realpath(media_path))
+        existing_status = db.get_file_status(_resolve(media_path))
         if existing_status is not None and existing_status not in ("MISSING", "FAILED"):
             print(f"  – Already tracked: {media_path}")
             skipped += 1
@@ -1844,8 +719,10 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
             continue
 
         # Hash the actual file and compare
-        _, our_hash, h_size, h_mtime = hash_file(media_path)
+        _, our_hash, h_size, h_mtime, hash_err = hash_file(media_path)
         if our_hash is None:
+            if hash_err:
+                print(f"  ✗ Could not read {media_name}: {hash_err}")
             errors += 1
             continue
 
@@ -1857,7 +734,7 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
             continue
 
         # Hashes match — import into the database
-        media_real = os.path.realpath(media_path)
+        media_real = _resolve(media_path)
 
         if existing_status in ("MISSING", "FAILED"):
             db.accept_file(media_real, our_hash, h_size, h_mtime, now)
@@ -1898,7 +775,7 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
     MISSING → removes the record (you intentionally deleted it).
     FAILED  → re-hashes and stores the new checksum as known-good.
     """
-    file_path = os.path.realpath(file_arg)
+    file_path = _resolve(file_arg)
     now = _now()
 
     status = db.get_file_status(file_path)
@@ -1913,12 +790,13 @@ def _run_accept_one(db: ChecksumDB, target_dir: str, file_arg: str):
     elif status == "FAILED":
         if not os.path.isfile(file_path):
             print(f"  File not found on disk: {file_path}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_IO)
 
-        _, digest, h_size, h_mtime = hash_file(file_path)
+        _, digest, h_size, h_mtime, hash_err = hash_file(file_path)
         if digest is None:
-            print("  Error reading file.", file=sys.stderr)
-            sys.exit(1)
+            print(f"  Error reading file: {hash_err or 'unknown error'}",
+                  file=sys.stderr)
+            sys.exit(EXIT_IO)
 
         db.accept_file(file_path, digest, h_size, h_mtime, now)
         print(f"  ✓ Accepted: {file_path}")
@@ -1957,7 +835,7 @@ def _discover_db_for_file(file_arg: str) -> str:
         return found
 
     # 2. Walk up from the file's resolved location
-    search_dir = os.path.dirname(os.path.realpath(file_arg))
+    search_dir = os.path.dirname(_resolve(file_arg))
     while True:
         found = _check_dir(search_dir)
         if found:
@@ -1980,7 +858,7 @@ def _run_verify_file(db: ChecksumDB, file_arg: str):
 
     Exit codes: 0 = OK, 2 = checksum mismatch, 1 = error (not tracked, not found, read error).
     """
-    file_path = os.path.realpath(file_arg)
+    file_path = _resolve(file_arg)
     now = _now()
 
     record = db.get_file_record(file_path)
@@ -1989,13 +867,16 @@ def _run_verify_file(db: ChecksumDB, file_arg: str):
         sys.exit(1)
 
     if not os.path.isfile(file_path):
+        # Semantically this is "file that was tracked is gone" — code 1
+        # (MISSING), not 6 (I/O). Keep the legacy mapping.
         print(f"  File not found on disk: {file_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_MISSING)
 
-    _, digest, _h_size, _h_mtime = hash_file(file_path)
+    _, digest, _h_size, _h_mtime, hash_err = hash_file(file_path)
     if digest is None:
-        print("  Error reading file.", file=sys.stderr)
-        sys.exit(1)
+        print(f"  Error reading file: {hash_err or 'unknown error'}",
+              file=sys.stderr)
+        sys.exit(EXIT_IO)
 
     baseline = record["baseline_checksum"]
     if digest == baseline:
@@ -2005,7 +886,7 @@ def _run_verify_file(db: ChecksumDB, file_arg: str):
         print(f"  ✗ FAILED: {file_path}", file=sys.stderr)
         print(f"    Expected : {baseline}", file=sys.stderr)
         print(f"    Got      : {digest}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(EXIT_BIT_ROT)
 
 
 def _run_accept_all(db: ChecksumDB, target_dir: str):
@@ -2029,22 +910,18 @@ def _run_accept_all(db: ChecksumDB, target_dir: str):
     errors = 0
 
     if failed_paths:
-        db.begin()
-        try:
+        with db.transaction():
             for fpath in failed_paths:
-                _, digest, h_size, h_mtime = hash_file(fpath)
+                _, digest, h_size, h_mtime, hash_err = hash_file(fpath)
                 if digest is None:
-                    print(f"  ! Cannot read {fpath} — skipping.")
+                    suffix = f": {hash_err}" if hash_err else ""
+                    print(f"  ! Cannot read {fpath}{suffix} — skipping.")
                     errors += 1
                     continue
 
                 db.accept_file(fpath, digest, h_size, h_mtime, now)
                 accepted += 1
                 print(f"  ✓ Accepted: {fpath}")
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
 
     if not purged and not accepted and not errors:
         print("  Nothing to reconcile — no MISSING or FAILED files.")
@@ -2058,651 +935,126 @@ def _run_accept_all(db: ChecksumDB, target_dir: str):
     print("═" * 60)
 
 
-# ── Track mode (scheduler installation) ────────────────────────────────────────
+# ── Interactive --track wizard ─────────────────────────────────────────────────
 
-import hashlib as _hashlib
-import platform as _platform
-import subprocess as _subprocess
-import textwrap as _textwrap
+def _run_track_setup(path_arg: str):
+    """Interactive setup wizard for --track.
 
-def _dir_hash(target_dir: str) -> str:
-    """Short hash of the target directory path for unique config naming."""
-    return _hashlib.md5(target_dir.encode()).hexdigest()[:8]
-
-
-def _find_rotbyte_executable() -> str:
-    """Find the full path to the rotbyte executable for scheduled tasks.
-
-    On macOS, always returns 'python script.py' format to avoid going
-    through shell wrapper scripts (like Homebrew's bash wrappers). This
-    is critical for Full Disk Access — TCC checks the binary that
-    actually performs I/O (Python), and a bash wrapper in the chain
-    breaks the attribution.
-
-    On Linux (systemd), the shell wrapper is fine since there's no TCC.
+    Collects the same inputs --track accepts as flags, validating each with
+    the existing parsers, then calls _run_track() to perform the actual
+    platform install. No install logic is duplicated here.
     """
-    if _platform.system() == "Darwin":
-        # Always use Python directly on macOS to avoid bash wrapper
-        # attribution issues with Full Disk Access
-        script = os.path.realpath(sys.argv[0])
-        if script.endswith(".py"):
-            return f"{sys.executable} {script}"
-        # If invoked via a wrapper, find the .py script it points to
-        wrapper = shutil.which(os.path.basename(sys.argv[0]))
-        if wrapper:
-            wrapper = os.path.realpath(wrapper)
-            try:
-                with open(wrapper, "r") as f:
-                    content = f.read()
-                # Parse Homebrew-style wrapper:
-                #   exec "/path/to/rotbyte.py" "$@"
-                match = _re.search(r'exec\s+"([^"]+\.py)"', content)
-                if match:
-                    return f"{sys.executable} {match.group(1)}"
-            except OSError:
-                pass
-        return f"{sys.executable} {script}"
-
-    # Linux / other: shell wrappers work fine
-    if not sys.argv[0].endswith(".py"):
-        candidate = shutil.which(os.path.basename(sys.argv[0]))
-        if candidate:
-            return os.path.realpath(candidate)
-
-    candidate = shutil.which("rotbyte")
-    if candidate:
-        return os.path.realpath(candidate)
-
-    return f"{sys.executable} {os.path.realpath(sys.argv[0])}"
-
-
-def _generate_launchd_plist(label: str, command: List[str],
-                            interval_seconds: Optional[int] = None,
-                            calendar_times: Optional[List[Tuple[int, int]]] = None) -> str:
-    """Generate a macOS launchd plist XML string.
-
-    Either interval_seconds (for StartInterval) or calendar_times
-    (for StartCalendarInterval) must be provided.
-    """
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"',
-        '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-        '<plist version="1.0">',
-        '<dict>',
-        '    <key>Label</key>',
-        f'    <string>{label}</string>',
-        '    <key>ProgramArguments</key>',
-        '    <array>',
-    ]
-    for c in command:
-        lines.append(f'        <string>{c}</string>')
-    lines.append('    </array>')
-
-    if interval_seconds is not None:
-        lines.append('    <key>StartInterval</key>')
-        lines.append(f'    <integer>{interval_seconds}</integer>')
-    elif calendar_times is not None:
-        lines.append('    <key>StartCalendarInterval</key>')
-        lines.append('    <array>')
-        for hour, minute in calendar_times:
-            lines.append('        <dict>')
-            lines.append('            <key>Hour</key>')
-            lines.append(f'            <integer>{hour}</integer>')
-            lines.append('            <key>Minute</key>')
-            lines.append(f'            <integer>{minute}</integer>')
-            lines.append('        </dict>')
-        lines.append('    </array>')
-    else:
-        raise ValueError("Must provide interval_seconds or calendar_times")
-
-    lines.extend([
-        '    <key>StandardOutPath</key>',
-        f'    <string>/tmp/{label}.log</string>',
-        '    <key>StandardErrorPath</key>',
-        f'    <string>/tmp/{label}.log</string>',
-        '    <key>Nice</key>',
-        '    <integer>10</integer>',
-        '</dict>',
-        '</plist>',
-        '',
-    ])
-    return '\n'.join(lines)
-
-
-def _generate_systemd_unit(description: str, command: List[str]) -> str:
-    """Generate a systemd .service unit file."""
-    exec_start = " ".join(command)
-    return _textwrap.dedent(f"""\
-        [Unit]
-        Description={description}
-
-        [Service]
-        Type=oneshot
-        ExecStart={exec_start}
-        Nice=10
-
-        [Install]
-        WantedBy=default.target
-    """)
-
-
-def _generate_systemd_timer(description: str,
-                            interval_seconds: Optional[int] = None,
-                            calendar_times: Optional[List[Tuple[int, int]]] = None) -> str:
-    """Generate a systemd .timer unit file."""
-    if interval_seconds is not None:
-        minutes = max(1, interval_seconds // 60)
-        schedule = f"    OnBootSec=5min\n    OnUnitActiveSec={minutes}min"
-    elif calendar_times is not None:
-        entries = []
-        for hour, minute in calendar_times:
-            entries.append(f"    OnCalendar=*-*-* {hour:02d}:{minute:02d}:00")
-        schedule = "\n".join(entries) + "\n    Persistent=true"
-    else:
-        raise ValueError("Must provide interval_seconds or calendar_times")
-
-    return _textwrap.dedent(f"""\
-        [Unit]
-        Description={description}
-
-        [Timer]
-        {schedule}
-
-        [Install]
-        WantedBy=timers.target
-    """)
-
-
-def _run_track(target_dir: str, every_seconds: int,
-               full_at: Optional[List[Tuple[int, int]]],
-               budget_seconds: Optional[int],
-               rotbyte_exe: str,
-               workers: Optional[int] = None,
-               due_days: Optional[int] = None,
-               notify: Optional[str] = None,
-               auto_export: bool = False,
-               run_on_battery: bool = False):
-    """Install platform-native scheduled tasks for rotbyte.
-
-    On macOS:   launchd plists in ~/Library/LaunchAgents/
-    On Linux:   systemd user timer/service pairs in ~/.config/systemd/user/
-    On Windows: Task Scheduler tasks under \\rotbyte\\ (user-level).
-    """
-    is_mac = _platform.system() == "Darwin"
-    is_linux = _platform.system() == "Linux"
-    is_windows = _platform.system() == "Windows"
-
-    if not is_mac and not is_linux and not is_windows:
-        print(f"Error: --track is not supported on {_platform.system()}.", file=sys.stderr)
-        print("  Supported platforms: macOS (launchd), Linux (systemd), Windows (Task Scheduler).",
-              file=sys.stderr)
-        sys.exit(1)
-
-    if run_on_battery and not is_windows:
-        # Silent on non-Windows — flag is platform-specific but permissive.
-        pass
-
-    dhash = _dir_hash(target_dir)
-
-    # Split rotbyte_exe into command parts (handles "python /path/to/rotbyte.py")
-    exe_parts = rotbyte_exe.split()
-
-    # --workers passthrough (only when explicitly set)
-    workers_args = ["--workers", str(workers)] if workers is not None else []
-    notify_args = ["--notify", notify] if notify else []
-    # --auto-export is a bare flag that persists in the scheduled command
-    # so each future run re-exports the manifest after a full --check.
-    auto_export_args = ["--auto-export"] if auto_export else []
-
-    # Build the commands that will be scheduled
-    quick_cmd = (exe_parts + workers_args + notify_args + auto_export_args
-                 + ["--scheduled", "--quiet", target_dir])
-    full_cmd = None
-    if full_at:
-        full_cmd = (exe_parts + ["--check", "--quiet"] + workers_args + notify_args
-                    + auto_export_args + ["--scheduled"])
-        if due_days:
-            full_cmd += ["--due", f"{due_days}d"]
-        if budget_seconds:
-            # Store as the original duration format for the scheduled command
-            budget_h = budget_seconds // 3600
-            budget_m = (budget_seconds % 3600) // 60
-            budget_str = ""
-            if budget_h:
-                budget_str += f"{budget_h}h"
-            if budget_m:
-                budget_str += f"{budget_m}m"
-            if not budget_str:
-                budget_str = "1m"
-            full_cmd += ["--budget", budget_str]
-        full_cmd.append(target_dir)
+    from typing import Tuple
 
     print("═" * 60)
-    print("  rotbyte — Installing scheduled scans")
-    print("═" * 60)
-    print(f"  Directory  : {target_dir}")
-    print(f"  Quick scan : every {_format_duration(every_seconds)}")
-    if full_at:
-        times_str = ", ".join(_format_clock_time(h, m) for h, m in full_at)
-        print(f"  Full scan  : daily at {times_str}")
-        if budget_seconds:
-            print(f"  Budget     : {_format_duration(budget_seconds)} per full scan")
-        if due_days:
-            print(f"  Due window : files not verified in {due_days} days")
-    if workers is not None:
-        print(f"  Workers    : {workers}")
-    if notify:
-        print(f"  Notify     : {notify}")
-    if auto_export:
-        print(f"  Manifest   : auto-exported after each full scan")
-    if is_windows:
-        plat_label = "Windows (Task Scheduler)"
-    elif is_mac:
-        plat_label = "macOS (launchd)"
-    else:
-        plat_label = "Linux (systemd)"
-    print(f"  Platform   : {plat_label}")
-    if is_windows:
-        print(f"  On battery : {'allowed' if run_on_battery else 'skip (default)'}")
+    print("  rotbyte — Scheduled scan setup")
     print("═" * 60)
     print()
-
-    if is_mac:
-        _install_launchd(target_dir, dhash, quick_cmd, every_seconds,
-                         full_cmd, full_at)
-    elif is_linux:
-        _install_systemd(target_dir, dhash, quick_cmd, every_seconds,
-                         full_cmd, full_at)
-    else:
-        _install_schtasks(target_dir, dhash, quick_cmd, every_seconds,
-                          full_cmd, full_at, budget_seconds=budget_seconds,
-                          run_on_battery=run_on_battery)
-
+    print("  This wizard installs scheduled scans via launchd (macOS)")
+    print("  or systemd (Linux). Press Ctrl-C at any prompt to abort.")
     print()
-    print("═" * 60)
-    print("  ✓ Scheduled scans installed successfully.")
-    print()
-    print("  Logs:")
-    if is_mac:
-        print(f"    /tmp/com.rotbyte.quick.{dhash}.log")
-        if full_at:
-            print(f"    /tmp/com.rotbyte.full.{dhash}.log")
-    elif is_linux:
-        print(f"    journalctl --user -u rotbyte-quick-{dhash}")
-        if full_at:
-            print(f"    journalctl --user -u rotbyte-full-{dhash}")
-    else:
-        log_dir = os.path.join(os.environ.get("LOCALAPPDATA",
-                               os.path.expanduser("~")), "rotbyte", "logs")
-        print(f"    {os.path.join(log_dir, f'quick-{dhash}.log')}")
-        if full_at:
-            print(f"    {os.path.join(log_dir, f'full-{dhash}.log')}")
-        print("    (also visible in Task Scheduler → Task History)")
-    print("═" * 60)
 
+    # 1. Target directory
+    default_dir = _resolve(path_arg)
+    raw = input(f"  Directory to scan [{default_dir}]: ").strip()
+    target_dir = _resolve(raw) if raw else default_dir
+    if not os.path.isdir(target_dir):
+        print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
+        sys.exit(EXIT_IO)
 
-def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
-                     every_seconds: int, full_cmd: Optional[List[str]],
-                     full_at: Optional[List[Tuple[int, int]]]):
-    """Write and load macOS launchd plist files."""
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
-    os.makedirs(agents_dir, exist_ok=True)
-
-    quick_label = f"com.rotbyte.quick.{dhash}"
-    quick_plist = os.path.join(agents_dir, f"{quick_label}.plist")
-
-    # Unload existing agents first (ignore errors if not loaded)
-    _subprocess.run(["launchctl", "unload", quick_plist],
-                    capture_output=True)
-
-    plist_content = _generate_launchd_plist(
-        quick_label, quick_cmd, interval_seconds=every_seconds,
-    )
-    with open(quick_plist, "w") as f:
-        f.write(plist_content)
-    _subprocess.run(["launchctl", "load", quick_plist], check=True)
-    print(f"  ✓ Installed: {quick_plist}")
-
-    if full_cmd and full_at:
-        full_label = f"com.rotbyte.full.{dhash}"
-        full_plist = os.path.join(agents_dir, f"{full_label}.plist")
-
-        _subprocess.run(["launchctl", "unload", full_plist],
-                        capture_output=True)
-
-        plist_content = _generate_launchd_plist(
-            full_label, full_cmd, calendar_times=full_at,
-        )
-        with open(full_plist, "w") as f:
-            f.write(plist_content)
-        _subprocess.run(["launchctl", "load", full_plist], check=True)
-        print(f"  ✓ Installed: {full_plist}")
-
-
-def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
-                     every_seconds: int, full_cmd: Optional[List[str]],
-                     full_at: Optional[List[Tuple[int, int]]]):
-    """Write and enable systemd user timer/service pairs."""
-    unit_dir = os.path.expanduser("~/.config/systemd/user")
-    os.makedirs(unit_dir, exist_ok=True)
-
-    quick_name = f"rotbyte-quick-{dhash}"
-
-    # Quick scan service + timer
-    service_content = _generate_systemd_unit(
-        f"rotbyte quick scan ({target_dir})", quick_cmd,
-    )
-    timer_content = _generate_systemd_timer(
-        f"rotbyte quick scan timer ({target_dir})",
-        interval_seconds=every_seconds,
-    )
-
-    with open(os.path.join(unit_dir, f"{quick_name}.service"), "w") as f:
-        f.write(service_content)
-    with open(os.path.join(unit_dir, f"{quick_name}.timer"), "w") as f:
-        f.write(timer_content)
-
-    _subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    _subprocess.run(["systemctl", "--user", "enable", "--now", f"{quick_name}.timer"],
-                    check=True)
-    print(f"  ✓ Installed: {quick_name}.timer + .service")
-
-    if full_cmd and full_at:
-        full_name = f"rotbyte-full-{dhash}"
-
-        service_content = _generate_systemd_unit(
-            f"rotbyte full scan ({target_dir})", full_cmd,
-        )
-        timer_content = _generate_systemd_timer(
-            f"rotbyte full scan timer ({target_dir})",
-            calendar_times=full_at,
-        )
-
-        with open(os.path.join(unit_dir, f"{full_name}.service"), "w") as f:
-            f.write(service_content)
-        with open(os.path.join(unit_dir, f"{full_name}.timer"), "w") as f:
-            f.write(timer_content)
-
-        _subprocess.run(["systemctl", "--user", "enable", "--now", f"{full_name}.timer"],
-                        check=True)
-        print(f"  ✓ Installed: {full_name}.timer + .service")
-
-
-# ── Windows Task Scheduler install ─────────────────────────────────────────────
-
-def _xml_escape(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             .replace('"', "&quot;").replace("'", "&apos;"))
-
-
-def _generate_task_xml(description: str, command: List[str],
-                       triggers_xml: str, run_on_battery: bool,
-                       execution_time_limit: Optional[str] = None) -> str:
-    """Generate a Windows Task Scheduler XML definition.
-
-    `triggers_xml` is a <Triggers>...</Triggers> block the caller assembles
-    (interval-based for quick scans, calendar-based for full scans).
-    `execution_time_limit` is an ISO 8601 duration like "PT2H" that maps
-    directly to --budget for full scans.
-    """
-    if not command:
-        raise ValueError("command must not be empty")
-    program = _xml_escape(command[0])
-    arguments = _xml_escape(_quote_windows_args(command[1:])) if len(command) > 1 else ""
-    desc = _xml_escape(description)
-    author = _xml_escape(os.environ.get("USERNAME", "rotbyte"))
-    # Default: stop after 24 hours of runtime even if the task never finished,
-    # to avoid stuck tasks blocking the next schedule. Full scans override via
-    # execution_time_limit when --budget is set.
-    time_limit = execution_time_limit or "PT24H"
-    battery_flags = (
-        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
-        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
-        if run_on_battery else
-        "    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>\n"
-        "    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>\n"
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-16"?>\n'
-        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
-        '  <RegistrationInfo>\n'
-        f'    <Description>{desc}</Description>\n'
-        f'    <Author>{author}</Author>\n'
-        '    <URI>\\rotbyte\\' + _xml_escape(description) + '</URI>\n'
-        '  </RegistrationInfo>\n'
-        f'  {triggers_xml}\n'
-        '  <Principals>\n'
-        '    <Principal id="Author">\n'
-        '      <LogonType>InteractiveToken</LogonType>\n'
-        '      <RunLevel>LeastPrivilege</RunLevel>\n'
-        '    </Principal>\n'
-        '  </Principals>\n'
-        '  <Settings>\n'
-        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
-        + battery_flags +
-        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
-        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
-        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
-        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
-        '    <Enabled>true</Enabled>\n'
-        '    <Hidden>false</Hidden>\n'
-        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n'
-        '    <WakeToRun>false</WakeToRun>\n'
-        f'    <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>\n'
-        '    <Priority>7</Priority>\n'
-        '  </Settings>\n'
-        '  <Actions Context="Author">\n'
-        '    <Exec>\n'
-        f'      <Command>{program}</Command>\n'
-        + (f'      <Arguments>{arguments}</Arguments>\n' if arguments else '') +
-        '    </Exec>\n'
-        '  </Actions>\n'
-        '</Task>\n'
-    )
-
-
-def _quote_windows_args(args: List[str]) -> str:
-    """Quote a list of arguments for a Windows <Arguments> element.
-
-    Uses the CommandLineToArgvW convention: wrap in double quotes any
-    argument that contains a space or double quote, and escape embedded
-    quotes by doubling backslashes + quote.
-    """
-    out = []
-    for a in args:
-        if not a:
-            out.append('""')
-            continue
-        needs_quote = any(c in a for c in ' \t"')
-        if not needs_quote:
-            out.append(a)
-            continue
-        # Escape per MS rules
-        escaped = a.replace("\\", "\\\\").replace('"', '\\"')
-        out.append(f'"{escaped}"')
-    return " ".join(out)
-
-
-def _iso_duration(seconds: int) -> str:
-    """Convert seconds to ISO 8601 duration (e.g. PT2H, PT30M, PT1H30M)."""
-    hours, rem = divmod(max(seconds, 0), 3600)
-    minutes, secs = divmod(rem, 60)
-    parts = []
-    if hours:
-        parts.append(f"{hours}H")
-    if minutes:
-        parts.append(f"{minutes}M")
-    if secs and not (hours or minutes):
-        parts.append(f"{secs}S")
-    return "PT" + ("".join(parts) if parts else "1M")
-
-
-def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
-                      every_seconds: int, full_cmd: Optional[List[str]],
-                      full_at: Optional[List[Tuple[int, int]]],
-                      budget_seconds: Optional[int] = None,
-                      run_on_battery: bool = False):
-    """Register Windows Task Scheduler tasks under \\rotbyte\\.
-
-    Uses `schtasks.exe /Create /XML` so the full richness of the task
-    definition (ExecutionTimeLimit, battery policy, StartWhenAvailable)
-    is preserved. Requires no elevated privileges for user-level tasks.
-    """
-    import tempfile
-
-    tasks_dir = os.path.join(os.environ.get("LOCALAPPDATA",
-                             os.path.expanduser("~")), "rotbyte", "tasks")
-    os.makedirs(tasks_dir, exist_ok=True)
-
-    # ── Quick scan ─────────────────────────────────────────────────────
-    quick_name = f"rotbyte-quick-{dhash}"
-    quick_path = f"\\rotbyte\\{quick_name}"
-    interval_iso = _iso_duration(every_seconds)
-    # Start trigger a minute from now so the task has a concrete StartBoundary.
-    start = datetime.now().replace(microsecond=0).isoformat()
-    quick_triggers = (
-        '<Triggers>\n'
-        '    <TimeTrigger>\n'
-        f'      <StartBoundary>{start}</StartBoundary>\n'
-        '      <Enabled>true</Enabled>\n'
-        '      <Repetition>\n'
-        f'        <Interval>{interval_iso}</Interval>\n'
-        '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
-        '      </Repetition>\n'
-        '    </TimeTrigger>\n'
-        '  </Triggers>'
-    )
-    quick_xml = _generate_task_xml(
-        f"rotbyte quick scan ({target_dir})", quick_cmd,
-        quick_triggers, run_on_battery,
-    )
-    quick_xml_path = os.path.join(tasks_dir, f"{quick_name}.xml")
-    # schtasks expects UTF-16-LE with BOM for /XML input.
-    with open(quick_xml_path, "wb") as f:
-        f.write(quick_xml.encode("utf-16"))
-
-    _subprocess.run(
-        ["schtasks.exe", "/Create", "/TN", quick_path, "/XML", quick_xml_path, "/F"],
-        check=True,
-    )
-    print(f"  ✓ Installed: {quick_path}")
-
-    # ── Full scan ──────────────────────────────────────────────────────
-    if full_cmd and full_at:
-        full_name = f"rotbyte-full-{dhash}"
-        full_task_path = f"\\rotbyte\\{full_name}"
-        # Multiple CalendarTrigger blocks, one per clock time.
-        trigger_parts = ['<Triggers>']
-        for hh, mm in full_at:
-            today = datetime.now().date()
-            sb = f"{today.isoformat()}T{hh:02d}:{mm:02d}:00"
-            trigger_parts.append(
-                '    <CalendarTrigger>\n'
-                f'      <StartBoundary>{sb}</StartBoundary>\n'
-                '      <Enabled>true</Enabled>\n'
-                '      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n'
-                '    </CalendarTrigger>'
-            )
-        trigger_parts.append('  </Triggers>')
-        full_triggers = "\n".join(trigger_parts)
-        # Map --budget to ExecutionTimeLimit so the task auto-stops when
-        # the budget is exhausted, matching launchd/systemd behavior.
-        limit = _iso_duration(budget_seconds) if budget_seconds else None
-        full_xml = _generate_task_xml(
-            f"rotbyte full scan ({target_dir})", full_cmd,
-            full_triggers, run_on_battery, execution_time_limit=limit,
-        )
-        full_xml_path = os.path.join(tasks_dir, f"{full_name}.xml")
-        with open(full_xml_path, "wb") as f:
-            f.write(full_xml.encode("utf-16"))
-        _subprocess.run(
-            ["schtasks.exe", "/Create", "/TN", full_task_path, "/XML", full_xml_path, "/F"],
-            check=True,
-        )
-        print(f"  ✓ Installed: {full_task_path}")
-
-
-def _discover_schtasks() -> Dict[str, Dict]:
-    """Query Task Scheduler for installed rotbyte tasks.
-
-    Parses `schtasks /Query /XML` output to reconstruct per-directory
-    schedule info for --status.
-    """
-    try:
-        result = _subprocess.run(
-            ["schtasks.exe", "/Query", "/TN", "\\rotbyte\\", "/XML"],
-            capture_output=True, text=True, check=False,
-        )
-    except FileNotFoundError:
-        return {}
-    if result.returncode != 0 or not result.stdout:
-        return {}
-
-    # Output is a concatenated series of Task XML docs. Split on the
-    # XML prolog to recover each one.
-    import re
-    docs = [d for d in re.split(r'(?=<\?xml )', result.stdout) if d.strip()]
-    import xml.etree.ElementTree as ET
-    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
-
-    found: Dict[str, Dict] = {}
-    for doc in docs:
+    # 2. Quick scan frequency
+    while True:
+        raw = input("  Quick scan frequency [60m]: ").strip() or "60m"
         try:
-            root = ET.fromstring(doc)
-        except ET.ParseError:
-            continue
-        desc_el = root.find("t:RegistrationInfo/t:Description", ns)
-        desc = desc_el.text if desc_el is not None and desc_el.text else ""
-        # Description format: "rotbyte quick scan (TARGET)" / "rotbyte full scan (TARGET)"
-        m = re.match(r"rotbyte (quick|full) scan \((.+)\)", desc)
-        if not m:
-            continue
-        kind, target = m.group(1), m.group(2)
-        entry = found.setdefault(target, {"target_dir": target, "platform": "windows"})
-        if kind == "quick":
-            interval_el = root.find(
-                "t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", ns)
-            entry["quick_interval"] = _parse_iso_duration(interval_el.text) if interval_el is not None else None
+            every_seconds = parse_duration(raw)
+            every_display = raw
+            break
+        except ValueError as e:
+            print(f"  Invalid duration: {e}")
+
+    # 3. Full scan clock times (optional)
+    full_at_times: Optional[List[Tuple[int, int]]] = None
+    full_at_display: List[str] = []
+    while True:
+        raw = input("  Full scan clock times, space-separated (e.g. 2h 14h) [none]: ").strip()
+        if not raw:
+            break
+        try:
+            full_at_times = [parse_clock_time(t) for t in raw.split()]
+            full_at_display = raw.split()
+            break
+        except ValueError as e:
+            print(f"  Invalid clock time: {e}")
+
+    # 4. Budget (only meaningful with full scans)
+    budget_seconds: Optional[int] = None
+    budget_display: Optional[str] = None
+    if full_at_times:
+        while True:
+            raw = input("  Time budget per full scan (e.g. 2h) [none]: ").strip()
+            if not raw:
+                break
+            try:
+                budget_seconds = parse_duration(raw)
+                budget_display = raw
+                break
+            except ValueError as e:
+                print(f"  Invalid duration: {e}")
+
+    # 5. Due threshold
+    due_days: Optional[int] = None
+    due_display: Optional[str] = None
+    while True:
+        raw = input("  Re-verify files not checked within (e.g. 30d) [none]: ").strip()
+        if not raw:
+            break
+        try:
+            due_days = parse_days(raw)
+            due_display = raw
+            break
+        except ValueError as e:
+            print(f"  Invalid --due value: {e}")
+
+    # 6. Email notifications (optional)
+    notify: Optional[str] = None
+    raw = input("  Send email on problems? [y/N]: ").strip().lower()
+    if raw in ("y", "yes"):
+        cfg_path = _notify_config_path()
+        if not os.path.exists(cfg_path):
+            print(f"  Email isn't configured yet ({cfg_path} not found).")
+            print("  Run 'rotbyte --notify-setup email' first, then re-run --track-setup.")
+            print("  Continuing without email notifications.")
         else:
-            times = []
-            for ct in root.findall("t:Triggers/t:CalendarTrigger", ns):
-                sb = ct.find("t:StartBoundary", ns)
-                if sb is None or not sb.text:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(sb.text)
-                    times.append((dt.hour, dt.minute))
-                except ValueError:
-                    continue
-            entry["full_at"] = times
-            limit_el = root.find("t:Settings/t:ExecutionTimeLimit", ns)
-            if limit_el is not None and limit_el.text:
-                entry["budget"] = _parse_iso_duration(limit_el.text)
-    return found
+            notify = "email"
+
+    # 7. Confirmation summary
+    rotbyte_exe = _find_rotbyte_executable()
+    cli_parts = [rotbyte_exe, "--track", "--every", every_display]
+    if full_at_display:
+        cli_parts.extend(["--full-at", *full_at_display])
+    if budget_display:
+        cli_parts.extend(["--budget", budget_display])
+    if due_display:
+        cli_parts.extend(["--due", due_display])
+    if notify:
+        cli_parts.extend(["--notify", notify])
+    cli_parts.append(target_dir)
+
+    print()
+    print("  Equivalent command:")
+    print(f"    {' '.join(cli_parts)}")
+    print()
+    raw = input("  Install? [Y/n]: ").strip().lower()
+    if raw in ("n", "no"):
+        print("  Aborted.")
+        return
+
+    # 8. Install via the existing code path
+    _run_track(target_dir, every_seconds, full_at_times, budget_seconds,
+               rotbyte_exe, workers=None, due_days=due_days, notify=notify)
 
 
-def _parse_iso_duration(s: Optional[str]) -> Optional[int]:
-    """Parse an ISO 8601 duration (PT2H30M) into seconds. Best-effort."""
-    if not s or not s.startswith("PT"):
-        return None
-    import re
-    total = 0
-    for num, unit in re.findall(r"(\d+)([HMS])", s[2:]):
-        n = int(num)
-        if unit == "H":
-            total += n * 3600
-        elif unit == "M":
-            total += n * 60
-        elif unit == "S":
-            total += n
-    return total or None
-
-
-# ── Status mode ────────────────────────────────────────────────────────────────
-
-import glob as _glob
-import plistlib as _plistlib
+# ── --status dispatch ──────────────────────────────────────────────────────────
 
 def _run_status():
     """Display status of all tracked directories with schedule and health info.
@@ -2710,19 +1062,15 @@ def _run_status():
     Discovers installed scheduler configs, opens each target's database,
     and reports schedule, last activity, and file health.
     """
-    is_mac = _platform.system() == "Darwin"
-    is_linux = _platform.system() == "Linux"
-    is_windows = _platform.system() == "Windows"
-
-    if not is_mac and not is_linux and not is_windows:
-        print(f"Error: --status is not supported on {_platform.system()}.", file=sys.stderr)
-        sys.exit(1)
+    if not (_IS_MACOS or _IS_LINUX or _IS_WINDOWS):
+        print(f"Error: --status is not supported on {sys.platform}.", file=sys.stderr)
+        sys.exit(EXIT_IO)
 
     # Discover all tracked directories grouped by hash
-    if is_windows:
+    if _IS_WINDOWS:
         tracked = _discover_schtasks()
     else:
-        tracked = _discover_tracked(is_mac)
+        tracked = _discover_tracked(_IS_MACOS)
 
     if not tracked:
         print("  No scheduled scans found.")
@@ -2832,475 +1180,7 @@ def _run_status():
     print("═" * 60)
 
 
-def _discover_tracked(is_mac: bool) -> Dict[str, Dict]:
-    """Discover all installed rotbyte scheduler configs.
-
-    Returns {target_dir: {"quick": {...}, "full": {...}}} with schedule
-    details and active status for each tracked directory.
-    """
-    if is_mac:
-        return _discover_launchd()
-    return _discover_systemd()
-
-
-def _discover_launchd() -> Dict[str, Dict]:
-    """Parse installed launchd plists to discover tracked directories."""
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
-    tracked: Dict[str, Dict] = {}
-
-    for plist_path in sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist"))):
-        try:
-            with open(plist_path, "rb") as f:
-                plist = _plistlib.load(f)
-        except Exception:
-            continue
-
-        label = plist.get("Label", "")
-        args = plist.get("ProgramArguments", [])
-        if not args:
-            continue
-
-        # The target directory is always the last argument
-        target_dir = args[-1] if args else None
-        if not target_dir or not os.path.isabs(target_dir):
-            continue
-
-        if target_dir not in tracked:
-            tracked[target_dir] = {}
-
-        # Check if this agent is loaded
-        result = _subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True, text=True,
-        )
-        active = result.returncode == 0
-
-        if ".quick." in label:
-            interval = plist.get("StartInterval", 3600)
-            tracked[target_dir]["quick"] = {
-                "interval": interval,
-                "active": active,
-            }
-        elif ".full." in label:
-            times = []
-            cal = plist.get("StartCalendarInterval", [])
-            if isinstance(cal, dict):
-                cal = [cal]
-            for entry in cal:
-                times.append((entry.get("Hour", 0), entry.get("Minute", 0)))
-
-            tracked[target_dir]["full"] = {
-                "times": times,
-                "active": active,
-                **_parse_cmd_flags(args),
-            }
-
-    return tracked
-
-
-def _discover_systemd() -> Dict[str, Dict]:
-    """Parse installed systemd user units to discover tracked directories."""
-    unit_dir = os.path.expanduser("~/.config/systemd/user")
-    tracked: Dict[str, Dict] = {}
-
-    for service_path in sorted(_glob.glob(os.path.join(unit_dir, "rotbyte-*.service"))):
-        basename = os.path.basename(service_path)
-        # e.g. rotbyte-quick-a1b2c3d4.service
-        name = basename.replace(".service", "")
-
-        try:
-            with open(service_path, "r") as f:
-                content = f.read()
-        except OSError:
-            continue
-
-        # Extract ExecStart line
-        exec_line = None
-        for line in content.splitlines():
-            if line.startswith("ExecStart="):
-                exec_line = line[len("ExecStart="):]
-                break
-        if not exec_line:
-            continue
-
-        args = exec_line.split()
-        target_dir = args[-1] if args else None
-        if not target_dir or not os.path.isabs(target_dir):
-            continue
-
-        if target_dir not in tracked:
-            tracked[target_dir] = {}
-
-        # Check if timer is active
-        timer_name = f"{name}.timer"
-        result = _subprocess.run(
-            ["systemctl", "--user", "is-active", timer_name],
-            capture_output=True, text=True,
-        )
-        active = result.stdout.strip() == "active"
-
-        is_quick = "-quick-" in name
-
-        if is_quick:
-            # Parse interval from timer file
-            timer_path = service_path.replace(".service", ".timer")
-            interval = 3600  # default
-            try:
-                with open(timer_path, "r") as f:
-                    for line in f:
-                        if line.strip().startswith("OnUnitActiveSec="):
-                            val = line.strip().split("=", 1)[1]
-                            # Parse "60min" format
-                            m = _re.match(r"(\d+)min", val)
-                            if m:
-                                interval = int(m.group(1)) * 60
-                            break
-            except OSError:
-                pass
-            tracked[target_dir]["quick"] = {
-                "interval": interval,
-                "active": active,
-            }
-        else:
-            # Parse calendar times from timer file
-            timer_path = service_path.replace(".service", ".timer")
-            times = []
-            try:
-                with open(timer_path, "r") as f:
-                    for line in f:
-                        if line.strip().startswith("OnCalendar="):
-                            val = line.strip().split("=", 1)[1]
-                            # Parse "*-*-* HH:MM:00"
-                            m = _re.search(r"(\d{2}):(\d{2}):00", val)
-                            if m:
-                                times.append((int(m.group(1)), int(m.group(2))))
-            except OSError:
-                pass
-            tracked[target_dir]["full"] = {
-                "times": times,
-                "active": active,
-                **_parse_cmd_flags(args),
-            }
-
-    return tracked
-
-
-def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
-    """Extract --due, --budget, --workers, --notify values from a command arg list."""
-    flags: Dict[str, Optional[str]] = {}
-    for i, arg in enumerate(args):
-        if arg == "--due" and i + 1 < len(args):
-            flags["due"] = args[i + 1]
-        elif arg == "--budget" and i + 1 < len(args):
-            flags["budget"] = args[i + 1]
-        elif arg == "--workers" and i + 1 < len(args):
-            flags["workers"] = args[i + 1]
-        elif arg == "--notify" and i + 1 < len(args):
-            flags["notify"] = args[i + 1]
-    return flags
-
-
-# ── Email notifications ────────────────────────────────────────────────────────
-
-def _notify_config_path() -> str:
-    """Return the platform-appropriate path for the notify config file."""
-    if _platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/rotbyte")
-    else:
-        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-        base = os.path.join(base, "rotbyte")
-    return os.path.join(base, "notify.conf")
-
-
-def _load_notify_config() -> configparser.ConfigParser:
-    """Load and return the notification config, or exit with an error."""
-    path = _notify_config_path()
-    if not os.path.isfile(path):
-        print(f"Error: No notification config found at {path}", file=sys.stderr)
-        print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
-        sys.exit(1)
-    config = configparser.ConfigParser()
-    config.read(path)
-    if "email" not in config:
-        print(f"Error: No [email] section in {path}", file=sys.stderr)
-        print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
-        sys.exit(1)
-    for key in ("smtp_host", "smtp_port", "username", "password", "to"):
-        if key not in config["email"]:
-            print(f"Error: Missing '{key}' in [email] section of {path}", file=sys.stderr)
-            print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
-            sys.exit(1)
-    return config
-
-
-def _run_track_setup(path_arg: str):
-    """Interactive setup wizard for --track.
-
-    Collects the same inputs --track accepts as flags, validating each with
-    the existing parsers, then calls _run_track() to perform the actual
-    platform install. No install logic is duplicated here.
-    """
-    print("═" * 60)
-    print("  rotbyte — Scheduled scan setup")
-    print("═" * 60)
-    print()
-    print("  This wizard installs scheduled scans via launchd (macOS)")
-    print("  or systemd (Linux). Press Ctrl-C at any prompt to abort.")
-    print()
-
-    # 1. Target directory
-    default_dir = os.path.realpath(path_arg)
-    raw = input(f"  Directory to scan [{default_dir}]: ").strip()
-    target_dir = os.path.realpath(raw) if raw else default_dir
-    if not os.path.isdir(target_dir):
-        print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
-        sys.exit(1)
-
-    # 2. Quick scan frequency
-    while True:
-        raw = input("  Quick scan frequency [60m]: ").strip() or "60m"
-        try:
-            every_seconds = parse_duration(raw)
-            every_display = raw
-            break
-        except ValueError as e:
-            print(f"  Invalid duration: {e}")
-
-    # 3. Full scan clock times (optional)
-    full_at_times: Optional[List[Tuple[int, int]]] = None
-    full_at_display: List[str] = []
-    while True:
-        raw = input("  Full scan clock times, space-separated (e.g. 2h 14h) [none]: ").strip()
-        if not raw:
-            break
-        try:
-            full_at_times = [parse_clock_time(t) for t in raw.split()]
-            full_at_display = raw.split()
-            break
-        except ValueError as e:
-            print(f"  Invalid clock time: {e}")
-
-    # 4. Budget (only meaningful with full scans)
-    budget_seconds: Optional[int] = None
-    budget_display: Optional[str] = None
-    if full_at_times:
-        while True:
-            raw = input("  Time budget per full scan (e.g. 2h) [none]: ").strip()
-            if not raw:
-                break
-            try:
-                budget_seconds = parse_duration(raw)
-                budget_display = raw
-                break
-            except ValueError as e:
-                print(f"  Invalid duration: {e}")
-
-    # 5. Due threshold
-    due_days: Optional[int] = None
-    due_display: Optional[str] = None
-    while True:
-        raw = input("  Re-verify files not checked within (e.g. 30d) [none]: ").strip()
-        if not raw:
-            break
-        try:
-            due_days = parse_days(raw)
-            due_display = raw
-            break
-        except ValueError as e:
-            print(f"  Invalid --due value: {e}")
-
-    # 6. Email notifications (optional)
-    notify: Optional[str] = None
-    raw = input("  Send email on problems? [y/N]: ").strip().lower()
-    if raw in ("y", "yes"):
-        cfg_path = _notify_config_path()
-        if not os.path.exists(cfg_path):
-            print(f"  Email isn't configured yet ({cfg_path} not found).")
-            print("  Run 'rotbyte --notify-setup email' first, then re-run --track-setup.")
-            print("  Continuing without email notifications.")
-        else:
-            notify = "email"
-
-    # 7. Confirmation summary
-    rotbyte_exe = _find_rotbyte_executable()
-    cli_parts = [rotbyte_exe, "--track", "--every", every_display]
-    if full_at_display:
-        cli_parts.extend(["--full-at", *full_at_display])
-    if budget_display:
-        cli_parts.extend(["--budget", budget_display])
-    if due_display:
-        cli_parts.extend(["--due", due_display])
-    if notify:
-        cli_parts.extend(["--notify", notify])
-    cli_parts.append(target_dir)
-
-    print()
-    print("  Equivalent command:")
-    print(f"    {' '.join(cli_parts)}")
-    print()
-    raw = input("  Install? [Y/n]: ").strip().lower()
-    if raw in ("n", "no"):
-        print("  Aborted.")
-        return
-
-    # 8. Install via the existing code path
-    _run_track(target_dir, every_seconds, full_at_times, budget_seconds,
-               rotbyte_exe, workers=None, due_days=due_days, notify=notify)
-
-
-def _run_notify_setup():
-    """Interactive setup for email notifications."""
-    print("═" * 60)
-    print("  rotbyte — Email notification setup")
-    print("═" * 60)
-    print()
-    print("  You'll need SMTP credentials for your email provider.")
-    print("  For Gmail, use an App Password (not your account password).")
-    print("  See: https://support.google.com/accounts/answer/185833")
-    print()
-
-    smtp_host = input("  SMTP host (e.g. smtp.gmail.com): ").strip()
-    if not smtp_host:
-        print("Error: SMTP host is required.", file=sys.stderr)
-        sys.exit(1)
-
-    smtp_port_str = input("  SMTP port [587]: ").strip()
-    smtp_port = int(smtp_port_str) if smtp_port_str else 587
-
-    username = input("  Username (your email address): ").strip()
-    if not username:
-        print("Error: Username is required.", file=sys.stderr)
-        sys.exit(1)
-
-    password = input("  Password / app password: ").strip()
-    if not password:
-        print("Error: Password is required.", file=sys.stderr)
-        sys.exit(1)
-
-    to_addr = input(f"  Send alerts to [{username}]: ").strip()
-    if not to_addr:
-        to_addr = username
-
-    # Test the connection
-    print()
-    print("  Testing connection...", end="", flush=True)
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-            server.starttls()
-            server.login(username, password)
-
-            msg = email.mime.text.MIMEText(
-                "This is a test notification from rotbyte.\n\n"
-                "If you received this, email notifications are working correctly.\n"
-            )
-            msg["Subject"] = "rotbyte: test notification"
-            msg["From"] = username
-            msg["To"] = to_addr
-            server.sendmail(username, [to_addr], msg.as_string())
-    except Exception as e:
-        print(f" failed.\n\n  Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    print(" ok.")
-
-    # Write config
-    config_path = _notify_config_path()
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-
-    config = configparser.ConfigParser()
-    config["email"] = {
-        "smtp_host": smtp_host,
-        "smtp_port": str(smtp_port),
-        "username": username,
-        "password": password,
-        "to": to_addr,
-    }
-    with open(config_path, "w") as f:
-        config.write(f)
-    os.chmod(config_path, 0o600)
-
-    print(f"  Config saved to {config_path}")
-    print(f"  Test email sent to {to_addr} — check your inbox.")
-    print()
-    print("  Usage:")
-    print("    rotbyte --check --notify email /Volumes/Media")
-    print("    rotbyte --track --notify email --every 1h /Volumes/Media")
-
-
-def _send_email_notification(target_dir: str, failed: int, count_missing: int,
-                             failed_files: List[Dict],
-                             freshness: Optional[tuple] = None):
-    """Send an email notification about scan problems.
-
-    Best-effort: prints a warning on failure but never prevents the scan
-    from completing with its normal exit code.
-
-    freshness, if provided, is a (total, verified_within, due) tuple from
-    ChecksumDB.freshness_stats() and is appended as a summary line.
-    """
-    try:
-        config = _load_notify_config()
-    except SystemExit:
-        # _load_notify_config calls sys.exit on error; during notification
-        # we want to warn, not abort.
-        print("  Warning: could not load email config — skipping notification.",
-              file=sys.stderr)
-        return
-
-    section = config["email"]
-
-    # Build subject
-    parts = []
-    if failed > 0:
-        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
-    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
-
-    # Build body
-    lines = [
-        f"rotbyte detected problems in {target_dir}:\n",
-    ]
-    if failed > 0:
-        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        lines.append(f"  Missing files:    {count_missing}")
-    lines.append("")
-
-    if failed_files:
-        lines.append("Affected files:")
-        for f in failed_files[:50]:
-            lines.append(f"  ✗ {f['file_path']}")
-        if len(failed_files) > 50:
-            lines.append(f"  ... and {len(failed_files) - 50} more")
-        lines.append("")
-
-    if freshness is not None:
-        f_total, f_verified, f_due = freshness
-        f_pct = (f_verified / f_total * 100) if f_total else 0.0
-        lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} files verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
-        lines.append("")
-
-    lines.append("Run `rotbyte --report` for full details.")
-    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
-
-    body = "\n".join(lines)
-
-    try:
-        msg = email.mime.text.MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = section["username"]
-        msg["To"] = section["to"]
-
-        with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
-                          timeout=30) as server:
-            server.starttls()
-            server.login(section["username"], section["password"])
-            server.sendmail(section["username"], [section["to"]], msg.as_string())
-    except Exception as e:
-        print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)
-
-
-# ── Normal scan mode ───────────────────────────────────────────────────────────
+# ── Scan pipeline ──────────────────────────────────────────────────────────────
 
 def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                 interrupted: List[bool]):
@@ -3309,6 +1189,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     quiet = args.quiet or args.json_output
     budget_seconds = getattr(args, "budget_seconds", None)
     due_days = getattr(args, "due_days", None)
+    case_insensitive = getattr(args, "case_insensitive", False)
 
     if not quiet:
         print("═" * 60)
@@ -3328,7 +1209,9 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
 
     # ── Phase 1: Scan filesystem and compare against database ──────────
     with Spinner("Scanning filesystem", quiet=quiet) as sp:
-        all_files = scan_files(target_dir, db.db_path, args.include_hidden, args.exclude_dirs)
+        all_files = scan_files(target_dir, db.db_path, args.include_hidden,
+                               args.exclude_dirs,
+                               case_insensitive=case_insensitive)
         sp.set_suffix(f"  {len(all_files):,} files")
 
     with Spinner("Loading database", quiet=quiet) as sp:
@@ -3368,8 +1251,16 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     db.start_run(target_dir)
     now = _now()
     start_time = time.monotonic()
-    result = run_hashing(db, to_hash, args.workers, now, interrupted, quiet,
-                         budget_seconds=budget_seconds)
+    try:
+        result = run_hashing(db, to_hash, args.workers, now, interrupted, quiet,
+                             budget_seconds=budget_seconds)
+    except Exception as e:
+        # Unexpected worker-pool or orchestration failure — exit with the
+        # dedicated internal-error code so automation can distinguish it
+        # from normal scan findings.
+        print(f"\nError: hashing phase failed unexpectedly: {e}", file=sys.stderr)
+        db.close()
+        sys.exit(EXIT_INTERNAL)
 
     # ── Phase 3: Detect missing files ──────────────────────────────────
     count_missing = 0
@@ -3468,14 +1359,14 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     if result.failed > 0:
         print()
         print("⚠  BIT ROT DETECTED — run with --report for details.")
-        sys.exit(2)
+        sys.exit(EXIT_BIT_ROT)
     if interrupted[0]:
         print()
         print("  Run again to resume where you left off.")
-        sys.exit(3)
+        sys.exit(EXIT_INTERRUPTED)
     if count_missing > 0:
-        sys.exit(1)
-    sys.exit(0)
+        sys.exit(EXIT_MISSING)
+    sys.exit(EXIT_OK)
 
 
 if __name__ == "__main__":

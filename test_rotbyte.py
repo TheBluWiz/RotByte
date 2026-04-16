@@ -300,23 +300,29 @@ class TestUtcToLocal:
 class TestHashFile:
     def test_normal(self, tmp):
         path = str(tmp / "a.txt")
-        fpath, digest, size, mtime = rotbyte.hash_file(path)
+        fpath, digest, size, mtime, err = rotbyte.hash_file(path)
         assert fpath == path
         assert digest == _hash_bytes(b"alpha")
         assert size == 5
         assert mtime is not None
+        assert err is None
 
     def test_nonexistent(self):
-        fpath, digest, size, mtime = rotbyte.hash_file("/nonexistent/file")
+        fpath, digest, size, mtime, err = rotbyte.hash_file("/nonexistent/file")
         assert digest is None
         assert size is None
+        # Error message routed back to the parent for aggregation rather
+        # than printed inline from a worker process.
+        assert err is not None
+        assert "No such file" in err or "cannot find" in err.lower()
 
     def test_empty_file(self, tmp):
         p = tmp / "empty.txt"
         p.write_bytes(b"")
-        fpath, digest, size, mtime = rotbyte.hash_file(str(p))
+        fpath, digest, size, mtime, err = rotbyte.hash_file(str(p))
         assert digest == _hash_bytes(b"")
         assert size == 0
+        assert err is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -621,6 +627,35 @@ class TestScanFiles:
         files = rotbyte.scan_files(str(empty), db_p)
         assert files == []
 
+    def test_case_insensitive_normalises_to_lowercase(self, tmp, db_path):
+        # With --case-insensitive, returned paths are lowercased so a
+        # rename like "foo.mkv" → "Foo.mkv" doesn't produce a phantom
+        # MISSING on case-insensitive filesystems.
+        (tmp / "MixedCase.TXT").write_text("x")
+        files = rotbyte.scan_files(str(tmp), db_path, case_insensitive=True)
+        assert all(f == f.lower() for f in files)
+        assert any(f.endswith("mixedcase.txt") for f in files)
+
+    def test_walk_error_continues(self, tmp, db_path, capsys, monkeypatch):
+        # A walk-time OSError (e.g. a network drive vanishing) should
+        # surface as a warning on stderr, not abort the scan.
+        real_walk = os.walk
+
+        def flaky_walk(*args, **kwargs):
+            yield from real_walk(*args, **kwargs)
+            onerror = kwargs.get("onerror")
+            if onerror:
+                err = OSError("Network drive disconnected")
+                err.filename = str(tmp / "missing")
+                onerror(err)
+
+        monkeypatch.setattr(os, "walk", flaky_walk)
+        files = rotbyte.scan_files(str(tmp), db_path)
+        captured = capsys.readouterr()
+        # Still returned the files it found before the simulated failure.
+        assert files
+        assert "Walk error" in captured.err
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Prescan Logic
@@ -697,6 +732,21 @@ class TestFileLock:
         lock2 = rotbyte.FileLock(lock_path)
         assert lock2.acquire() is True
         lock2.release()
+
+    def test_lock_refuses_to_follow_symlink(self, tmp):
+        # POSIX: a malicious symlink at <db>.lock pointing somewhere the
+        # user can write must not let an attacker redirect the PID-record
+        # write. acquire() should fail rather than open the symlink target.
+        if sys.platform == "win32":
+            pytest.skip("symlink semantics differ on Windows")
+        decoy = tmp / "decoy.txt"
+        decoy.write_text("untouched")
+        lock_path = tmp / "redirect.lock"
+        os.symlink(str(decoy), str(lock_path))
+        lock = rotbyte.FileLock(str(lock_path))
+        assert lock.acquire() is False
+        # Decoy file untouched — no PID written through the symlink.
+        assert decoy.read_text() == "untouched"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1265,6 +1315,56 @@ class TestRunHashing:
         # Should process fewer than all 20
         assert result.new < 20
 
+    def test_file_deleted_mid_scan_marks_missing(self, tmp, db):
+        """A previously-tracked file that vanishes between prescan and
+        hash should be routed to MISSING, not counted as an error.
+        """
+        now = rotbyte._now()
+        gone = str(tmp / "ghost.txt")
+        # Pre-seed the DB so this is a tracked file with a known hash.
+        db.upsert_file(gone, "ghost.txt", 5, now, "x" * 128, None, "OK", now)
+        entries = [
+            rotbyte.FileEntry(gone, "ghost.txt", 5, now, "x" * 128, False),
+        ]
+        # File doesn't exist on disk — simulates the prescan→hash race.
+        result = rotbyte.run_hashing(db, entries, workers=1, now=now,
+                                     interrupted=[False], quiet=True)
+        assert result.errors == 0
+        assert db.get_file_status(gone) == "MISSING"
+
+    def test_unreadable_file_aggregated_not_spammed(self, tmp, db, capsys):
+        """Per-file read failures are aggregated; only the first ten
+        print inline, the rest collapse to a single summary line.
+
+        Skips on Windows where chmod 000 doesn't deny reads to the owner.
+        Also skips when run as root (chmod 000 is bypassed).
+        """
+        if sys.platform == "win32" or os.geteuid() == 0:
+            pytest.skip("requires POSIX non-root for chmod-based unreadability")
+        now = rotbyte._now()
+        # Twelve real files we then make unreadable — exists at lstat()
+        # time so they hit the "errors" branch, not deferred_missing.
+        paths = []
+        for i in range(12):
+            p = tmp / f"locked_{i}.bin"
+            p.write_bytes(b"x")
+            os.chmod(p, 0o000)
+            paths.append(str(p))
+        try:
+            entries = [
+                rotbyte.FileEntry(p, os.path.basename(p), 1, now, None, True)
+                for p in paths
+            ]
+            result = rotbyte.run_hashing(db, entries, workers=1, now=now,
+                                         interrupted=[False], quiet=True)
+            assert result.errors == 12
+            captured = capsys.readouterr()
+            # Summary line names the suppressed count.
+            assert "more read errors suppressed" in captured.err
+        finally:
+            for p in paths:
+                os.chmod(p, 0o644)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 29. Detect Missing — unit test
@@ -1317,12 +1417,55 @@ class TestSchedulerGeneration:
         # Should parse without error
         plistlib.loads(xml.encode())
 
+    def test_launchd_plist_escapes_xml_metacharacters(self):
+        # A target dir with XML metacharacters must round-trip through
+        # plistlib without producing malformed XML or extra elements.
+        import plistlib
+        evil = "/Volumes/Bad <dir> & \"name\""
+        xml = rotbyte._generate_launchd_plist(
+            "com.rotbyte.test", ["python3", "rotbyte.py", evil],
+            interval_seconds=60,
+        )
+        parsed = plistlib.loads(xml.encode())
+        assert parsed["ProgramArguments"][-1] == evil
+        assert parsed["Label"] == "com.rotbyte.test"
+
+    def test_launchd_log_path_under_user_logs(self):
+        # Log path must NOT live in /tmp (unbounded growth, no rotation).
+        path = rotbyte._launchd_log_path("com.rotbyte.x.abc")
+        assert path.endswith("com.rotbyte.x.abc.log")
+        assert "/Library/Logs/rotbyte/" in path
+        assert not path.startswith("/tmp/")
+
     def test_systemd_service(self):
         unit = rotbyte._generate_systemd_unit(
             "rotbyte quick scan", ["rotbyte", "--quiet", "/data"],
         )
-        assert "ExecStart=rotbyte --quiet /data" in unit
+        # Each arg is quoted so a path containing whitespace doesn't get
+        # silently split by systemd's command-line parser.
+        assert 'ExecStart="rotbyte" "--quiet" "/data"' in unit
         assert "Type=oneshot" in unit
+
+    def test_systemd_service_quotes_paths_with_spaces(self):
+        unit = rotbyte._generate_systemd_unit(
+            "rotbyte", ["rotbyte", "--quiet", "/Volumes/My Media"],
+        )
+        assert 'ExecStart="rotbyte" "--quiet" "/Volumes/My Media"' in unit
+
+    def test_systemd_escape_backslash_and_quote(self):
+        # A target path containing a quote or backslash must be escaped per
+        # systemd.service(5) so it parses as a single argument.
+        assert rotbyte._systemd_escape_arg('a"b') == '"a\\"b"'
+        assert rotbyte._systemd_escape_arg('a\\b') == '"a\\\\b"'
+
+    def test_systemd_description_strips_newlines(self):
+        # A CRLF in Description= would close the line and let the rest of
+        # the value inject another systemd directive.
+        unit = rotbyte._generate_systemd_unit(
+            "rotbyte\n[Service]\nUser=root", ["rotbyte"],
+        )
+        assert "User=root" in unit  # text survives, but...
+        assert "Description=rotbyte [Service] User=root" in unit  # on one line
 
     def test_systemd_timer_interval(self):
         timer = rotbyte._generate_systemd_timer(
@@ -1798,8 +1941,9 @@ class TestStatusFreshness:
 
         with unittest.mock.patch("rotbyte._discover_tracked",
                                  return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._platform") as mock_plat:
-            mock_plat.system.return_value = "Linux"
+             unittest.mock.patch("rotbyte._IS_MACOS", False), \
+             unittest.mock.patch("rotbyte._IS_LINUX", True), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
             captured = io.StringIO()
             with unittest.mock.patch("sys.stdout", captured):
                 rotbyte._run_status()
@@ -1816,8 +1960,9 @@ class TestStatusFreshness:
 
         with unittest.mock.patch("rotbyte._discover_tracked",
                                  return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._platform") as mock_plat:
-            mock_plat.system.return_value = "Linux"
+             unittest.mock.patch("rotbyte._IS_MACOS", False), \
+             unittest.mock.patch("rotbyte._IS_LINUX", True), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
             captured = io.StringIO()
             with unittest.mock.patch("sys.stdout", captured):
                 rotbyte._run_status()
@@ -1847,8 +1992,9 @@ class TestStatusFreshness:
 
         with unittest.mock.patch("rotbyte._discover_tracked",
                                  return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._platform") as mock_plat:
-            mock_plat.system.return_value = "Linux"
+             unittest.mock.patch("rotbyte._IS_MACOS", False), \
+             unittest.mock.patch("rotbyte._IS_LINUX", True), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
             captured = io.StringIO()
             with unittest.mock.patch("sys.stdout", captured):
                 rotbyte._run_status()
@@ -1876,8 +2022,9 @@ class TestStatusFreshness:
         }
         with unittest.mock.patch("rotbyte._discover_tracked",
                                  return_value=tracked), \
-             unittest.mock.patch("rotbyte._platform") as mock_plat:
-            mock_plat.system.return_value = "Linux"
+             unittest.mock.patch("rotbyte._IS_MACOS", False), \
+             unittest.mock.patch("rotbyte._IS_LINUX", True), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
             captured = io.StringIO()
             with unittest.mock.patch("sys.stdout", captured):
                 rotbyte._run_status()
@@ -1897,8 +2044,9 @@ class TestStatusFreshness:
         }
         with unittest.mock.patch("rotbyte._discover_tracked",
                                  return_value=tracked), \
-             unittest.mock.patch("rotbyte._platform") as mock_plat:
-            mock_plat.system.return_value = "Linux"
+             unittest.mock.patch("rotbyte._IS_MACOS", False), \
+             unittest.mock.patch("rotbyte._IS_LINUX", True), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
             captured = io.StringIO()
             with unittest.mock.patch("sys.stdout", captured):
                 rotbyte._run_status()
