@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-04-18
 
 ### Security
 - launchd plist generation now uses `plistlib.dumps()`; target paths containing `<`, `>`, `&`, or `"` can no longer produce malformed or injected XML
@@ -91,7 +91,7 @@
 - 38 new test functions covering the new surface
 - Platform-agnostic: `_IS_WINDOWS` constant, `_quote_windows_args` (6 cases), `_iso_duration`/`_parse_iso_duration` round-trips (11 cases), `_generate_task_xml` structure and escaping (10 cases), `_try_lock`/`_unlock` shim (3 cases), `--auto-export` behavior (4 cases), integrity exit-code-4 path (1 case), cross-volume DB detection (2 cases)
 - Windows-only, gated with `@pytest.mark.skipif(sys.platform != "win32")`: schtasks install→discover round-trip, `--run-on-battery` flag reaches installed XML, backslash path handling — all 3 skipped on macOS/Linux but activate automatically on a `windows-latest` CI runner
-- Total: 240 passing, 3 skipped (Windows-only) on macOS/Linux
+- Total: 284 passing, 3 skipped (Windows-only) on macOS/Linux
 
 **Notifications**
 - Added `--scheduled` flag (set internally by `--track`) to distinguish scheduled runs from manual ones

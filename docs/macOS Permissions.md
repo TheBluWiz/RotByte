@@ -7,7 +7,7 @@ without a terminal, so they need explicit permission.
 
 This guide covers the one-time setup to let rotbyte run unattended.
 
-> **Requires rotbyte v1.0.0 or later.** Earlier versions route launchd through
+> **Requires rotbyte v1.1.0 or later.** Earlier versions route launchd through
 > a bash wrapper, which breaks TCC attribution regardless of FDA settings.
 
 ---
@@ -212,7 +212,7 @@ Remove the personal copy or use the full Homebrew path with `--track`.
 ```bash
 python3 -c "import plistlib; plistlib.load(open('$HOME/Library/LaunchAgents/com.rotbyte.quick.HASH.plist', 'rb'))"
 ```
-If this fails, update to v1.0.0+ and re-run `--track` to regenerate.
+If this fails, update to v1.1.0+ and re-run `--track` to regenerate.
 
 **`--full-at` consumes the directory path as a time argument**
 → `--full-at` accepts multiple values and is greedy. Put the path before it:
