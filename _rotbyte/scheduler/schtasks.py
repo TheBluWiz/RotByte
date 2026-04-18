@@ -226,6 +226,63 @@ def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
         print(f"  ✓ Installed: {full_task_path}")
 
 
+def _uninstall_schtasks(target_dir: str) -> Tuple[List[str], List[str]]:
+    """Delete the Task Scheduler tasks installed for a target directory.
+
+    Returns ``(removed_task_names, error_messages)``. A pair of empty
+    lists means no tasks existed for this target.
+    """
+    from . import _dir_hash
+    dhash = _dir_hash(target_dir)
+    names = [f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}"]
+    return _delete_tasks(names)
+
+
+def _uninstall_all_schtasks() -> Tuple[List[str], List[str]]:
+    """Delete every rotbyte task registered under ``\\rotbyte\\``."""
+    from . import _dir_hash
+    discovered = _discover_schtasks()
+    names: List[str] = []
+    for target_dir in discovered:
+        dhash = _dir_hash(target_dir)
+        names.extend([f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}"])
+    return _delete_tasks(names)
+
+
+def _delete_tasks(names: List[str]) -> Tuple[List[str], List[str]]:
+    """Issue ``schtasks /Delete /F`` for each name; aggregate results.
+
+    Tasks that don't exist are silently ignored — schtasks reports them
+    as "ERROR: The system cannot find the file specified" or similar,
+    which we translate to "nothing to remove" rather than treating as
+    a real failure. Anything else lands in the error list.
+    """
+    removed: List[str] = []
+    errors: List[str] = []
+    for name in names:
+        task_path = f"\\rotbyte\\{name}"
+        try:
+            result = _subprocess.run(
+                ["schtasks.exe", "/Delete", "/TN", task_path, "/F"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError as e:
+            errors.append(f"schtasks.exe not available: {e}")
+            continue
+        if result.returncode == 0:
+            removed.append(name)
+            continue
+        # Distinguish "task didn't exist" from real failures by stderr text.
+        msg = ((result.stderr or "") + (result.stdout or "")).lower()
+        if "cannot find" in msg or "does not exist" in msg:
+            continue  # nothing to remove for this name
+        errors.append(
+            f"schtasks /Delete {task_path} failed: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return removed, errors
+
+
 def _discover_schtasks() -> Dict[str, Dict]:
     """Query Task Scheduler for installed rotbyte tasks.
 

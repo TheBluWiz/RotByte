@@ -112,6 +112,8 @@ from _rotbyte.scheduler import (
     _find_rotbyte_executable,
     _parse_cmd_flags,
     _run_track,
+    _run_untrack,
+    _run_untrack_all,
 )
 from _rotbyte.scheduler.launchd import (
     _discover_launchd,
@@ -119,6 +121,8 @@ from _rotbyte.scheduler.launchd import (
     _install_launchd,
     _launchd_log_path,
     _rotate_launchd_log,
+    _uninstall_all_launchd,
+    _uninstall_launchd,
 )
 from _rotbyte.scheduler.schtasks import (
     _discover_schtasks,
@@ -127,6 +131,8 @@ from _rotbyte.scheduler.schtasks import (
     _iso_duration,
     _parse_iso_duration,
     _quote_windows_args,
+    _uninstall_all_schtasks,
+    _uninstall_schtasks,
     _xml_escape,
 )
 from _rotbyte.scheduler.systemd import (
@@ -136,6 +142,8 @@ from _rotbyte.scheduler.systemd import (
     _install_systemd,
     _systemd_escape_arg,
     _systemd_escape_description,
+    _uninstall_all_systemd,
+    _uninstall_systemd,
 )
 
 # Kept available for tests that poke at it via ``rotbyte.smtplib``.
@@ -158,6 +166,28 @@ EXIT_DB_CORRUPT = 4         # PRAGMA quick_check failed; restore from backup
 EXIT_DB_LOCKED = 5          # Another rotbyte process holds the lock
 EXIT_IO = 6                 # Target dir unreachable / permission denied / I/O failure
 EXIT_INTERNAL = 7           # Worker pool died, unexpected exception
+
+
+def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
+    """Return mode-flag names that would conflict with --untrack[-all].
+
+    Used to refuse combinations like ``--untrack --check`` or
+    ``--untrack-all --track`` that don't have a coherent meaning.
+    Listed in --help order for predictable error messages.
+    """
+    flags: List[str] = []
+    if args.track:               flags.append("--track")
+    if args.track_setup:         flags.append("--track-setup")
+    if args.status:              flags.append("--status")
+    if args.report:              flags.append("--report")
+    if args.check:               flags.append("--check")
+    if args.accept:              flags.append("--accept")
+    if args.accept_all:          flags.append("--accept-all")
+    if args.import_hashes:       flags.append("--import")
+    if args.verify_file:         flags.append("--verify-file")
+    if args.export:              flags.append("--export")
+    if args.notify_setup:        flags.append("--notify-setup")
+    return flags
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
@@ -232,6 +262,8 @@ Examples:
   rotbyte --due 7d --budget 1h           Re-verify week-old files, 1hr budget
   rotbyte --track /Volumes/Media         Quick scan every hour (launchd/systemd)
   rotbyte --track --every 30m --full-at 2h 14h --budget 2h /Volumes/Media
+  rotbyte --untrack /Volumes/Media       Remove scheduled scans for one directory
+  rotbyte --untrack-all                  Remove every scheduled rotbyte run
   rotbyte --status                       Show all scheduled scans and health
 
 Exit codes:
@@ -303,6 +335,14 @@ Exit codes:
                              "battery life (matches typical Task Scheduler defaults).")
     parser.add_argument("--track-setup", dest="track_setup", action="store_true",
                         help="Interactive setup wizard for --track (prompts for schedule, budget, etc.)")
+    parser.add_argument("--untrack", action="store_true",
+                        help="Remove scheduled scans for the given directory "
+                             "(or the current directory if PATH is omitted). "
+                             "Stops the launchd / systemd / Task Scheduler "
+                             "unit and deletes its config file.")
+    parser.add_argument("--untrack-all", dest="untrack_all", action="store_true",
+                        help="Remove every scheduled scan installed by rotbyte "
+                             "on this machine across every tracked directory.")
     parser.add_argument("--status", action="store_true",
                         help="Show status of all scheduled scans and file health")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
@@ -317,6 +357,23 @@ Exit codes:
                         help="Internal: set by --track to identify scheduled runs")
 
     args = parser.parse_args()
+
+    # Validate --untrack / --untrack-all up front so a conflicting
+    # combination can't be silently won by another mode flag's earlier
+    # dispatch branch (e.g. --status). The actual untrack work happens
+    # further down, after notify-config and other input validation has
+    # had a chance to short-circuit.
+    if args.untrack and args.untrack_all:
+        print("Error: --untrack and --untrack-all are mutually exclusive.",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.untrack or args.untrack_all:
+        conflicts = _conflicting_mode_flags(args)
+        if conflicts:
+            flag = "--untrack-all" if args.untrack_all else "--untrack"
+            print(f"Error: {flag} cannot be combined with {', '.join(conflicts)}.",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # --notify-setup is a standalone command
     if args.notify_setup:
@@ -347,6 +404,22 @@ Exit codes:
     if args.status:
         _run_status()
         return
+
+    # --untrack / --untrack-all: tear down installed scheduler units.
+    # Mutually-exclusive validation already happened up front, so by the
+    # time we get here at most one of these is set. They don't open the
+    # database, take the lock, or require the target path to still exist
+    # on disk (a removed directory should still be untrackable so its
+    # schedule isn't orphaned).
+    if args.untrack_all:
+        sys.exit(_run_untrack_all())
+    if args.untrack:
+        # Single-target untrack: realpath the path argument so the dhash
+        # we compute matches what --track installed. os.path.realpath()
+        # tolerates non-existent paths (returns the input absolutised),
+        # which is the right behaviour here.
+        target_dir = _resolve(args.path)
+        sys.exit(_run_untrack(target_dir))
 
     # --verify-file has its own database discovery and bypasses the normal
     # target_dir / db_path resolution

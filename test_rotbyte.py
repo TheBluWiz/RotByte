@@ -55,6 +55,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 import rotbyte
+import _rotbyte as _rotbyte_pkg
+import _rotbyte.scheduler  # noqa: F401 — registers submodule attribute
+import _rotbyte.scheduler.launchd  # noqa: F401
+import _rotbyte.scheduler.schtasks  # noqa: F401
+import _rotbyte.scheduler.systemd  # noqa: F401
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1498,6 +1503,435 @@ class TestParseCmdFlags:
     def test_no_flags(self):
         flags = rotbyte._parse_cmd_flags(["rotbyte", "--quiet", "/data"])
         assert "due" not in flags
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 31a. --untrack / --untrack-all
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUntrackBackends:
+    """Backend-level tests: mock subprocess + filesystem and verify the
+    right unload/disable + unlink sequence runs for each platform.
+    """
+
+    def _ok_run(self):
+        return unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+
+    # ── launchd ──────────────────────────────────────────────────────
+
+    def test_launchd_uninstall_specific_target(self, tmp_path, monkeypatch):
+        """_uninstall_launchd unloads + unlinks both quick and full plists
+        for the target's dir-hash, and only those.
+        """
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        target = "/Volumes/MyMedia"
+        dhash = rotbyte._dir_hash(target)
+        for kind in ("quick", "full"):
+            (agents / f"com.rotbyte.{kind}.{dhash}.plist").write_text("<plist/>")
+        # An unrelated rotbyte plist for a different target should be
+        # left alone.
+        (agents / f"com.rotbyte.quick.deadbeef.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        calls = []
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok_run()
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess,
+                            "run", fake_run)
+
+        removed, errors = rotbyte._uninstall_launchd(target)
+
+        assert sorted(removed) == sorted([
+            f"com.rotbyte.quick.{dhash}",
+            f"com.rotbyte.full.{dhash}",
+        ])
+        assert errors == []
+        # Only the two target plists were removed; the unrelated one stays.
+        assert not (agents / f"com.rotbyte.quick.{dhash}.plist").exists()
+        assert not (agents / f"com.rotbyte.full.{dhash}.plist").exists()
+        assert (agents / "com.rotbyte.quick.deadbeef.plist").exists()
+        # bootout was attempted for each label.
+        bootout_cmds = [c for c in calls if c[:2] == ["launchctl", "bootout"]]
+        assert len(bootout_cmds) == 2
+
+    def test_launchd_uninstall_falls_back_to_unload(self, tmp_path, monkeypatch):
+        """If `launchctl bootout` returns non-zero, fall back to
+        `launchctl unload` before unlinking.
+        """
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        target = "/Volumes/MyMedia"
+        dhash = rotbyte._dir_hash(target)
+        plist = agents / f"com.rotbyte.quick.{dhash}.plist"
+        plist.write_text("<plist/>")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        cmds = []
+        def fake_run(cmd, **kw):
+            cmds.append(cmd)
+            if cmd[:2] == ["launchctl", "bootout"]:
+                return unittest.mock.MagicMock(returncode=1, stdout="", stderr="not loaded")
+            return self._ok_run()
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess,
+                            "run", fake_run)
+
+        removed, errors = rotbyte._uninstall_launchd(target)
+
+        assert removed == [f"com.rotbyte.quick.{dhash}"]
+        assert errors == []
+        # Exactly one bootout attempt + one unload fallback.
+        assert any(c[:2] == ["launchctl", "bootout"] for c in cmds)
+        assert any(c[:2] == ["launchctl", "unload"] for c in cmds)
+
+    def test_launchd_uninstall_no_unit_returns_empty(self, tmp_path, monkeypatch):
+        """No plists for this target → returns empty lists, no subprocess call."""
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        called = []
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess,
+                            "run", lambda *a, **kw: called.append(a) or self._ok_run())
+        removed, errors = rotbyte._uninstall_launchd("/no/such/dir")
+        assert removed == []
+        assert errors == []
+        assert called == []  # never even tried to bootout
+
+    def test_launchd_uninstall_unlink_failure_records_error(self, tmp_path, monkeypatch):
+        """An os.unlink failure on an existing plist surfaces as an error."""
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        target = "/Volumes/MyMedia"
+        dhash = rotbyte._dir_hash(target)
+        plist = agents / f"com.rotbyte.quick.{dhash}.plist"
+        plist.write_text("<plist/>")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess,
+                            "run", lambda *a, **kw: self._ok_run())
+        def boom(p):
+            raise OSError("permission denied")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd.os, "unlink", boom)
+
+        removed, errors = rotbyte._uninstall_launchd(target)
+        assert removed == []
+        assert len(errors) == 1
+        assert "could not remove" in errors[0]
+
+    def test_launchd_uninstall_all_iterates_discovered(self, tmp_path, monkeypatch):
+        """_uninstall_all_launchd globs every com.rotbyte.* plist."""
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in ("com.rotbyte.quick.aaa", "com.rotbyte.full.aaa",
+                      "com.rotbyte.quick.bbb", "com.unrelated.app"):
+            (agents / f"{label}.plist").write_text("<plist/>")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess,
+                            "run", lambda *a, **kw: self._ok_run())
+
+        removed, errors = rotbyte._uninstall_all_launchd()
+        assert sorted(removed) == [
+            "com.rotbyte.full.aaa",
+            "com.rotbyte.quick.aaa",
+            "com.rotbyte.quick.bbb",
+        ]
+        assert errors == []
+        assert (agents / "com.unrelated.app.plist").exists()  # untouched
+
+    # ── systemd ──────────────────────────────────────────────────────
+
+    def test_systemd_uninstall_specific_target(self, tmp_path, monkeypatch):
+        """_uninstall_systemd disables + unlinks both timer and service
+        files for the target dir-hash and runs daemon-reload once at the end.
+        """
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        target = "/srv/data"
+        dhash = rotbyte._dir_hash(target)
+        for kind in ("quick", "full"):
+            (unit_dir / f"rotbyte-{kind}-{dhash}.timer").write_text("")
+            (unit_dir / f"rotbyte-{kind}-{dhash}.service").write_text("")
+        # Unrelated rotbyte unit for a different target — must survive.
+        (unit_dir / "rotbyte-quick-cafef00d.timer").write_text("")
+        (unit_dir / "rotbyte-quick-cafef00d.service").write_text("")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        cmds = []
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd._subprocess,
+                            "run", lambda c, **kw: cmds.append(c) or self._ok_run())
+
+        removed, errors = rotbyte._uninstall_systemd(target)
+
+        assert sorted(removed) == sorted([
+            f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}",
+        ])
+        assert errors == []
+        for kind in ("quick", "full"):
+            assert not (unit_dir / f"rotbyte-{kind}-{dhash}.timer").exists()
+            assert not (unit_dir / f"rotbyte-{kind}-{dhash}.service").exists()
+        # Untouched.
+        assert (unit_dir / "rotbyte-quick-cafef00d.timer").exists()
+        # daemon-reload ran exactly once at the end.
+        reloads = [c for c in cmds if c[-1] == "daemon-reload"]
+        assert len(reloads) == 1
+        # disable+now ran for each timer.
+        disables = [c for c in cmds
+                    if "disable" in c and "--now" in c]
+        assert len(disables) == 2
+
+    def test_systemd_uninstall_no_unit_skips_daemon_reload(self, tmp_path, monkeypatch):
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        cmds = []
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd._subprocess,
+                            "run", lambda c, **kw: cmds.append(c) or self._ok_run())
+        removed, errors = rotbyte._uninstall_systemd("/no/such/dir")
+        assert removed == []
+        assert errors == []
+        # Nothing was found, so we never invoked systemctl at all.
+        assert cmds == []
+
+    def test_systemd_uninstall_all_iterates(self, tmp_path, monkeypatch):
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        for name in ("rotbyte-quick-aaa", "rotbyte-full-aaa", "rotbyte-quick-bbb"):
+            (unit_dir / f"{name}.timer").write_text("")
+            (unit_dir / f"{name}.service").write_text("")
+        # Unrelated systemd unit must survive.
+        (unit_dir / "user-app.timer").write_text("")
+        (unit_dir / "user-app.service").write_text("")
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd._subprocess,
+                            "run", lambda c, **kw: self._ok_run())
+        removed, errors = rotbyte._uninstall_all_systemd()
+        assert sorted(removed) == ["rotbyte-full-aaa", "rotbyte-quick-aaa", "rotbyte-quick-bbb"]
+        assert errors == []
+        assert (unit_dir / "user-app.timer").exists()  # untouched
+
+    # ── schtasks ─────────────────────────────────────────────────────
+
+    def test_schtasks_uninstall_specific_target(self, monkeypatch):
+        target = "C:\\Volumes\\MyMedia"
+        dhash = rotbyte._dir_hash(target)
+        cmds = []
+        def fake_run(cmd, **kw):
+            cmds.append(cmd)
+            return unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.schtasks._subprocess,
+                            "run", fake_run)
+        removed, errors = rotbyte._uninstall_schtasks(target)
+        assert sorted(removed) == sorted([
+            f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}",
+        ])
+        assert errors == []
+        assert all(c[:2] == ["schtasks.exe", "/Delete"] for c in cmds)
+        assert len(cmds) == 2
+
+    def test_schtasks_missing_task_treated_as_noop(self, monkeypatch):
+        """`The system cannot find the file specified` is not an error."""
+        def fake_run(cmd, **kw):
+            return unittest.mock.MagicMock(
+                returncode=1, stdout="",
+                stderr="ERROR: The system cannot find the file specified.",
+            )
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.schtasks._subprocess,
+                            "run", fake_run)
+        removed, errors = rotbyte._uninstall_schtasks("/some/path")
+        assert removed == []
+        assert errors == []
+
+    def test_schtasks_real_failure_recorded(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            return unittest.mock.MagicMock(
+                returncode=1, stdout="", stderr="ERROR: Access is denied.",
+            )
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.schtasks._subprocess,
+                            "run", fake_run)
+        removed, errors = rotbyte._uninstall_schtasks("/some/path")
+        assert removed == []
+        assert len(errors) == 2  # one per task name attempted
+        assert all("Access is denied" in e for e in errors)
+
+
+class TestRunUntrackDispatch:
+    """Tests for the platform-dispatch wrappers _run_untrack[_all] and
+    the main() wiring. Patches the platform flags so the test runs the
+    right backend regardless of the host OS.
+    """
+
+    def _capture(self):
+        """Return a stdout/stderr capture context manager pair."""
+        return io.StringIO(), io.StringIO()
+
+    def test_run_untrack_default_to_cwd(self, tmp_path, monkeypatch):
+        """`rotbyte --untrack` (no path) untracks the current working dir."""
+        captured: dict = {}
+        def fake_uninstall(target_dir):
+            captured["target"] = target_dir
+            return ([], [])  # no unit found
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_launchd", fake_uninstall)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        rc, out, err = _run_cli("--untrack", cwd=str(tmp_path))
+        assert rc == 0
+        assert "No scheduled run found" in out
+        # The subprocess child saw cwd == tmp_path; check that the realpath
+        # of "." (the default) was honored.
+        # (Subprocess test — we can't read captured["target"] from here,
+        # but the message contains the resolved path.)
+        assert str(tmp_path) in out or "/private" + str(tmp_path) in out
+
+    def test_run_untrack_explicit_path(self, monkeypatch):
+        """`rotbyte --untrack /some/path` uses /some/path, not cwd."""
+        target_seen: dict = {}
+        def fake_uninstall(target_dir):
+            target_seen["t"] = target_dir
+            return (["com.rotbyte.quick.abc"], [])
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_launchd", fake_uninstall)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "/Volumes/Foo"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        # The realpath of /Volumes/Foo (which doesn't exist) is itself.
+        assert target_seen["t"] == "/Volumes/Foo"
+
+    def test_run_untrack_all_iterates(self, monkeypatch, capsys):
+        def fake_uninstall_all():
+            return (["com.rotbyte.quick.aaa", "com.rotbyte.full.aaa",
+                     "com.rotbyte.quick.bbb"], [])
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_all_launchd", fake_uninstall_all)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv", ["rotbyte", "--untrack-all"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "Removed 3 scheduled runs" in out
+
+    def test_run_untrack_no_unit_message(self, monkeypatch, capsys):
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_launchd", lambda t: ([], []))
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "/no/where"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        assert "No scheduled run found for /no/where" in capsys.readouterr().out
+
+    def test_run_untrack_failure_exits_6(self, monkeypatch, capsys):
+        def fake_uninstall(target_dir):
+            return ([], ["could not remove /Users/x/Library/...: permission denied"])
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_launchd", fake_uninstall)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "/some/path"]):
+                rotbyte.main()
+        # Exit code 6 (EXIT_IO) per spec.
+        assert exc.value.code == 6
+        assert "permission denied" in capsys.readouterr().err
+
+    def test_run_untrack_internal_error_exits_7(self, monkeypatch, capsys):
+        def fake_uninstall(target_dir):
+            raise RuntimeError("kaboom")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_uninstall_launchd", fake_uninstall)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "/some/path"]):
+                rotbyte.main()
+        assert exc.value.code == 7
+        assert "kaboom" in capsys.readouterr().err
+
+    def test_run_untrack_unsupported_platform_exits_7(self, monkeypatch, capsys):
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv", ["rotbyte", "--untrack-all"]):
+                rotbyte.main()
+        assert exc.value.code == 7
+
+
+class TestUntrackArgValidation:
+    """Mutually-exclusive-arg combos must be rejected before we touch
+    the scheduler at all.
+    """
+
+    def _expect_rejection(self, argv, message_substring):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv", argv):
+                rotbyte.main()
+        assert exc.value.code == 1
+
+    def test_untrack_and_untrack_all_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "--untrack-all"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_untrack_with_check_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "--check"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--untrack cannot be combined with --check" in capsys.readouterr().err
+
+    def test_untrack_with_track_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "--track"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--untrack cannot be combined with --track" in capsys.readouterr().err
+
+    def test_untrack_all_with_status_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack-all", "--status"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--untrack-all cannot be combined with --status" in capsys.readouterr().err
 
 
 # ══════════════════════════════════════════════════════════════════════════════

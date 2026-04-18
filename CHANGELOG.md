@@ -11,8 +11,10 @@
 - SMTP credentials now stored in the OS credential store by default: macOS Keychain (`security`), Windows Credential Manager (`cmdkey` + `CredReadW` via ctypes), or Linux libsecret (`secret-tool`) when available — plaintext `notify.conf` (chmod 0600) is used only as a fallback and prints a stderr warning when it happens
 
 ### Added
+- `--untrack [PATH]` removes the scheduled rotbyte runs installed for a directory (defaults to the current working directory if omitted). Path is canonicalised the same way `--track` canonicalises it at install time, so the same directory always maps to the same scheduled units. Per-platform: launchd `bootout` + plist unlink on macOS, `systemctl --user disable --now` + unit unlink + `daemon-reload` on Linux, `schtasks /Delete` on Windows. Friendly no-op (exit 0) when nothing is installed for the target.
+- `--untrack-all` removes every rotbyte schedule on the machine. Discovers installed units the same way `--status` does and removes each one. Friendly no-op when nothing is installed.
 - `--case-insensitive` opt-in flag normalises scanned paths to lowercase so a rename-by-case on APFS or NTFS doesn't produce phantom MISSINGs; flipping it on an existing database rewrites every tracked path on the next scan (one-way migration, documented)
-- Exit codes 5 (`DB_LOCKED` — another rotbyte process holds the lock), 6 (`IO` — target unreachable, permission denied), and 7 (`INTERNAL` — worker pool died, unexpected exception). **Minor breaking change** for callers that treated any non-zero as "corruption detected"
+- Exit codes 5 (`DB_LOCKED` — another rotbyte process holds the lock), 6 (`IO` — target unreachable, permission denied, scheduler unload/unlink failure), and 7 (`INTERNAL` — worker pool died, unexpected exception). **Minor breaking change** for callers that treated any non-zero as "corruption detected"
 - Windows `FILE_ATTRIBUTE_HIDDEN` is now honored by `--include-hidden`; the flag no longer skips only POSIX dotfiles on Windows
 - Named `EXIT_*` constants exported from `rotbyte` for programmatic callers
 

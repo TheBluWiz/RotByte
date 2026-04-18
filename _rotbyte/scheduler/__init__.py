@@ -16,7 +16,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 from ..helpers import _format_clock_time, _format_duration
-from ..platform import _IS_MACOS, _IS_WINDOWS
+from ..platform import _IS_LINUX, _IS_MACOS, _IS_WINDOWS
 
 
 def _dir_hash(target_dir: str) -> str:
@@ -228,3 +228,114 @@ def _discover_tracked(is_mac: bool) -> Dict[str, Dict]:
     if is_mac:
         return launchd._discover_launchd()
     return systemd._discover_systemd()
+
+
+# Exit-code values returned by _run_untrack[_all]. These mirror the
+# documented public exit codes (0 / 6 / 7) so the caller in rotbyte.py
+# can hand them straight to sys.exit.
+_UNTRACK_OK = 0
+_UNTRACK_IO_ERROR = 6
+_UNTRACK_INTERNAL = 7
+
+
+def _run_untrack(target_dir: str) -> int:
+    """Remove scheduled rotbyte runs for ``target_dir``.
+
+    Returns the process exit code: 0 on success (including the friendly
+    "no schedule found" no-op), 6 if any platform command failed, 7 if
+    the platform isn't supported or an internal error occurred.
+    """
+    from . import launchd, schtasks, systemd
+
+    if _IS_MACOS:
+        backend_label = "launchd"
+        try:
+            removed, errors = launchd._uninstall_launchd(target_dir)
+        except Exception as e:  # noqa: BLE001 — platform uninstall failure
+            print(f"Error: launchd uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    elif _IS_LINUX:
+        backend_label = "systemd"
+        try:
+            removed, errors = systemd._uninstall_systemd(target_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: systemd uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    elif _IS_WINDOWS:
+        backend_label = "Task Scheduler"
+        try:
+            removed, errors = schtasks._uninstall_schtasks(target_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: Task Scheduler uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    else:
+        print(f"Error: --untrack is not supported on {sys.platform}.", file=sys.stderr)
+        return _UNTRACK_INTERNAL
+
+    if not removed and not errors:
+        print(f"  No scheduled run found for {target_dir}")
+        return _UNTRACK_OK
+
+    if removed:
+        print(f"  ✓ Removed scheduled run for {target_dir} ({backend_label})")
+        for name in removed:
+            print(f"      {name}")
+
+    if errors:
+        for msg in errors:
+            print(f"  ! {msg}", file=sys.stderr)
+        return _UNTRACK_IO_ERROR
+
+    return _UNTRACK_OK
+
+
+def _run_untrack_all() -> int:
+    """Remove every scheduled rotbyte run on the system.
+
+    Returns the process exit code: 0 on success (including the friendly
+    "nothing to remove" no-op), 6 if any platform command failed, 7 if
+    the platform isn't supported or an internal error occurred.
+    """
+    from . import launchd, schtasks, systemd
+
+    if _IS_MACOS:
+        backend_label = "launchd"
+        try:
+            removed, errors = launchd._uninstall_all_launchd()
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: launchd uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    elif _IS_LINUX:
+        backend_label = "systemd"
+        try:
+            removed, errors = systemd._uninstall_all_systemd()
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: systemd uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    elif _IS_WINDOWS:
+        backend_label = "Task Scheduler"
+        try:
+            removed, errors = schtasks._uninstall_all_schtasks()
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: Task Scheduler uninstall failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    else:
+        print(f"Error: --untrack-all is not supported on {sys.platform}.",
+              file=sys.stderr)
+        return _UNTRACK_INTERNAL
+
+    if not removed and not errors:
+        print("  No scheduled runs found.")
+        return _UNTRACK_OK
+
+    for name in removed:
+        print(f"  ✓ Removed: {name}")
+    if errors:
+        for msg in errors:
+            print(f"  ! {msg}", file=sys.stderr)
+
+    n = len(removed)
+    plural = "s" if n != 1 else ""
+    print(f"\n  Removed {n} scheduled run{plural} ({backend_label})")
+
+    return _UNTRACK_IO_ERROR if errors else _UNTRACK_OK

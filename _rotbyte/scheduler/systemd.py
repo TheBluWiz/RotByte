@@ -132,6 +132,69 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
         print(f"  ✓ Installed: {full_name}.timer + .service")
 
 
+def _uninstall_systemd(target_dir: str) -> Tuple[List[str], List[str]]:
+    """Disable and delete the systemd user units for a target directory.
+
+    Returns ``(removed_unit_names, error_messages)``. A pair of empty
+    lists means no units existed for this target.
+    """
+    from . import _dir_hash
+    dhash = _dir_hash(target_dir)
+    names = [f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}"]
+    return _disable_and_unlink(names)
+
+
+def _uninstall_all_systemd() -> Tuple[List[str], List[str]]:
+    """Disable and delete every ``rotbyte-*`` systemd user unit pair."""
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    timers = sorted(_glob.glob(os.path.join(unit_dir, "rotbyte-*.timer")))
+    names = [os.path.basename(t)[: -len(".timer")] for t in timers]
+    return _disable_and_unlink(names)
+
+
+def _disable_and_unlink(names: List[str]) -> Tuple[List[str], List[str]]:
+    """Stop, disable, and remove a list of systemd user timer/service pairs.
+
+    Per-unit disable failures are best-effort (the timer may already be
+    stopped); only ``unlink`` failures count as errors. A single
+    ``daemon-reload`` runs at the end if anything was actually removed,
+    so systemd forgets the deleted units.
+    """
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    removed: List[str] = []
+    errors: List[str] = []
+    any_unlinked = False
+    for name in names:
+        timer = os.path.join(unit_dir, f"{name}.timer")
+        service = os.path.join(unit_dir, f"{name}.service")
+        if not (os.path.isfile(timer) or os.path.isfile(service)):
+            continue
+        # Best-effort disable+stop. Ignore non-zero (timer may already
+        # be stopped or never have been enabled).
+        _subprocess.run(
+            ["systemctl", "--user", "disable", "--now", f"{name}.timer"],
+            capture_output=True, text=True,
+        )
+        unit_removed = False
+        for path in (timer, service):
+            if os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                    unit_removed = True
+                    any_unlinked = True
+                except OSError as e:
+                    errors.append(f"could not remove {path}: {e}")
+        if unit_removed:
+            removed.append(name)
+    if any_unlinked:
+        # Reload so systemd's in-memory unit cache forgets the deleted files.
+        _subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            capture_output=True, text=True,
+        )
+    return removed, errors
+
+
 def _discover_systemd() -> Dict[str, Dict]:
     """Parse installed systemd user units to discover tracked directories."""
     unit_dir = os.path.expanduser("~/.config/systemd/user")

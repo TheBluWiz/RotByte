@@ -136,6 +136,66 @@ def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
         print(f"  ✓ Installed: {full_plist}")
 
 
+def _uninstall_launchd(target_dir: str) -> Tuple[List[str], List[str]]:
+    """Bootout (or unload) and delete the launchd plists for a target.
+
+    Returns ``(removed_labels, error_messages)``. An empty
+    ``(removed, errors)`` tuple means no plists existed for this target —
+    the caller treats that as a friendly no-op rather than an error.
+    """
+    from . import _dir_hash
+    dhash = _dir_hash(target_dir)
+    labels = [f"com.rotbyte.quick.{dhash}", f"com.rotbyte.full.{dhash}"]
+    return _bootout_and_unlink(labels)
+
+
+def _uninstall_all_launchd() -> Tuple[List[str], List[str]]:
+    """Bootout and delete every ``com.rotbyte.*`` launchd agent."""
+    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    plists = sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist")))
+    labels = [os.path.basename(p)[: -len(".plist")] for p in plists]
+    return _bootout_and_unlink(labels)
+
+
+def _bootout_and_unlink(labels: List[str]) -> Tuple[List[str], List[str]]:
+    """Stop and remove a list of launchd plists by label.
+
+    Modern macOS prefers ``launchctl bootout gui/<uid>/<label>``; older
+    releases (10.10 and earlier) only know ``launchctl unload <plist>``.
+    Try the modern form first and fall back; either way attempt the
+    ``os.unlink`` so a leftover plist doesn't haunt the next reboot.
+    Bootout/unload failures are best-effort (the agent may already be
+    stopped); only ``unlink`` failures count as errors.
+    """
+    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    removed: List[str] = []
+    errors: List[str] = []
+    uid = os.getuid()
+    for label in labels:
+        plist_path = os.path.join(agents_dir, f"{label}.plist")
+        if not os.path.isfile(plist_path):
+            continue  # nothing here for this label
+        # Stop the agent. Modern syntax first; fall back to legacy.
+        target = f"gui/{uid}/{label}"
+        result = _subprocess.run(
+            ["launchctl", "bootout", target],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            _subprocess.run(
+                ["launchctl", "unload", plist_path],
+                capture_output=True, text=True,
+            )
+        # Remove the plist regardless — leaving it would let launchd
+        # re-load the agent on the next user login or reboot.
+        try:
+            os.unlink(plist_path)
+            removed.append(label)
+        except OSError as e:
+            errors.append(f"could not remove {plist_path}: {e}")
+    return removed, errors
+
+
 def _discover_launchd() -> Dict[str, Dict]:
     """Parse installed launchd plists to discover tracked directories."""
     agents_dir = os.path.expanduser("~/Library/LaunchAgents")

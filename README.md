@@ -149,6 +149,18 @@ rotbyte --status
 
 On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`. On Windows it registers Task Scheduler tasks under `\rotbyte\` (user-level, no admin prompt). Running `--track` without `--full-at` installs only the quick scan; add `--full-at` to also schedule a nightly full re-verify. For a guided setup, use `rotbyte --track-setup` — it mirrors `--notify-setup` and walks you through every option.
 
+To remove scheduled runs:
+
+```bash
+# Stop tracking a single directory (defaults to the current dir if omitted)
+rotbyte --untrack /Volumes/Media
+
+# Remove every rotbyte schedule on this machine
+rotbyte --untrack-all
+```
+
+`--untrack` canonicalises the path the same way `--track` does, so it removes exactly what was installed for that directory. If nothing is installed for the path, rotbyte prints a friendly notice and exits 0. The checksum database is left in place — only the scheduler unit (launchd plist / systemd timer+service / Task Scheduler task) is removed.
+
 On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
 > **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [docs/macOS Permissions.md](docs/macOS%20Permissions.md).

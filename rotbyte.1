@@ -185,13 +185,42 @@ FAILED files. If no scheduled scans are found, suggests the
 .B \-\-track
 command.
 .TP
-.B \-\-untrack
-Remove all scheduled scans for the given directory. Unloads and deletes
-the launchd plists (macOS) or disables and deletes the systemd timer and
-service units (Linux). Does not remove the checksum database.
+.BI \-\-untrack " [PATH]"
+Remove the scheduled rotbyte runs that were installed for the given
+directory. The path is canonicalised the same way
+.B \-\-track
+canonicalises it at install time (via
+.BR realpath (3)),
+so the same directory always maps to the same scheduled units. If
+.I PATH
+is omitted the current working directory is used.
+.IP
+On macOS the launchd agent is bootout-ed (or unloaded on older releases)
+and the plist file under
+.I ~/Library/LaunchAgents/
+is deleted. On Linux the systemd user timer and service are disabled,
+their unit files removed from
+.IR ~/.config/systemd/user/ ,
+and
+.B systemctl --user daemon-reload
+is run. On Windows the corresponding Task Scheduler tasks under
+.I \\rotbyte\\
+are deleted with
+.BR schtasks.exe .
+.IP
+The checksum database itself is not touched. If no scheduled run is
+installed for the target directory, a friendly notice is printed and
+rotbyte exits 0 \(em this is not an error.
 .TP
 .B \-\-untrack\-all
-Remove all scheduled scans for every tracked directory.
+Remove every scheduled rotbyte run on this machine across all tracked
+directories. Discovers installed units the same way
+.B \-\-status
+does and removes each one. Prints the list of removed units and a count.
+Exits 0 even when nothing was found.
+.IP
+Mutually exclusive with
+.BR \-\-untrack .
 .TP
 .BI \-\-every " INTERVAL"
 Quick scan frequency when using
