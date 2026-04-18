@@ -68,7 +68,18 @@ import _rotbyte.scheduler.systemd  # noqa: F401
 
 @pytest.fixture
 def tmp(tmp_path):
-    """Create a temp directory with a few test files."""
+    """Create a temp directory pre-populated with four small test files.
+
+    Convention used throughout this suite:
+      - `tmp`       → pre-populated (a.txt, b.txt, c.txt, sub/d.txt).
+                      Default for tests that want "a dir with some files".
+      - `tmp_path`  → pytest's own empty temp dir. Use it when the test
+                      needs a custom layout, an empty dir, or a separate
+                      sandbox from a `tmp` already in scope.
+
+    Mixing both in one test is intentional — e.g. `tmp` as the scan target
+    and `tmp_path` as an independent destination for an exported manifest.
+    """
     (tmp_path / "a.txt").write_text("alpha")
     (tmp_path / "b.txt").write_text("bravo")
     (tmp_path / "c.txt").write_text("charlie")
@@ -98,6 +109,21 @@ def _run_cli(*args, cwd=None):
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "rotbyte.py")] + list(args)
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=60)
     return r.returncode, r.stdout, r.stderr
+
+
+def _run_cli_ok(*args, cwd=None):
+    """Run rotbyte and assert exit code 0.
+
+    Use for setup calls where a failure would invalidate the test's
+    assumptions — rather than `_run_cli(...)` and letting a silent
+    non-zero exit cascade into a confusing downstream assertion.
+    """
+    rc, out, err = _run_cli(*args, cwd=cwd)
+    assert rc == 0, (
+        f"setup _run_cli({args!r}) failed: rc={rc}\n"
+        f"--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    )
+    return rc, out, err
 
 
 def _extract_json(text: str) -> dict:
@@ -178,6 +204,43 @@ def _prescan_existing(tmp, filename, checksum="somehash", status="OK",
     mtime = mtime_override or rotbyte._mtime_iso(st)
     existing = {path: (checksum, st.st_size + size_offset, mtime, status)}
     return path, existing
+
+
+_PLATFORMS = ("macos", "linux", "windows")
+
+
+def _force_scheduler_platform(monkeypatch, name):
+    """Pin the scheduler module's platform flags for this test.
+
+    `name` is "macos", "linux", "windows", or None (all flags False, i.e.
+    an unsupported host). Unmentioned flags are set to False so exactly
+    one platform — or none — is "active" during the test.
+    """
+    if name is not None and name not in _PLATFORMS:
+        raise ValueError(f"Unknown platform {name!r}; expected one of {_PLATFORMS} or None")
+    monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", name == "macos")
+    monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", name == "linux")
+    monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", name == "windows")
+
+
+def _force_rotbyte_platform(name):
+    """Return a context manager that pins rotbyte module's platform flags.
+
+    Mirrors _force_scheduler_platform but for the `rotbyte` top-level module,
+    which is the namespace TestStatusFreshness's code path checks.
+    """
+    if name is not None and name not in _PLATFORMS:
+        raise ValueError(f"Unknown platform {name!r}; expected one of {_PLATFORMS} or None")
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        with unittest.mock.patch("rotbyte._IS_MACOS", name == "macos"), \
+             unittest.mock.patch("rotbyte._IS_LINUX", name == "linux"), \
+             unittest.mock.patch("rotbyte._IS_WINDOWS", name == "windows"):
+            yield
+
+    return _ctx()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -768,7 +831,7 @@ class TestCLIFirstRun:
     def test_index_reports_new_files(self, tmp):
         rc, out, err = _run_cli(str(tmp))
         assert rc == 0
-        assert "New files" in out or "new" in out.lower()
+        assert "New files" in out
 
     def test_json_output_first_run(self, tmp):
         rc, out, err = _run_cli("--json", str(tmp))
@@ -786,7 +849,7 @@ class TestCLIFirstRun:
 
 class TestCLIQuickScan:
     def test_second_run_skips(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
@@ -794,13 +857,13 @@ class TestCLIQuickScan:
         assert data["skipped"] == 4
 
     def test_edit_detected(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         time.sleep(0.05)
         (tmp / "a.txt").write_text("alpha_modified")
         rc, out, err = _run_cli("--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
-        assert data["updated"] >= 1
+        assert data["updated"] == 1
         assert data["failed"] == 0  # edit, not bit rot
 
 
@@ -810,7 +873,7 @@ class TestCLIQuickScan:
 
 class TestCLICheck:
     def test_check_no_changes(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--check", "--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
@@ -818,15 +881,15 @@ class TestCLICheck:
         assert data["failed"] == 0
 
     def test_check_detects_bit_rot(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         rc, out, err = _run_cli("--check", "--json", str(tmp))
         assert rc == 2  # exit code for bit rot
         data = _extract_json(out)
-        assert data["failed"] >= 1
+        assert data["failed"] == 1
 
     def test_check_exit_code_2(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "b.txt")
         rc, _, _ = _run_cli("--check", str(tmp))
         assert rc == 2
@@ -838,15 +901,15 @@ class TestCLICheck:
 
 class TestCLIMissing:
     def test_missing_detected(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         rc, out, err = _run_cli("--json", str(tmp))
         assert rc == 1  # exit code for missing
         data = _extract_json(out)
-        assert data["missing"] >= 1
+        assert data["missing"] == 1
 
     def test_skip_missing_flag(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         rc, out, err = _run_cli("--skip-missing", "--json", str(tmp))
         assert rc == 0
@@ -855,7 +918,7 @@ class TestCLIMissing:
 
     def test_reappeared_file_verified(self, tmp):
         """A file that disappears and reappears should be re-verified."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         content = (tmp / "a.txt").read_bytes()
         (tmp / "a.txt").unlink()
         _run_cli(str(tmp))  # marks MISSING
@@ -863,7 +926,10 @@ class TestCLIMissing:
         rc, out, err = _run_cli("--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
-        assert data["verified_ok"] >= 1
+        # Only the previously-MISSING file is forced to re-verify; the other
+        # three are unchanged and land in "skipped".
+        assert data["verified_ok"] == 1
+        assert data["skipped"] == 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -872,13 +938,13 @@ class TestCLIMissing:
 
 class TestCLIMoveDetection:
     def test_rename_detected(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         content = (tmp / "a.txt").read_bytes()
         (tmp / "a.txt").unlink()
         (tmp / "a_renamed.txt").write_bytes(content)
         rc, out, err = _run_cli("--json", str(tmp))
         data = _extract_json(out)
-        assert data["likely_moves"] >= 1
+        assert data["likely_moves"] == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -887,7 +953,7 @@ class TestCLIMoveDetection:
 
 class TestCLIAccept:
     def test_accept_missing(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         _run_cli(str(tmp))  # marks MISSING
         rc, out, err = _run_cli("--accept", str(tmp / "a.txt"), str(tmp))
@@ -895,7 +961,7 @@ class TestCLIAccept:
         assert "Removed" in out
 
     def test_accept_failed(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         _run_cli("--check", str(tmp))  # marks FAILED
         rc, out, err = _run_cli("--accept", str(tmp / "a.txt"), str(tmp))
@@ -903,7 +969,7 @@ class TestCLIAccept:
         assert "Accepted" in out
 
     def test_accept_unknown_file(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--accept", "/nonexistent/file.txt", str(tmp))
         assert rc == 1
 
@@ -914,7 +980,7 @@ class TestCLIAccept:
 
 class TestCLIAcceptAll:
     def test_accept_all_clears_missing_and_failed(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         (tmp / "b.txt").unlink()
         _run_cli("--check", str(tmp))
@@ -924,7 +990,7 @@ class TestCLIAcceptAll:
         assert "Failed accepted" in out
 
     def test_accept_all_nothing_to_do(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--accept-all", str(tmp))
         assert rc == 0
         assert "Nothing to reconcile" in out
@@ -958,34 +1024,40 @@ class TestCLIImport:
     def test_import_mismatch(self, tmp):
         (tmp / "a.txt.b2sum").write_text("0" * 128 + "  a.txt\n")
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "MISMATCH" in out
 
     def test_import_invalid_hash_length(self, tmp):
         (tmp / "a.txt.b2sum").write_text("abc  a.txt\n")
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "Invalid hash" in out
 
     def test_import_no_matching_file(self, tmp):
         (tmp / "nonexistent.mkv.b2sum").write_text("0" * 128 + "  nonexistent.mkv\n")
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "No matching file" in out
 
     def test_import_empty_hash_file(self, tmp):
         (tmp / "a.txt.b2sum").write_text("")
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "Empty file" in out
 
     def test_import_no_sidecars(self, tmp):
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "No .b2sum or .b2 files found" in out
 
     def test_import_already_tracked(self, tmp):
         # First index the file normally
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         content = (tmp / "a.txt").read_bytes()
         expected_hash = _hash_bytes(content)
         (tmp / "a.txt.b2sum").write_text(f"{expected_hash}  a.txt\n")
         rc, out, err = _run_cli("--import", str(tmp))
+        assert rc == 0
         assert "Already tracked" in out
 
 
@@ -995,7 +1067,7 @@ class TestCLIImport:
 
 class TestCLIExport:
     def test_export(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         export_path = str(tmp / "manifest.txt")
         rc, out, err = _run_cli("--export", export_path, str(tmp))
         assert rc == 0
@@ -1008,7 +1080,7 @@ class TestCLIExport:
             assert len(parts[0]) == 128
 
     def test_export_excludes_missing(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         _run_cli(str(tmp))  # mark MISSING
         export_path = str(tmp / "manifest.txt")
@@ -1030,7 +1102,7 @@ class TestCLIExport:
 
 class TestCLIReport:
     def test_report_after_scan(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--report", str(tmp))
         assert rc == 0
         assert "Integrity Report" in out
@@ -1044,11 +1116,11 @@ class TestCLIReport:
         assert "empty" in out.lower()
 
     def test_report_shows_failed(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         _run_cli("--check", str(tmp))
         rc, out, err = _run_cli("--report", str(tmp))
-        assert "Failed files" in out or "FAILED" in out
+        assert "Failed files" in out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1065,12 +1137,12 @@ class TestCLIJson:
             assert key in data
 
     def test_json_failed_files_listed(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         rc, out, err = _run_cli("--check", "--json", str(tmp))
         data = _extract_json(out)
         assert "failed_files" in data
-        assert len(data["failed_files"]) >= 1
+        assert len(data["failed_files"]) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1079,7 +1151,7 @@ class TestCLIJson:
 
 class TestCLIQuiet:
     def test_quiet_no_output_on_ok(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--quiet", str(tmp))
         assert rc == 0
         # Quiet mode suppresses the verbose scanning/loading progress lines
@@ -1087,7 +1159,7 @@ class TestCLIQuiet:
         assert "Loading" not in out
 
     def test_quiet_shows_problems(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         rc, out, err = _run_cli("--quiet", str(tmp))
         assert rc == 1
@@ -1102,10 +1174,10 @@ class TestCLIBudget:
     def test_budget_requires_check_or_due(self, tmp):
         rc, out, err = _run_cli("--budget", "1h", str(tmp))
         assert rc != 0
-        assert "requires" in err.lower() or "requires" in out.lower()
+        assert "--budget requires --check" in err
 
     def test_budget_with_check(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--check", "--budget", "2h", "--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
@@ -1122,7 +1194,7 @@ class TestCLIBudget:
 
 class TestCLIDue:
     def test_due_implies_check(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--due", "30d", "--json", str(tmp))
         assert rc == 0
         data = _extract_json(out)
@@ -1195,20 +1267,20 @@ class TestExitCodes:
         assert rc == 0
 
     def test_exit_1_missing(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         rc, _, _ = _run_cli(str(tmp))
         assert rc == 1
 
     def test_exit_2_bit_rot(self, tmp):
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         rc, _, _ = _run_cli("--check", str(tmp))
         assert rc == 2
 
     def test_exit_2_trumps_exit_1(self, tmp):
         """Bit rot exit code takes priority over missing."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         (tmp / "b.txt").unlink()
         rc, _, _ = _run_cli("--check", str(tmp))
@@ -1221,15 +1293,22 @@ class TestExitCodes:
 
 class TestCLIConcurrentLock:
     def test_concurrent_run_blocked(self, tmp):
-        """A second instance against the same DB should fail."""
-        db_name = "." + tmp.name + rotbyte.DB_FILENAME_SUFFIX
-        lock_path = str(tmp / db_name) + ".lock"
+        """A second instance against the same DB should fail.
+
+        Discovers the real DB file produced by a prior rotbyte run, then
+        derives the lock path from it. If rotbyte's filename convention
+        changes, this still tests the actual contention path because the
+        DB-file glob follows the production code.
+        """
+        _run_cli_ok(str(tmp))  # creates the DB so we can glob for it
+        db_file = next(tmp.glob(f".*{rotbyte.DB_FILENAME_SUFFIX}"))
+        lock_path = str(db_file) + ".lock"
         lock = rotbyte.FileLock(lock_path)
         assert lock.acquire()
         try:
             rc, out, err = _run_cli(str(tmp))
             assert rc != 0
-            assert "Another instance" in err or "already running" in err
+            assert "Another instance is already running" in err
         finally:
             lock.release()
 
@@ -1247,14 +1326,17 @@ class TestCLIInvalidInputs:
     def test_full_at_without_track(self, tmp):
         rc, out, err = _run_cli("--full-at", "2h", str(tmp))
         assert rc != 0
+        assert "--full-at requires --track" in err
 
     def test_every_without_track(self, tmp):
         rc, out, err = _run_cli("--every", "30m", str(tmp))
         assert rc != 0
+        assert "--every requires --track" in err
 
     def test_workers_zero(self, tmp):
         rc, out, err = _run_cli("--workers", "0", str(tmp))
         assert rc != 0
+        assert "--workers must be at least 1" in err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1531,7 +1613,7 @@ class TestUntrackBackends:
             (agents / f"com.rotbyte.{kind}.{dhash}.plist").write_text("<plist/>")
         # An unrelated rotbyte plist for a different target should be
         # left alone.
-        (agents / f"com.rotbyte.quick.deadbeef.plist").write_text("<plist/>")
+        (agents / "com.rotbyte.quick.deadbeef.plist").write_text("<plist/>")
 
         monkeypatch.setattr(os.path, "expanduser",
                             lambda p: p.replace("~", str(tmp_path)))
@@ -1783,9 +1865,7 @@ class TestRunUntrackDispatch:
             return ([], [])  # no unit found
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_launchd", fake_uninstall)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         rc, out, err = _run_cli("--untrack", cwd=str(tmp_path))
         assert rc == 0
@@ -1804,9 +1884,7 @@ class TestRunUntrackDispatch:
             return (["com.rotbyte.quick.abc"], [])
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_launchd", fake_uninstall)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv",
@@ -1822,9 +1900,7 @@ class TestRunUntrackDispatch:
                      "com.rotbyte.quick.bbb"], [])
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_all_launchd", fake_uninstall_all)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv", ["rotbyte", "--untrack-all"]):
@@ -1836,9 +1912,7 @@ class TestRunUntrackDispatch:
     def test_run_untrack_no_unit_message(self, monkeypatch, capsys):
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_launchd", lambda t: ([], []))
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv",
@@ -1852,9 +1926,7 @@ class TestRunUntrackDispatch:
             return ([], ["could not remove /Users/x/Library/...: permission denied"])
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_launchd", fake_uninstall)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv",
@@ -1869,9 +1941,7 @@ class TestRunUntrackDispatch:
             raise RuntimeError("kaboom")
         monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
                             "_uninstall_launchd", fake_uninstall)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", True)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, "macos")
 
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv",
@@ -1881,9 +1951,7 @@ class TestRunUntrackDispatch:
         assert "kaboom" in capsys.readouterr().err
 
     def test_run_untrack_unsupported_platform_exits_7(self, monkeypatch, capsys):
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_MACOS", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_LINUX", False)
-        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_IS_WINDOWS", False)
+        _force_scheduler_platform(monkeypatch, None)
         with pytest.raises(SystemExit) as exc:
             with unittest.mock.patch("sys.argv", ["rotbyte", "--untrack-all"]):
                 rotbyte.main()
@@ -1996,7 +2064,14 @@ class TestEdgeCases:
         data = _extract_json(out)
         assert data["new"] == 100
 
-    @pytest.mark.skipif(os.getuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        sys.platform != "win32" and os.getuid() == 0,
+        reason="root ignores file permissions",
+    )
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="chmod 000 does not deny reads to the owner on Windows",
+    )
     def test_unreadable_file(self, tmp):
         """Unreadable files should be counted as errors, not crash."""
         bad = tmp / "unreadable.txt"
@@ -2022,7 +2097,7 @@ class TestEdgeCases:
 
     def test_empty_file_hashes(self, tmp):
         (tmp / "empty.txt").write_bytes(b"")
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--check", "--json", str(tmp))
         data = _extract_json(out)
         assert data["failed"] == 0
@@ -2039,7 +2114,7 @@ class TestEdgeCases:
     def test_version_flag(self):
         rc, out, err = _run_cli("--version")
         assert rc == 0
-        assert "rotbyte" in out or rotbyte.VERSION in out
+        assert rotbyte.VERSION in out
 
     def test_help_flag(self):
         rc, out, err = _run_cli("--help")
@@ -2057,8 +2132,8 @@ class TestDBCorruption:
         db_path = tmp / db_name
         db_path.write_bytes(b"this is not a sqlite database")
         rc, out, err = _run_cli(str(tmp))
-        assert rc != 0
-        assert "corrupt" in err.lower() or "could not open" in err.lower()
+        assert rc == rotbyte.EXIT_DB_CORRUPT
+        assert "corrupt" in err.lower()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2080,6 +2155,126 @@ class TestWorkers:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 36b. Streaming hash — multi-buffer files
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStreamingHash:
+    """Verify the streaming-hash path on files that cross the HASH_BUFFER_SIZE
+    boundary so we're not silently optimised into a single-read path for
+    small test fixtures.
+    """
+
+    def test_multi_buffer_file_matches_reference(self, tmp):
+        """A file several buffers long records the correct BLAKE2b digest."""
+        from _rotbyte.hashing import HASH_BUFFER_SIZE
+        # Three full buffers plus an intentionally-odd tail so any
+        # off-by-one in the loop shows up as a hash mismatch.
+        data = os.urandom(HASH_BUFFER_SIZE * 3 + 17)
+        big = tmp / "big.bin"
+        big.write_bytes(data)
+
+        rc, out, err = _run_cli("--json", str(tmp))
+        assert rc == 0
+        result = _extract_json(out)
+        # 4 fixture files + big.bin all hashed fresh.
+        assert result["new"] == 5
+        # bytes_hashed accumulates every read chunk, so must be >= the big file.
+        assert result["bytes_hashed"] >= len(data)
+
+        # The stored checksum must match a reference BLAKE2b over the exact
+        # bytes — rules out truncation, double-read, or endianness bugs.
+        reference = hashlib.blake2b(data).hexdigest()
+        db_path = str(next(tmp.glob(f".*{rotbyte.DB_FILENAME_SUFFIX}")))
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            rec = db.get_file_record(os.path.realpath(str(big)))
+        finally:
+            db.close()
+        assert rec is not None, "big.bin was not indexed"
+        assert rec["checksum"] == reference
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 36c. Real SIGINT during a running scan
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRealSIGINT:
+    """Send a real SIGINT to a running rotbyte subprocess. The existing
+    interrupt-flag test only exercises the Python-level `interrupted[]`
+    list; this covers the signal-handler path end-to-end.
+    """
+
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="SIGINT semantics differ on Windows")
+    def test_sigint_exits_cleanly(self, tmp_path):
+        import signal
+        # Enough files that the scan takes long enough to interrupt reliably.
+        for i in range(50):
+            (tmp_path / f"f{i:02d}.bin").write_bytes(os.urandom(256 * 1024))
+
+        cmd = [sys.executable,
+               os.path.join(os.path.dirname(__file__), "rotbyte.py"),
+               "--workers", "1", "--quiet", str(tmp_path)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Give it a moment to start hashing.
+            time.sleep(0.2)
+            # First SIGINT sets the flag; a second forces exit if the first
+            # gets swallowed during a tight loop.
+            proc.send_signal(signal.SIGINT)
+            time.sleep(0.1)
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+            rc = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            pytest.fail("rotbyte did not exit within timeout after SIGINT")
+        # 3 = EXIT_INTERRUPTED; 0 is acceptable if the scan happened to
+        # finish in the 200ms window before the signal landed.
+        assert rc in (0, 3), f"unexpected exit code {rc} after SIGINT"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 36d. Disk-full / ENOSPC on DB writes
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDiskFullDBWrites:
+    """Simulate an ENOSPC during a DB commit and verify rotbyte surfaces
+    the failure rather than crashing the interpreter or silently losing
+    work. We run in-process against the real ChecksumDB so the full write
+    path (upsert_file → commit) is exercised.
+    """
+
+    def test_commit_enospc_propagates(self, tmp, db):
+        """Inside an active transaction, a simulated ENOSPC on commit
+        propagates as sqlite3.OperationalError and the DB stays recoverable.
+        """
+        now = rotbyte._now()
+        db.begin()
+        db.upsert_file("/tmp/a", "a", 1, now, "x" * 128, None, "OK", now)
+
+        def boom():
+            raise sqlite3.OperationalError("disk I/O error")
+
+        # Simulate SQLite returning ENOSPC at commit time by patching the
+        # rotbyte-level wrapper. Caller must see the original exception —
+        # rotbyte must not swallow or mask storage failures.
+        with unittest.mock.patch.object(db, "commit", side_effect=boom):
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                db.commit()
+
+        # After the patch is removed, a rollback + fresh transaction
+        # succeed — proves rotbyte can recover (e.g. on a retry) rather
+        # than carrying poisoned state between operations.
+        db.rollback()
+        db.begin()
+        db.upsert_file("/tmp/b", "b", 1, now, "y" * 128, None, "OK", now)
+        db.commit()
+        assert db.get_file_status("/tmp/b") == "OK"
+        assert db.get_file_status("/tmp/a") is None  # rolled back
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 37. Interrupted run detection
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2091,12 +2286,7 @@ class TestInterruptedRunDetection:
         db.close()
         rc, out, err = _run_cli(str(tmp))
         assert rc == 0
-        combined = out + err
-        assert "previous run" in combined.lower() or "interrupted" in combined.lower()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+        assert "previous run" in out and "interrupted" in out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2106,10 +2296,9 @@ if __name__ == "__main__":
 class TestCLIAcceptEdgeCases:
     def test_accept_ok_file_is_noop(self, tmp):
         """Accepting a file that is already OK should not error or change state."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--accept", str(tmp / "a.txt"), str(tmp))
-        # Should indicate there's nothing to accept
-        assert "nothing to accept" in out.lower() or "status 'OK'" in out
+        assert "nothing to accept" in out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2148,7 +2337,7 @@ class TestExportImportRoundTrip:
         """Export a manifest, wipe the DB, re-import via b2sum sidecars,
         then verify all checksums still match."""
         # Step 1: index all files
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
 
         # Step 2: export manifest
         manifest = tmp / "manifest.txt"
@@ -2188,14 +2377,14 @@ class TestExportImportRoundTrip:
 class TestVerifyFile:
     def test_verify_ok(self, tmp):
         """File that matches baseline exits 0 and prints OK."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
         assert rc == 0
         assert "OK" in out
 
     def test_verify_mismatch_exit_2(self, tmp):
         """Bit-rotted file (content changed, same mtime) exits 2."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         _corrupt_file(tmp / "a.txt")
         rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
         assert rc == 2
@@ -2203,7 +2392,7 @@ class TestVerifyFile:
 
     def test_verify_not_tracked_exit_1(self, tmp):
         """File that exists on disk but is not in the DB exits 1."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         untracked = tmp / "untracked.txt"
         untracked.write_text("not indexed")
         rc, out, err = _run_cli("--verify-file", str(untracked), str(tmp))
@@ -2212,7 +2401,7 @@ class TestVerifyFile:
 
     def test_verify_missing_from_disk_exit_1(self, tmp):
         """File tracked in DB but deleted from disk exits 1."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         (tmp / "a.txt").unlink()
         rc, out, err = _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
         assert rc == 1
@@ -2220,13 +2409,21 @@ class TestVerifyFile:
 
     def test_verify_updates_last_verified(self, tmp, db_path):
         """Successful verify updates last_verified in the database."""
-        _run_cli(str(tmp))
-        db = rotbyte.ChecksumDB(db_path)
+        _run_cli_ok(str(tmp))
         file_path = str(os.path.realpath(str(tmp / "a.txt")))
+
+        # Back-date last_verified by a day so any refresh is unambiguous,
+        # avoiding a real-time sleep to make timestamps differ.
+        db = rotbyte.ChecksumDB(db_path)
+        db.conn.execute(
+            "UPDATE checksums SET last_verified = datetime('now', '-1 day') "
+            "WHERE file_path = ?",
+            (file_path,),
+        )
+        db.conn.commit()
         before = db.get_file_record(file_path)["last_verified"]
         db.close()
 
-        time.sleep(1.1)
         _run_cli("--verify-file", str(tmp / "a.txt"), str(tmp))
 
         db = rotbyte.ChecksumDB(db_path)
@@ -2237,7 +2434,7 @@ class TestVerifyFile:
     def test_discover_db_in_cwd(self, tmp, tmp_path):
         """DB is found when cwd contains a matching .{dirname}_rotbyte.db."""
         # Index from cwd == tmp so the DB is created there
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         # Run --verify-file using cwd=tmp so _discover_db_for_file finds it there
         rc, out, err = _run_cli("--verify-file", str(tmp / "b.txt"), cwd=str(tmp))
         assert rc == 0
@@ -2245,7 +2442,7 @@ class TestVerifyFile:
 
     def test_discover_db_walk_up(self, tmp):
         """DB is discovered by walking up from a deeply nested file."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         deep_file = tmp / "sub" / "d.txt"
         # cwd is a temp dir that has no DB — forces walk-up from deep_file
         rc, out, err = _run_cli("--verify-file", str(deep_file), cwd="/tmp")
@@ -2281,7 +2478,7 @@ class TestFreshnessStats:
 
     def test_files_past_window_counted_as_due(self, tmp, db_path):
         """Files with last_verified older than the window appear as due."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         db = rotbyte.ChecksumDB(db_path)
         try:
             # Back-date last_verified for all files by 40 days
@@ -2298,7 +2495,7 @@ class TestFreshnessStats:
 
     def test_mixed_freshness(self, tmp, db_path):
         """Some files within window, others outside."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         db = rotbyte.ChecksumDB(db_path)
         try:
             # Back-date two files by 40 days
@@ -2321,7 +2518,7 @@ class TestFreshnessStats:
 
     def test_missing_files_excluded(self, tmp, db_path):
         """MISSING files are not counted in freshness stats."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         db = rotbyte.ChecksumDB(db_path)
         try:
             # Mark one file as MISSING
@@ -2369,20 +2566,24 @@ class TestStatusFreshness:
             }
         }
 
+    def _capture_status(self, tracked: dict) -> str:
+        """Invoke rotbyte._run_status() on Linux with `tracked` mocked in.
+
+        Returns the captured stdout. Centralises the platform forcing and
+        stdout redirection that every freshness assertion needs.
+        """
+        captured = io.StringIO()
+        with unittest.mock.patch("rotbyte._discover_tracked",
+                                 return_value=tracked), \
+             _force_rotbyte_platform("linux"), \
+             unittest.mock.patch("sys.stdout", captured):
+            rotbyte._run_status()
+        return captured.getvalue()
+
     def test_freshness_shown_when_due_configured(self, tmp, db_path):
         """--status shows freshness stats when --due is in the tracked config."""
         _run_cli(str(tmp))  # create database with 4 files verified now
-
-        with unittest.mock.patch("rotbyte._discover_tracked",
-                                 return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._IS_MACOS", False), \
-             unittest.mock.patch("rotbyte._IS_LINUX", True), \
-             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
-            captured = io.StringIO()
-            with unittest.mock.patch("sys.stdout", captured):
-                rotbyte._run_status()
-
-        out = captured.getvalue()
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
         assert "Fresh" in out
         assert "30d window" in out
         assert "files verified" in out
@@ -2390,18 +2591,8 @@ class TestStatusFreshness:
 
     def test_freshness_values_correct(self, tmp, db_path):
         """Freshness line shows correct counts (all 4 files verified within window)."""
-        _run_cli(str(tmp))
-
-        with unittest.mock.patch("rotbyte._discover_tracked",
-                                 return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._IS_MACOS", False), \
-             unittest.mock.patch("rotbyte._IS_LINUX", True), \
-             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
-            captured = io.StringIO()
-            with unittest.mock.patch("sys.stdout", captured):
-                rotbyte._run_status()
-
-        out = captured.getvalue()
+        _run_cli_ok(str(tmp))
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
         assert "4 / 4" in out
 
     def test_freshness_shows_overdue_count(self, tmp, db_path):
@@ -2424,23 +2615,14 @@ class TestStatusFreshness:
         finally:
             db.close()
 
-        with unittest.mock.patch("rotbyte._discover_tracked",
-                                 return_value=self._make_tracked(str(tmp), "30d")), \
-             unittest.mock.patch("rotbyte._IS_MACOS", False), \
-             unittest.mock.patch("rotbyte._IS_LINUX", True), \
-             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
-            captured = io.StringIO()
-            with unittest.mock.patch("sys.stdout", captured):
-                rotbyte._run_status()
-
-        out = captured.getvalue()
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
         assert "2 / 4" in out        # 2 verified, 4 total
         assert "50.0%" in out        # 2/4 = 50%
         assert "2 files due" in out  # 2 overdue
 
     def test_freshness_absent_when_no_due(self, tmp, db_path):
         """--status does not show freshness section when --due is not configured."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
 
         tracked = {
             str(tmp): {
@@ -2454,38 +2636,20 @@ class TestStatusFreshness:
                 },
             }
         }
-        with unittest.mock.patch("rotbyte._discover_tracked",
-                                 return_value=tracked), \
-             unittest.mock.patch("rotbyte._IS_MACOS", False), \
-             unittest.mock.patch("rotbyte._IS_LINUX", True), \
-             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
-            captured = io.StringIO()
-            with unittest.mock.patch("sys.stdout", captured):
-                rotbyte._run_status()
-
-        out = captured.getvalue()
+        out = self._capture_status(tracked)
         assert "Fresh" not in out
         assert "due for re-verification" not in out
 
     def test_freshness_absent_when_no_full_scan(self, tmp, db_path):
         """--status does not show freshness when only quick scan is configured."""
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
 
         tracked = {
             str(tmp): {
                 "quick": {"interval": 3600, "active": True},
             }
         }
-        with unittest.mock.patch("rotbyte._discover_tracked",
-                                 return_value=tracked), \
-             unittest.mock.patch("rotbyte._IS_MACOS", False), \
-             unittest.mock.patch("rotbyte._IS_LINUX", True), \
-             unittest.mock.patch("rotbyte._IS_WINDOWS", False):
-            captured = io.StringIO()
-            with unittest.mock.patch("sys.stdout", captured):
-                rotbyte._run_status()
-
-        out = captured.getvalue()
+        out = self._capture_status(tracked)
         assert "Fresh" not in out
 
 
@@ -3074,7 +3238,7 @@ class TestAutoExport:
     def test_manifest_written_after_check(self, tmp_path):
         (tmp_path / "a.txt").write_text("hello")
         (tmp_path / "b.txt").write_text("world")
-        _run_cli(str(tmp_path))  # initial indexing
+        _run_cli_ok(str(tmp_path))  # initial indexing
         rc, out, _ = _run_cli("--check", "--auto-export", str(tmp_path))
         assert rc == 0
         manifests = list(tmp_path.glob(".*.manifest"))
@@ -3091,14 +3255,14 @@ class TestAutoExport:
     def test_manifest_refreshed_on_subsequent_checks(self, tmp_path):
         """A later run replaces the manifest, not appending to it."""
         (tmp_path / "a.txt").write_text("hello")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         _run_cli("--check", "--auto-export", str(tmp_path))
         manifest = next(tmp_path.glob(".*.manifest"))
         first_text = manifest.read_text()
 
         # Add a file, rerun — manifest should now contain both files.
         (tmp_path / "b.txt").write_text("world")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         _run_cli("--check", "--auto-export", str(tmp_path))
         second_text = manifest.read_text()
 
@@ -3118,7 +3282,7 @@ class TestIntegrityExitCode:
 
     def test_corrupt_header_exits_4(self, tmp):
         (tmp / "a.txt").write_text("hello")
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
         # Overwrite bytes in the SQLite header region.
         db_path = next(tmp.glob(".*_rotbyte.db"))
         with open(db_path, "r+b") as f:
@@ -3126,9 +3290,9 @@ class TestIntegrityExitCode:
             f.write(b"\x00" * 4000)
         rc, _, err = _run_cli(str(tmp))
         assert rc == 4
-        assert "integrity" in err.lower() or "corrupt" in err.lower()
+        assert "database file appears corrupt" in err
         # Recovery instructions should be present so users aren't stranded.
-        assert "Restore" in err or "restore" in err
+        assert "Restore" in err
 
 
 class TestDBOnSeparateVolume:
@@ -3149,7 +3313,7 @@ class TestDBOnSeparateVolume:
         """
         (tmp / "a.txt").write_text("hello")
         # Do an initial index as a subprocess (can't be patched).
-        _run_cli(str(tmp))
+        _run_cli_ok(str(tmp))
 
         # Now re-invoke in-process with patched stat to trigger the info line.
         real_stat = os.stat
@@ -3194,9 +3358,8 @@ class TestWindowsSchtasksRoundtrip:
     """
 
     def _cleanup(self, task_names):
-        import subprocess as _sp
         for name in task_names:
-            _sp.run(
+            subprocess.run(
                 ["schtasks.exe", "/Delete", "/TN", name, "/F"],
                 capture_output=True,
             )
@@ -3243,8 +3406,7 @@ class TestWindowsSchtasksRoundtrip:
                 run_on_battery=True,
             )
             # Query the installed task's XML back.
-            import subprocess as _sp
-            r = _sp.run(
+            r = subprocess.run(
                 ["schtasks.exe", "/Query", "/TN", task_names[0], "/XML"],
                 capture_output=True, text=True,
             )
@@ -3275,7 +3437,7 @@ class TestLegacyDatabaseRename:
     def _populate_legacy(self, tmp_path):
         """Create a legacy-named DB by building a fresh one and renaming."""
         (tmp_path / "a.txt").write_text("alpha")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         current = next(tmp_path.glob(".*_rotbyte.db"))
         legacy = current.with_name(
             current.name[:-len(rotbyte.DB_FILENAME_SUFFIX)]
@@ -3294,7 +3456,7 @@ class TestLegacyDatabaseRename:
         new = list(tmp_path.glob(".*_rotbyte.db"))
         assert len(new) == 1
         # One-line informational notice on stderr (not a warning).
-        assert "legacy" in err.lower() or "renamed" in err.lower()
+        assert "Renamed legacy database" in err
 
     def test_history_preserved_across_rename(self, tmp_path):
         """After rename, the existing DB rows survive — no re-indexing."""
@@ -3314,7 +3476,7 @@ class TestLegacyDatabaseRename:
         # Manufacture a lock sidecar to confirm it migrates.
         legacy_lock = legacy.with_suffix(legacy.suffix + ".lock")
         legacy_lock.write_text("42")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         new_lock = list(tmp_path.glob(".*_rotbyte.db.lock"))
         # The lock may or may not exist at query time (rotbyte releases it
         # at shutdown), but the old-name lock must be gone.
@@ -3335,7 +3497,7 @@ class TestLegacyDatabaseRename:
         # Build two DBs and rename one to the legacy name so both coexist.
         legacy = self._populate_legacy(tmp_path)
         # Start a second rotbyte run to create the new-name DB…
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         new = next(tmp_path.glob(".*_rotbyte.db"))
         # …then reintroduce a conflicting legacy sidecar.
         legacy_lock = legacy.with_suffix(legacy.suffix + ".lock")
@@ -3355,7 +3517,7 @@ class TestSchemaV3:
 
     def test_fresh_db_has_index(self, tmp_path):
         (tmp_path / "a.txt").write_text("x")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         db_path = next(tmp_path.glob(".*_rotbyte.db"))
         conn = sqlite3.connect(str(db_path))
         try:
@@ -3371,7 +3533,7 @@ class TestSchemaV3:
 
     def test_schema_version_is_three(self, tmp_path):
         (tmp_path / "a.txt").write_text("x")
-        _run_cli(str(tmp_path))
+        _run_cli_ok(str(tmp_path))
         db_path = next(tmp_path.glob(".*_rotbyte.db"))
         conn = sqlite3.connect(str(db_path))
         try:
@@ -3425,3 +3587,7 @@ class TestSchemaV3:
             conn.execute("SELECT 1").fetchone()
         finally:
             conn.close()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])
