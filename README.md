@@ -49,7 +49,7 @@ rotbyte /Volumes/Media
 # Full re-verify — the only way to catch true silent corruption
 rotbyte --check
 
-# See what's healthy and what isn't
+# Integrity summary: counts by state, failed files, stale files
 rotbyte --report
 ```
 
@@ -57,29 +57,15 @@ rotbyte --report
 
 ### Your first run
 
-On the first run, rotbyte hashes every file in the target directory and stores the results in a `.{dirname}_rotbyte.db` SQLite database inside that directory. Subsequent runs only re-hash files whose size or modification time changed, so they're fast.
+On the first run, rotbyte hashes every file in the target directory and stores the results in a `.{dirname}_rotbyte.db` SQLite database inside that directory. Subsequent runs only re-hash files whose size or modification time changed, so they're fast. Pass a path to scan somewhere other than the current directory.
 
 > Databases from rotbyte 1.0 and earlier used the name `.{dirname}_checksums.db`. They are auto-migrated on the first run of any newer version — the DB plus its `.lock`, WAL, SHM, and `.manifest` sidecars are atomically renamed, with all history preserved. You'll see a single `Renamed legacy database to …` notice on stderr when it happens.
-
-```bash
-# Index all files in the current directory
-rotbyte
-
-# Index a specific drive or folder
-rotbyte /Volumes/Media
-```
 
 ### Checking for corruption
 
 Default scans detect changed files but won't catch bit rot — silent corruption where the data changes without touching the modification time. `--check` re-hashes every file regardless of metadata. A hash change accompanied by a metadata change is treated as an intentional edit; only a hash change with no metadata change triggers a FAILED record.
 
-```bash
-# Full re-verify — the only way to catch true silent corruption
-rotbyte --check /Volumes/Media
-
-# See a full status report: counts, failed files, stale files
-rotbyte --report /Volumes/Media
-```
+After a scan, `--report` prints an integrity summary for that directory's database — counts by state, which files have failed, and which are overdue for re-verification.
 
 ### Scheduling quick scans
 
