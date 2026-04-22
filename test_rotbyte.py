@@ -3589,5 +3589,119 @@ class TestSchemaV3:
             conn.close()
 
 
+class TestPreventSleep:
+    """Power-assertion context manager. Uses mocked subprocess / ctypes so the
+    tests run on any host without actually keeping the system awake.
+    """
+
+    def test_macos_spawns_caffeinate_bound_to_our_pid(self, monkeypatch):
+        from _rotbyte import power
+
+        monkeypatch.setattr(power, "_IS_MACOS", True)
+        monkeypatch.setattr(power, "_IS_WINDOWS", False)
+
+        popen_calls = []
+        fake_proc = unittest.mock.MagicMock()
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append((cmd, kwargs))
+            return fake_proc
+
+        monkeypatch.setattr(power.subprocess, "Popen", fake_popen)
+
+        with power.PreventSleep():
+            assert len(popen_calls) == 1
+            cmd, kwargs = popen_calls[0]
+            # -i idle, -m disk, -s system, -w bind to PID — all required for
+            # the external-drive stall fix to actually hold overnight.
+            assert cmd[0] == "caffeinate"
+            for flag in ("-i", "-m", "-s", "-w"):
+                assert flag in cmd
+            pid_idx = cmd.index("-w") + 1
+            assert cmd[pid_idx] == str(os.getpid())
+            # stdio must be detached so caffeinate doesn't hold parent's fds.
+            assert kwargs.get("stdin") == subprocess.DEVNULL
+            assert kwargs.get("stdout") == subprocess.DEVNULL
+            assert kwargs.get("stderr") == subprocess.DEVNULL
+
+        fake_proc.terminate.assert_called_once()
+
+    def test_macos_missing_caffeinate_does_not_raise(self, monkeypatch):
+        """If caffeinate isn't on PATH we continue without an assertion —
+        the scan must not abort just because sleep prevention failed."""
+        from _rotbyte import power
+
+        monkeypatch.setattr(power, "_IS_MACOS", True)
+        monkeypatch.setattr(power, "_IS_WINDOWS", False)
+
+        def raises_enoent(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "caffeinate")
+
+        monkeypatch.setattr(power.subprocess, "Popen", raises_enoent)
+
+        with power.PreventSleep() as guard:
+            assert guard._caffeinate is None
+        # release() on a no-op guard must also be safe.
+
+    def test_macos_release_swallows_terminate_errors(self, monkeypatch):
+        """caffeinate may have already exited by the time we call terminate()
+        (e.g. if the user SIGKILL'd it). That can't break shutdown."""
+        from _rotbyte import power
+
+        monkeypatch.setattr(power, "_IS_MACOS", True)
+        monkeypatch.setattr(power, "_IS_WINDOWS", False)
+
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.terminate.side_effect = OSError("already dead")
+        monkeypatch.setattr(power.subprocess, "Popen", lambda *a, **k: fake_proc)
+
+        with power.PreventSleep():
+            pass  # exit path runs terminate() which raises
+
+    def test_windows_sets_and_clears_execution_state(self, monkeypatch):
+        from _rotbyte import power
+
+        monkeypatch.setattr(power, "_IS_MACOS", False)
+        monkeypatch.setattr(power, "_IS_WINDOWS", True)
+
+        calls = []
+        fake_kernel32 = unittest.mock.MagicMock()
+        fake_kernel32.SetThreadExecutionState.side_effect = (
+            lambda flags: calls.append(flags) or 0
+        )
+        fake_windll = unittest.mock.MagicMock(kernel32=fake_kernel32)
+        fake_ctypes = unittest.mock.MagicMock(windll=fake_windll)
+
+        monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+
+        with power.PreventSleep():
+            pass
+
+        # Entry: continuous + system required. Exit: clear (continuous only).
+        assert calls == [
+            power._ES_CONTINUOUS | power._ES_SYSTEM_REQUIRED,
+            power._ES_CONTINUOUS,
+        ]
+
+    def test_linux_is_a_noop(self, monkeypatch):
+        from _rotbyte import power
+
+        monkeypatch.setattr(power, "_IS_MACOS", False)
+        monkeypatch.setattr(power, "_IS_WINDOWS", False)
+
+        # No subprocess, no ctypes: if either were touched the test would
+        # fail via the autospec'd module patches below raising AttributeError.
+        popen_called = []
+        monkeypatch.setattr(
+            power.subprocess, "Popen",
+            lambda *a, **k: popen_called.append(a) or unittest.mock.MagicMock()
+        )
+
+        with power.PreventSleep():
+            pass
+
+        assert popen_called == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

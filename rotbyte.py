@@ -105,6 +105,7 @@ from _rotbyte.platform import (
     _try_lock,
     _unlock,
 )
+from _rotbyte.power import PreventSleep
 from _rotbyte.progress import ProgressBar, Spinner
 from _rotbyte.scheduler import (
     _dir_hash,
@@ -640,7 +641,8 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        _run_phases(db, target_dir, args, interrupted)
+        with PreventSleep():
+            _run_phases(db, target_dir, args, interrupted)
     finally:
         signal.signal(signal.SIGINT, prev_sigint)
         if not _IS_WINDOWS and prev_sigterm is not None:

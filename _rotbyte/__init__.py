@@ -9,5 +9,6 @@ This is not a stable public API — the entry point is the top-level
 - :mod:`_rotbyte.database` — SQLite-backed ChecksumDB
 - :mod:`_rotbyte.hashing`  — hash pipeline, prescan, missing detection
 - :mod:`_rotbyte.notify`   — SMTP notifications + keychain storage
+- :mod:`_rotbyte.power`    — OS power assertions (caffeinate / SetThreadExecutionState)
 - :mod:`_rotbyte.scheduler` — launchd / systemd / Task Scheduler install
 """
