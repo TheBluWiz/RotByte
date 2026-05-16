@@ -1299,9 +1299,14 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
 
     # When --due is set, filter to only files that haven't been verified
     # within the threshold. New files (not yet in DB) are always included.
+    due_start_count = 0
     if due_days:
         with Spinner(f"Filtering to files due for re-verify ({due_days}d)", quiet=quiet) as sp:
             due_paths = db.due_file_paths(target_dir, due_days)
+            # Snapshot the "overdue at scan start" count so the email layer
+            # can later report done/start progress even if budget or errors
+            # leave some files still due.
+            due_start_count = len(due_paths)
             before = len(to_hash)
             to_hash = [e for e in to_hash if e.old_checksum is None or e.path in due_paths]
             filtered = before - len(to_hash)
@@ -1351,15 +1356,35 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
 
     # ── Email notification (if configured) ─────────────────────────────
     if args.notify == "email":
-        suppress = getattr(args, "scheduled", False) and not getattr(args, "full_at", None)
+        # Full re-verifies always notify; scheduled quick scans only notify
+        # when problems are found. --full-at is an install-time flag and is
+        # not passed to scheduled commands, so check args.check instead.
+        suppress = (
+            getattr(args, "scheduled", False)
+            and not args.check
+            and not has_problems
+        )
         if suppress:
             if not quiet:
-                print("  Skipping email notification (scheduled partial scan)")
-        elif result.failed > 0 or count_missing > 0:
+                print("  Skipping email notification (scheduled quick scan, no problems)")
+        else:
             failed_details = db.failed_files() if result.failed > 0 else []
             freshness = db.freshness_stats(target_dir, due_days) if due_days else None
-            _send_email_notification(target_dir, result.failed, count_missing,
-                                     failed_details, freshness=freshness)
+            due_progress = None
+            if due_days and due_start_count > 0:
+                due_end_count = len(db.due_file_paths(target_dir, due_days))
+                due_done = max(due_start_count - due_end_count, 0)
+                due_progress = (due_done, due_start_count)
+            _send_email_notification(
+                target_dir, result.failed, count_missing,
+                failed_details,
+                freshness=freshness,
+                elapsed_seconds=elapsed,
+                due_progress=due_progress,
+                interrupted=interrupted[0],
+                budget_exceeded=result.budget_exceeded,
+                errors=result.errors,
+            )
 
     if args.json_output:
         likely_moves = 0

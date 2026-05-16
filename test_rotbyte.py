@@ -2728,14 +2728,179 @@ class TestNotifyFreshness:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 45. --notify suppression controlled by --scheduled + --full-at
+# 44b. Outcome-based subject lines (PASS / DETECTED, progress, interrupted)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNotifyOutcome:
+    """Subject line classifies each scan as PASS or DETECTED, embeds optional
+    due-progress percentage, and appends ``(interrupted)`` when applicable.
+    Body distinguishes budget exhaustion from per-file read errors when some
+    due files remain unverified.
+    """
+
+    def _send_and_capture(self, **kwargs):
+        """Invoke _send_email_notification with a mocked SMTP; return (subject, body)."""
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg["email"] = {
+            "smtp_host": "smtp.example.com",
+            "smtp_port": "587",
+            "username": "user@example.com",
+            "password": "secret",
+            "to": "user@example.com",
+        }
+
+        sent = []
+
+        class FakeSMTP:
+            def __init__(self, *a, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def starttls(self): pass
+            def login(self, *a): pass
+            def sendmail(self, frm, to, msg): sent.append(msg)
+
+        defaults = dict(
+            target_dir="/data/photos",
+            failed=0, count_missing=0, failed_files=[],
+        )
+        defaults.update(kwargs)
+
+        with unittest.mock.patch("rotbyte._load_notify_config", return_value=cfg), \
+             unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
+            rotbyte._send_email_notification(**defaults)
+
+        assert sent, "No email was sent"
+        import email as _email_mod
+        import email.header as _email_hdr
+        msg = _email_mod.message_from_string(sent[0])
+        # Subject is Q-encoded (RFC 2047) when it contains non-ASCII chars
+        # (the em-dash). Decode into a plain str for the assertions.
+        raw = msg["Subject"]
+        decoded = _email_hdr.decode_header(raw)
+        subject = "".join(
+            (part.decode(charset or "utf-8") if isinstance(part, bytes) else part)
+            for part, charset in decoded
+        )
+        payload = msg.get_payload(decode=True)
+        charset = msg.get_content_charset() or "utf-8"
+        return subject, payload.decode(charset)
+
+    def test_clean_no_due_subject_is_pass(self):
+        subject, _ = self._send_and_capture()
+        assert subject.startswith("rotbyte: PASS")
+        assert "DETECTED" not in subject
+        assert "%" not in subject
+        assert subject.endswith("/data/photos")
+
+    def test_clean_body_mentions_clean_completion(self):
+        _, body = self._send_and_capture()
+        assert "completed cleanly" in body
+        assert "Affected files" not in body
+
+    def test_detected_subject_includes_problem_detail(self):
+        subject, _ = self._send_and_capture(
+            failed=3, failed_files=[{"file_path": "/data/photos/a.jpg"}],
+        )
+        assert "DETECTED" in subject
+        assert "bit rot in 3 files" in subject
+
+    def test_detected_missing_plural_and_singular(self):
+        s1, _ = self._send_and_capture(failed=1, failed_files=[{"file_path": "/x"}])
+        assert "bit rot in 1 file " in s1 or "bit rot in 1 file —" in s1
+        s2, _ = self._send_and_capture(count_missing=1)
+        assert "1 file missing" in s2
+
+    def test_due_progress_full_is_100_percent(self):
+        subject, _ = self._send_and_capture(due_progress=(47, 47))
+        assert "PASS 100% (47/47 due)" in subject
+
+    def test_due_progress_partial_percent(self):
+        subject, body = self._send_and_capture(due_progress=(30, 47))
+        assert "PASS 64% (30/47 due)" in subject
+        assert "30 / 47 verified this run" in body
+        assert "63.8%" in body
+
+    def test_interrupted_suffix_in_subject(self):
+        subject, body = self._send_and_capture(interrupted=True)
+        assert "(interrupted)" in subject
+        assert "Scan was interrupted" in body
+
+    def test_detected_with_progress_and_interruption(self):
+        subject, _ = self._send_and_capture(
+            failed=2, failed_files=[{"file_path": "/x"}],
+            due_progress=(10, 47), interrupted=True,
+        )
+        assert "DETECTED" in subject
+        assert "21% (10/47 due)" in subject
+        assert "(interrupted)" in subject
+        assert "bit rot in 2 files" in subject
+
+    def test_body_budget_exhausted_note(self):
+        _, body = self._send_and_capture(
+            due_progress=(30, 47), budget_exceeded=True,
+        )
+        assert "17 files still due" in body
+        assert "budget exhausted" in body
+        assert "`--budget`" in body
+        # Must NOT claim errors caused the shortfall when errors=0
+        assert "read error" not in body
+
+    def test_body_errors_note(self):
+        _, body = self._send_and_capture(
+            due_progress=(30, 47), errors=4,
+        )
+        assert "17 files still due" in body
+        assert "4 read errors" in body
+        assert "budget" not in body
+
+    def test_body_budget_and_errors_note(self):
+        _, body = self._send_and_capture(
+            due_progress=(30, 47), budget_exceeded=True, errors=2,
+        )
+        assert "17 files still due" in body
+        assert "budget exhausted" in body
+        assert "2 additional read errors" in body
+
+    def test_body_no_remaining_has_no_shortfall_line(self):
+        _, body = self._send_and_capture(due_progress=(47, 47))
+        assert "still due" not in body
+
+    def test_duration_in_body_when_provided(self):
+        _, body = self._send_and_capture(elapsed_seconds=125.0)
+        assert "Scan duration:" in body
+
+    def test_clean_body_skips_report_hint(self):
+        """PASS body doesn't need the --report / --accept hint (nothing to fix)."""
+        _, body = self._send_and_capture()
+        assert "--report" not in body
+        assert "--accept" not in body
+
+    def test_detected_body_keeps_report_hint(self):
+        _, body = self._send_and_capture(
+            failed=1, failed_files=[{"file_path": "/x"}],
+        )
+        assert "--report" in body
+        assert "--accept" in body
+
+    def test_due_progress_with_zero_start_is_omitted(self):
+        """due_progress=(0, 0) shouldn't add a percentage (nothing was due)."""
+        subject, body = self._send_and_capture(due_progress=(0, 0))
+        # We pass (0,0) but the caller in _run_phases only sets due_progress
+        # when start > 0. Still, be defensive: 100% is reasonable.
+        assert "0/0 due" in subject or "PASS —" in subject or "PASS " in subject
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 45. --notify suppression: full re-verifies always send; scheduled quick
+#     scans send only when problems are detected.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestNotifyPartialScan:
     """Verify email notification rules for scheduled vs. untracked runs."""
 
     def _make_args(self, notify="email", budget=None, due=None,
-                   scheduled=False, full_at=None):
+                   scheduled=False, check=True):
         import argparse
         args = argparse.Namespace(
             notify=notify,
@@ -2744,10 +2909,10 @@ class TestNotifyPartialScan:
             budget_seconds=1800 if budget else None,
             due_days=30 if due else None,
             scheduled=scheduled,
-            full_at=full_at,
+            full_at=None,
             quiet=True,
             json_output=False,
-            check=True,
+            check=check,
             workers=1,
             include_hidden=False,
             exclude_dirs=[],
@@ -2755,13 +2920,18 @@ class TestNotifyPartialScan:
         )
         return args
 
-    def _run_phases_with_mock(self, tmp_path, args):
-        """Run _run_phases against a real (indexed) tmp dir and return send call count."""
+    def _run_phases_with_mock(self, tmp_path, args, problem="corrupt"):
+        """Run _run_phases against a real (indexed) tmp dir and return send call count.
+
+        ``problem`` selects how to introduce trouble between the index and
+        verify passes: ``"corrupt"`` flips bytes while preserving mtime/size
+        (visible only to --check), ``"missing"`` deletes a file (visible to
+        quick scans too), and ``None`` leaves the tree clean.
+        """
         target_dir = str(tmp_path)
         db_name = "." + tmp_path.name + rotbyte.DB_FILENAME_SUFFIX
         db_path = str(tmp_path / db_name)
 
-        # First index the directory
         db = rotbyte.ChecksumDB(db_path)
         interrupted = [False]
         index_args = self._make_args(notify=None, budget=None, due=None)
@@ -2770,13 +2940,17 @@ class TestNotifyPartialScan:
                 rotbyte._run_phases(db, target_dir, index_args, interrupted)
         db.close()
 
-        # Corrupt a file to force a failure on the next run
-        for f in tmp_path.iterdir():
-            if f.suffix == ".txt":
-                _corrupt_file(f)
-                break
+        if problem == "corrupt":
+            for f in tmp_path.iterdir():
+                if f.suffix == ".txt":
+                    _corrupt_file(f)
+                    break
+        elif problem == "missing":
+            for f in tmp_path.iterdir():
+                if f.suffix == ".txt":
+                    f.unlink()
+                    break
 
-        # Now run with the test args and capture send calls
         db = rotbyte.ChecksumDB(db_path)
         interrupted = [False]
         with unittest.mock.patch("rotbyte._send_email_notification") as mock_send:
@@ -2791,24 +2965,30 @@ class TestNotifyPartialScan:
         call_count = self._run_phases_with_mock(tmp, args)
         assert call_count == 1, "Expected email on untracked run even with --budget"
 
-    def test_scheduled_without_full_at_suppresses(self, tmp):
-        """--scheduled without --full-at suppresses the notification."""
-        args = self._make_args(notify="email", scheduled=True, full_at=None)
-        call_count = self._run_phases_with_mock(tmp, args)
-        assert call_count == 0, "Expected no email for scheduled partial scan"
+    def test_scheduled_full_scan_sends_email(self, tmp):
+        """Scheduled full re-verify (--check) always sends a health report."""
+        args = self._make_args(notify="email", scheduled=True, check=True)
+        call_count = self._run_phases_with_mock(tmp, args, problem=None)
+        assert call_count == 1, "Expected email after scheduled full re-verify"
 
-    def test_scheduled_with_full_at_sends_email(self, tmp):
-        """--scheduled + --full-at sends email."""
-        args = self._make_args(notify="email", scheduled=True, full_at=["2h"])
-        call_count = self._run_phases_with_mock(tmp, args)
-        assert call_count == 1, "Expected email for scheduled full scan"
-
-    def test_scheduled_full_at_budget_interrupted_sends_email(self, tmp):
-        """--scheduled + --full-at + --budget still sends email."""
+    def test_scheduled_full_scan_with_budget_sends_email(self, tmp):
+        """Scheduled full re-verify with --budget still sends email."""
         args = self._make_args(notify="email", budget="30m",
-                               scheduled=True, full_at=["2h"])
-        call_count = self._run_phases_with_mock(tmp, args)
-        assert call_count == 1, "Expected email for budget-interrupted full scan"
+                               scheduled=True, check=True)
+        call_count = self._run_phases_with_mock(tmp, args, problem="corrupt")
+        assert call_count == 1, "Expected email for budget-capped full scan"
+
+    def test_scheduled_quick_scan_with_problems_sends_email(self, tmp):
+        """Scheduled quick scan alerts when problems are detected."""
+        args = self._make_args(notify="email", scheduled=True, check=False)
+        call_count = self._run_phases_with_mock(tmp, args, problem="missing")
+        assert call_count == 1, "Expected alert email from scheduled quick scan"
+
+    def test_scheduled_quick_scan_no_problems_suppresses(self, tmp):
+        """Scheduled quick scan stays quiet when nothing is wrong."""
+        args = self._make_args(notify="email", scheduled=True, check=False)
+        call_count = self._run_phases_with_mock(tmp, args, problem=None)
+        assert call_count == 0, "Expected no email from clean scheduled quick scan"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

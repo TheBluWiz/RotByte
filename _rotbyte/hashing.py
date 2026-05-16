@@ -207,7 +207,8 @@ def prescan_files(
 
 class HashResult:
     """Counters accumulated during the hashing phase."""
-    __slots__ = ("new", "ok", "updated", "failed", "errors", "bytes_hashed")
+    __slots__ = ("new", "ok", "updated", "failed", "errors", "bytes_hashed",
+                 "budget_exceeded")
 
     def __init__(self):
         self.new = 0
@@ -216,6 +217,7 @@ class HashResult:
         self.failed = 0
         self.errors = 0
         self.bytes_hashed = 0
+        self.budget_exceeded = False
 
 
 def run_hashing(
@@ -278,6 +280,7 @@ def run_hashing(
                         elapsed = time.monotonic() - budget_start
                         if elapsed >= budget_seconds:
                             budget_exceeded = True
+                            result.budget_exceeded = True
                             remaining = total - processed
                             if not quiet:
                                 print(f"\n  Time budget reached ({_format_duration(elapsed)})."

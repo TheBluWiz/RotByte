@@ -18,6 +18,7 @@ import subprocess as _subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
+from .helpers import _format_duration
 from .platform import _IS_MACOS, _IS_WINDOWS
 
 # Service identifier under which we register SMTP passwords with the OS keychain.
@@ -343,14 +344,31 @@ def _run_notify_setup():
 
 def _send_email_notification(target_dir: str, failed: int, count_missing: int,
                              failed_files: List[Dict],
-                             freshness: Optional[tuple] = None):
-    """Send an email notification about scan problems.
+                             freshness: Optional[tuple] = None,
+                             *,
+                             elapsed_seconds: Optional[float] = None,
+                             due_progress: Optional[Tuple[int, int]] = None,
+                             interrupted: bool = False,
+                             budget_exceeded: bool = False,
+                             errors: int = 0):
+    """Send an email notification summarizing a completed scan.
+
+    Subject distinguishes three outcomes:
+      - PASS: no bit rot and no missing files
+      - DETECTED: failed hashes or missing files
+    Interruption is appended to the subject as ``(interrupted)``.
+
+    ``due_progress`` is ``(done, start)`` — files verified this run out of
+    those that were overdue at scan start. When present, the subject
+    embeds the percentage (e.g. ``PASS 64% (30/47 due)``).
+
+    ``budget_exceeded`` and ``errors`` affect only the body: when due
+    progress is < 100%, the body explains whether the gap was the
+    ``--budget`` cap or per-file read errors (distinct causes, same
+    observable outcome of "files still due").
 
     Best-effort: prints a warning on failure but never prevents the scan
     from completing with its normal exit code.
-
-    freshness, if provided, is a (total, verified_within, due) tuple from
-    ChecksumDB.freshness_stats() and is appended as a summary line.
     """
     try:
         config = _load_notify_config()
@@ -363,30 +381,70 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
 
     section = config["email"]
 
+    has_problems = failed > 0 or count_missing > 0
+    outcome = "DETECTED" if has_problems else "PASS"
+
     # Build subject
-    parts = []
-    if failed > 0:
-        parts.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        parts.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
-    subject = f"rotbyte: {', '.join(parts)} — {target_dir}"
+    subject_parts = [f"rotbyte: {outcome}"]
+    if due_progress is not None:
+        done, start = due_progress
+        pct = (done / start * 100) if start > 0 else 100.0
+        subject_parts.append(f"{pct:.0f}% ({done:,}/{start:,} due)")
+    if interrupted:
+        subject_parts.append("(interrupted)")
+    subject = " ".join(subject_parts)
+    if has_problems:
+        detail = []
+        if failed > 0:
+            detail.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+        if count_missing > 0:
+            detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+        subject += f" — {', '.join(detail)}"
+    subject += f" — {target_dir}"
 
     # Build body
-    lines = [
-        f"rotbyte detected problems in {target_dir}:\n",
-    ]
-    if failed > 0:
-        lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
-    if count_missing > 0:
-        lines.append(f"  Missing files:    {count_missing}")
-    lines.append("")
+    if has_problems:
+        lines = [f"rotbyte detected problems in {target_dir}:\n"]
+        if failed > 0:
+            lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
+        if count_missing > 0:
+            lines.append(f"  Missing files:    {count_missing}")
+        lines.append("")
+    else:
+        lines = [f"rotbyte scan completed cleanly for {target_dir}.\n"]
 
-    if failed_files:
+    if interrupted:
+        lines.append("Scan was interrupted before completion (Ctrl-C / SIGTERM).")
+        lines.append("")
+
+    if has_problems and failed_files:
         lines.append("Affected files:")
         for f in failed_files[:50]:
             lines.append(f"  ✗ {f['file_path']}")
         if len(failed_files) > 50:
             lines.append(f"  ... and {len(failed_files) - 50} more")
+        lines.append("")
+
+    if due_progress is not None:
+        done, start = due_progress
+        remaining = start - done
+        pct = (done / start * 100) if start > 0 else 100.0
+        lines.append(f"Due-file progress: {done:,} / {start:,} verified this run ({pct:.1f}%)")
+        if remaining > 0:
+            # Distinguish budget cap from per-file errors so the operator
+            # knows whether to extend --budget or investigate I/O issues.
+            if budget_exceeded and errors > 0:
+                lines.append(f"  {remaining:,} file{'s' if remaining != 1 else ''} still due — "
+                             f"time budget exhausted; {errors:,} additional read error"
+                             f"{'s' if errors != 1 else ''} during scan.")
+            elif budget_exceeded:
+                lines.append(f"  {remaining:,} file{'s' if remaining != 1 else ''} still due — "
+                             f"time budget exhausted. Consider raising `--budget`.")
+            elif errors > 0:
+                lines.append(f"  {remaining:,} file{'s' if remaining != 1 else ''} still due — "
+                             f"{errors:,} read error{'s' if errors != 1 else ''} during scan.")
+            else:
+                lines.append(f"  {remaining:,} file{'s' if remaining != 1 else ''} still due.")
         lines.append("")
 
     if freshness is not None:
@@ -395,8 +453,13 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} files verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
         lines.append("")
 
-    lines.append("Run `rotbyte --report` for full details.")
-    lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
+    if elapsed_seconds is not None:
+        lines.append(f"Scan duration: {_format_duration(elapsed_seconds)}")
+        lines.append("")
+
+    if has_problems:
+        lines.append("Run `rotbyte --report` for full details.")
+        lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
 
     body = "\n".join(lines)
 
