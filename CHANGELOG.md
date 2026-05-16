@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1 — 2026-05-16
+
+### Fixed
+- Scheduled `--notify email` runs never sent emails. The suppression check in `_run_phases` keyed on `args.full_at`, which is a `--track` install-time flag and is not propagated into the scheduled commands the scheduler installs — so the gate evaluated `True` for every scheduled run, both quick and full. The check now keys on `args.check` and whether problems were detected: full re-verifies always send a health report, scheduled quick scans send only when failures, missing files, or interruptions are present, and manual runs continue to always send
+
+### Tests
+- `TestNotifyPartialScan` rewritten around the corrected semantics: untracked always-sends, scheduled full sends (clean and budget-capped), scheduled quick sends on missing-file problem, scheduled quick stays silent on a clean tree (5 tests total)
+
+---
+
 ## 1.1.0 — 2026-04-18
 
 ### Security
