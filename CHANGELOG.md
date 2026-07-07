@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.2 — Unreleased
+## 1.1.2 — 2026-07-07
 
 ### Fixed
 - **Scheduled scans no longer break on `brew upgrade`.** `--track` baked the version-pinned Homebrew Cellar path (e.g. `/opt/homebrew/Cellar/rotbyte/1.1.0/libexec/rotbyte.py`) into launchd plists / systemd units; the next upgrade deleted that directory and every scheduled run died at exec with "[Errno 2] No such file or directory" — silently, since `--status` still reported the agent as active. Scheduler commands now rewrite Cellar paths to the upgrade-stable `opt/<package>` symlink (interpreter and script both)
