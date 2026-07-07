@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.2 — Unreleased
+
+### Fixed
+- **Scheduled scans no longer break on `brew upgrade`.** `--track` baked the version-pinned Homebrew Cellar path (e.g. `/opt/homebrew/Cellar/rotbyte/1.1.0/libexec/rotbyte.py`) into launchd plists / systemd units; the next upgrade deleted that directory and every scheduled run died at exec with "[Errno 2] No such file or directory" — silently, since `--status` still reported the agent as active. Scheduler commands now rewrite Cellar paths to the upgrade-stable `opt/<package>` symlink (interpreter and script both)
+- **`--status` now reports schedule health, not just load state.** A loaded job whose command no longer exists shows `BROKEN ✗` with the missing path and the remedy; a loaded job whose last run exited non-zero shows `active ⚠ (last run exited N)` (launchd `LastExitStatus`). Every tracked directory also shows its notification state, so a schedule installed without `--notify` is visible instead of silently mute
+- **Linux `--status` discovery repaired** (regression from the 1.1.0 ExecStart quoting fix): discovery split `ExecStart=` on whitespace, so the quoted target path came back with literal quotes, failed `os.path.isabs()`, and the tracked directory vanished from the report; quoted flags (`--due`, `--notify`, …) were likewise unparseable. ExecStart lines are now tokenized with the inverse of the quoting rules (legacy unquoted units still parse)
+- **Windows `--status` discovery repaired**: `_discover_schtasks` returned a different data shape than the renderer consumed, so installed tasks displayed as "(not configured)". It now produces the same `quick`/`full` structure as launchd/systemd, including flags recovered from the task's `<Arguments>`
+- **The `from` address in `notify.conf` is honored again** (regression from the 1.1.0 notify rewrite; the v1.0.0 setup collected it for alias support and the docs still describe it). `--notify-setup email` prompts for "Send alerts from" once more, and notification emails use it as the header From and envelope sender, falling back to the login username
+- **A broken email config no longer disables scheduled scanning.** `--scheduled` runs downgrade the fail-fast notify-config check to a stderr warning and scan anyway; manual runs still abort early so misconfiguration is noticed
+- **SMTP passwords containing `%` no longer crash config readback** — both notify config readers/writers construct `ConfigParser(interpolation=None)`
+- **Windows argument quoting corrected to CommandLineToArgvW rules**: backslashes are only doubled before quotes; the previous blanket doubling corrupted quoted paths (`"C:\\Program Files"` parsed back with doubled separators). Discovery gained the matching splitter
+- **systemd install reloads once, after all unit files are written** — previously `daemon-reload` ran between the quick and full unit writes, so the full timer was enabled against a stale unit cache
+- `_find_rotbyte_executable()` returns an argument list instead of a whitespace-joined string, so interpreter/script paths containing spaces survive into scheduler configs intact
+
+### Added
+- `--track` warns at install time when the full-scan `--budget` is not shorter than the quick-scan `--every` interval — that combination guarantees quick scans collide with the full scan's database lock and exit without scanning
+
 ## 1.1.1 — 2026-05-16
 
 ### Fixed

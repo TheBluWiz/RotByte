@@ -93,23 +93,98 @@ def _generate_task_xml(description: str, command: List[str],
 def _quote_windows_args(args: List[str]) -> str:
     """Quote a list of arguments for a Windows <Arguments> element.
 
-    Uses the CommandLineToArgvW convention: wrap in double quotes any
-    argument that contains a space or double quote, and escape embedded
-    quotes by doubling backslashes + quote.
+    Follows the CommandLineToArgvW convention exactly (same rules as
+    ``subprocess.list2cmdline``): backslashes are literal *unless* they
+    precede a double quote, in which case they must be doubled; an
+    embedded quote becomes ``\\"``; trailing backslashes in a quoted
+    argument are doubled so they don't escape the closing quote.
+
+    Blanket-doubling every backslash (the previous behavior) corrupted
+    quoted Windows paths: ``"C:\\\\Program Files"`` parses back as
+    ``C:\\\\Program Files`` because mid-string double backslashes are two
+    literal characters when not followed by a quote.
     """
     out = []
     for a in args:
         if not a:
             out.append('""')
             continue
-        needs_quote = any(c in a for c in ' \t"')
-        if not needs_quote:
+        if not any(c in a for c in ' \t"'):
             out.append(a)
             continue
-        # Escape per MS rules
-        escaped = a.replace("\\", "\\\\").replace('"', '\\"')
-        out.append(f'"{escaped}"')
+        buf = ['"']
+        backslashes = 0
+        for c in a:
+            if c == "\\":
+                backslashes += 1
+            elif c == '"':
+                # Double each pending backslash, then escape the quote.
+                buf.append("\\" * (backslashes * 2))
+                buf.append('\\"')
+                backslashes = 0
+            else:
+                buf.append("\\" * backslashes)
+                buf.append(c)
+                backslashes = 0
+        # Trailing backslashes must be doubled so the closing quote is
+        # not consumed as an escape.
+        buf.append("\\" * (backslashes * 2))
+        buf.append('"')
+        out.append("".join(buf))
     return " ".join(out)
+
+
+def _split_windows_args(cmdline: str) -> List[str]:
+    """Split a Windows <Arguments> string back into an argument list.
+
+    Implements the CommandLineToArgvW parsing rules — the inverse of
+    :func:`_quote_windows_args` — so --status discovery can recover flags
+    like ``--notify email`` and quoted paths with spaces from installed
+    Task Scheduler XML.
+    """
+    args: List[str] = []
+    buf: List[str] = []
+    in_quotes = False
+    started = False
+    i = 0
+    n = len(cmdline)
+    while i < n:
+        c = cmdline[i]
+        if c == "\\":
+            # Count the run of backslashes and check what follows.
+            j = i
+            while j < n and cmdline[j] == "\\":
+                j += 1
+            count = j - i
+            if j < n and cmdline[j] == '"':
+                buf.append("\\" * (count // 2))
+                if count % 2:
+                    buf.append('"')       # escaped literal quote
+                    j += 1
+                # else: the quote is a delimiter, handled next iteration
+                i = j
+                started = True
+                continue
+            buf.append("\\" * count)
+            i = j
+            started = True
+        elif c == '"':
+            in_quotes = not in_quotes
+            started = True
+            i += 1
+        elif c in (" ", "\t") and not in_quotes:
+            if started:
+                args.append("".join(buf))
+                buf = []
+                started = False
+            i += 1
+        else:
+            buf.append(c)
+            started = True
+            i += 1
+    if started:
+        args.append("".join(buf))
+    return args
 
 
 def _iso_duration(seconds: int) -> str:
@@ -298,12 +373,29 @@ def _discover_schtasks() -> Dict[str, Dict]:
         return {}
     if result.returncode != 0 or not result.stdout:
         return {}
+    return _parse_schtasks_xml(result.stdout)
 
+
+def _parse_schtasks_xml(xml_output: str) -> Dict[str, Dict]:
+    """Parse concatenated Task XML docs into --status's tracked-dir shape.
+
+    Returns the same structure launchd/systemd discovery produce —
+    ``{target_dir: {"quick": {"interval", "active", ...flags},
+    "full": {"times", "active", ...flags}}}`` — so ``--status`` renders
+    Windows tasks with the shared code path. (The previous flat
+    ``quick_interval``/``full_at`` shape made the renderer report every
+    Windows task as "(not configured)".)
+
+    Factored out of :func:`_discover_schtasks` so the parsing is testable
+    without a Windows host.
+    """
     # Output is a concatenated series of Task XML docs. Split on the
     # XML prolog to recover each one.
-    docs = [d for d in _re.split(r'(?=<\?xml )', result.stdout) if d.strip()]
+    docs = [d for d in _re.split(r'(?=<\?xml )', xml_output) if d.strip()]
     import xml.etree.ElementTree as ET
     ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+    from . import _missing_command_path, _parse_cmd_flags
 
     found: Dict[str, Dict] = {}
     for doc in docs:
@@ -318,11 +410,32 @@ def _discover_schtasks() -> Dict[str, Dict]:
         if not m:
             continue
         kind, target = m.group(1), m.group(2)
-        entry = found.setdefault(target, {"target_dir": target, "platform": "windows"})
+        entry = found.setdefault(target, {})
+
+        enabled_el = root.find("t:Settings/t:Enabled", ns)
+        active = enabled_el is None or (enabled_el.text or "").strip().lower() == "true"
+
+        cmd_el = root.find("t:Actions/t:Exec/t:Command", ns)
+        args_el = root.find("t:Actions/t:Exec/t:Arguments", ns)
+        args: List[str] = []
+        if cmd_el is not None and cmd_el.text:
+            args.append(cmd_el.text)
+        if args_el is not None and args_el.text:
+            args.extend(_split_windows_args(args_el.text))
+        flags = _parse_cmd_flags(args)
+        missing_exe = _missing_command_path(args)
+
         if kind == "quick":
             interval_el = root.find(
                 "t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", ns)
-            entry["quick_interval"] = _parse_iso_duration(interval_el.text) if interval_el is not None else None
+            interval = (_parse_iso_duration(interval_el.text)
+                        if interval_el is not None else None)
+            entry["quick"] = {
+                "interval": interval or 3600,
+                "active": active,
+                "missing_exe": missing_exe,
+                **flags,
+            }
         else:
             times = []
             for ct in root.findall("t:Triggers/t:CalendarTrigger", ns):
@@ -334,8 +447,10 @@ def _discover_schtasks() -> Dict[str, Dict]:
                     times.append((dt.hour, dt.minute))
                 except ValueError:
                     continue
-            entry["full_at"] = times
-            limit_el = root.find("t:Settings/t:ExecutionTimeLimit", ns)
-            if limit_el is not None and limit_el.text:
-                entry["budget"] = _parse_iso_duration(limit_el.text)
+            entry["full"] = {
+                "times": times,
+                "active": active,
+                "missing_exe": missing_exe,
+                **flags,
+            }
     return found

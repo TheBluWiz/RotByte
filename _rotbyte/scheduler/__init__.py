@@ -24,23 +24,59 @@ def _dir_hash(target_dir: str) -> str:
     return _hashlib.md5(target_dir.encode()).hexdigest()[:8]
 
 
-def _find_rotbyte_executable() -> str:
-    """Find the full path to the rotbyte executable for scheduled tasks.
+# Matches a Homebrew Cellar path: <prefix>/Cellar/<package>/<version>/<rest>.
+# Used to rewrite version-pinned paths to the upgrade-stable opt symlink.
+_CELLAR_RE = _re.compile(r"^(?P<prefix>.*)/Cellar/(?P<pkg>[^/]+)/[^/]+/(?P<rest>.+)$")
 
-    On macOS, always returns 'python script.py' format to avoid going
+
+def _stable_homebrew_path(path: str) -> str:
+    """Rewrite a version-pinned Homebrew Cellar path to its opt equivalent.
+
+    ``/opt/homebrew/Cellar/rotbyte/1.1.0/libexec/rotbyte.py`` becomes
+    ``/opt/homebrew/opt/rotbyte/libexec/rotbyte.py``. The Cellar directory
+    is deleted on ``brew upgrade`` + ``brew cleanup``, so baking a Cellar
+    path into a persistent scheduler config (launchd plist, systemd unit,
+    Task Scheduler XML) silently breaks every scheduled run after the
+    next upgrade. The ``opt/<pkg>`` symlink always points at the current
+    version, so scheduled commands keep working across upgrades.
+
+    Returns ``path`` unchanged when it isn't a Cellar path or when the
+    opt equivalent doesn't exist (e.g. a partially removed install —
+    better to keep a path that works today than invent one that doesn't).
+    """
+    m = _CELLAR_RE.match(path)
+    if not m:
+        return path
+    stable = f"{m.group('prefix')}/opt/{m.group('pkg')}/{m.group('rest')}"
+    return stable if os.path.exists(stable) else path
+
+
+def _find_rotbyte_executable() -> List[str]:
+    """Find the command to run rotbyte from a scheduled task.
+
+    Returns the command as an argument list (e.g. ``["/usr/bin/python3",
+    "/path/rotbyte.py"]``) so paths containing spaces survive intact all
+    the way into the platform scheduler config.
+
+    On macOS, always returns '<python> <script.py>' form to avoid going
     through shell wrapper scripts (like Homebrew's bash wrappers). This
     is critical for Full Disk Access — TCC checks the binary that
     actually performs I/O (Python), and a bash wrapper in the chain
     breaks the attribution.
 
     On Linux (systemd), the shell wrapper is fine since there's no TCC.
+
+    All returned paths pass through :func:`_stable_homebrew_path` so a
+    Homebrew install never pins the scheduled command to a Cellar
+    directory that the next ``brew upgrade`` deletes.
     """
+    interpreter = _stable_homebrew_path(sys.executable)
     if _IS_MACOS:
         # Always use Python directly on macOS to avoid bash wrapper
         # attribution issues with Full Disk Access
         script = os.path.realpath(sys.argv[0])
         if script.endswith(".py"):
-            return f"{sys.executable} {script}"
+            return [interpreter, _stable_homebrew_path(script)]
         # If invoked via a wrapper, find the .py script it points to
         wrapper = shutil.which(os.path.basename(sys.argv[0]))
         if wrapper:
@@ -52,22 +88,22 @@ def _find_rotbyte_executable() -> str:
                 #   exec "/path/to/rotbyte.py" "$@"
                 match = _re.search(r'exec\s+"([^"]+\.py)"', content)
                 if match:
-                    return f"{sys.executable} {match.group(1)}"
+                    return [interpreter, _stable_homebrew_path(match.group(1))]
             except OSError:
                 pass
-        return f"{sys.executable} {script}"
+        return [interpreter, _stable_homebrew_path(script)]
 
     # Linux / other: shell wrappers work fine
     if not sys.argv[0].endswith(".py"):
         candidate = shutil.which(os.path.basename(sys.argv[0]))
         if candidate:
-            return os.path.realpath(candidate)
+            return [_stable_homebrew_path(os.path.realpath(candidate))]
 
     candidate = shutil.which("rotbyte")
     if candidate:
-        return os.path.realpath(candidate)
+        return [_stable_homebrew_path(os.path.realpath(candidate))]
 
-    return f"{sys.executable} {os.path.realpath(sys.argv[0])}"
+    return [interpreter, _stable_homebrew_path(os.path.realpath(sys.argv[0]))]
 
 
 def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
@@ -85,10 +121,30 @@ def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:
     return flags
 
 
+def _missing_command_path(args: List[str]) -> Optional[str]:
+    """Return the first command path in ``args`` that no longer exists.
+
+    Checks the interpreter (args[0]) and, when the second argument is a
+    ``.py`` script, the script itself. This is how a stale scheduler
+    config manifests in practice: a Homebrew upgrade deletes the old
+    Cellar directory and every scheduled run dies at exec with
+    "[Errno 2] No such file or directory" — invisible unless someone
+    reads the log. Surfacing it here lets --status say so.
+    """
+    if not args:
+        return None
+    if os.path.isabs(args[0]) and not os.path.exists(args[0]):
+        return args[0]
+    if (len(args) > 1 and args[1].endswith(".py")
+            and os.path.isabs(args[1]) and not os.path.exists(args[1])):
+        return args[1]
+    return None
+
+
 def _run_track(target_dir: str, every_seconds: int,
                full_at: Optional[List[Tuple[int, int]]],
                budget_seconds: Optional[int],
-               rotbyte_exe: str,
+               rotbyte_exe,
                workers: Optional[int] = None,
                due_days: Optional[int] = None,
                notify: Optional[str] = None,
@@ -121,8 +177,14 @@ def _run_track(target_dir: str, every_seconds: int,
 
     dhash = _dir_hash(target_dir)
 
-    # Split rotbyte_exe into command parts (handles "python /path/to/rotbyte.py")
-    exe_parts = rotbyte_exe.split()
+    # rotbyte_exe is an argument list from _find_rotbyte_executable().
+    # A plain string ("python /path/to/rotbyte.py") is tolerated for
+    # backward compatibility, but note that whitespace-splitting a string
+    # cannot preserve paths that contain spaces — pass a list for those.
+    if isinstance(rotbyte_exe, str):
+        exe_parts = rotbyte_exe.split()
+    else:
+        exe_parts = list(rotbyte_exe)
 
     # --workers passthrough (only when explicitly set)
     workers_args = ["--workers", str(workers)] if workers is not None else []
@@ -183,6 +245,22 @@ def _run_track(target_dir: str, every_seconds: int,
         print(f"  On battery : {'allowed' if run_on_battery else 'skip (default)'}")
     print("═" * 60)
     print()
+
+    # A full-scan budget at or above the quick-scan interval guarantees
+    # that quick scans fire while the full scan still holds the database
+    # lock — each collision exits 5 having done nothing, and the operator
+    # never hears about it. Warn loudly at install time, when the numbers
+    # are still easy to change.
+    if full_at and budget_seconds and budget_seconds >= every_seconds:
+        print(f"  ! Warning: the full-scan budget "
+              f"({_format_duration(budget_seconds)}) is not shorter than the "
+              f"quick-scan interval ({_format_duration(every_seconds)}).",
+              file=sys.stderr)
+        print("  ! Quick scans that fire during a full scan will find the "
+              "database locked and exit without scanning.", file=sys.stderr)
+        print("  ! Consider a smaller --budget or a larger --every.",
+              file=sys.stderr)
+        print(file=sys.stderr)
 
     if is_mac:
         launchd._install_launchd(target_dir, dhash, quick_cmd, every_seconds,

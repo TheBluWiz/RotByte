@@ -9,7 +9,7 @@ import subprocess as _subprocess
 import textwrap as _textwrap
 from typing import Dict, List, Optional, Tuple
 
-from . import _parse_cmd_flags
+from . import _missing_command_path, _parse_cmd_flags
 
 
 def _systemd_escape_arg(arg: str) -> str:
@@ -26,6 +26,47 @@ def _systemd_escape_arg(arg: str) -> str:
     a space silently split into two ExecStart arguments.
     """
     return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _split_exec_start(exec_line: str) -> List[str]:
+    """Tokenize an ExecStart= command line back into an argument list.
+
+    Inverse of the ``_systemd_escape_arg`` quoting: arguments are
+    whitespace-separated, ``"..."`` groups may contain spaces, and inside
+    quotes ``\\\\`` and ``\\"`` are escapes. Unquoted tokens (units written
+    by rotbyte ≤ 1.0, or hand-edited files) are split on whitespace as
+    before.
+
+    A naive ``str.split()`` here broke --status for every unit written
+    since the 1.1.0 quoting fix: the quoted target path came back as
+    ``"/path"`` (quotes included), failed ``os.path.isabs()``, and the
+    whole tracked directory silently vanished from the report.
+    """
+    args: List[str] = []
+    buf: List[str] = []
+    in_quotes = False
+    escaped = False
+    started = False
+    for ch in exec_line:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+        elif in_quotes and ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_quotes = not in_quotes
+            started = True
+        elif ch in (" ", "\t") and not in_quotes:
+            if started or buf:
+                args.append("".join(buf))
+                buf = []
+                started = False
+        else:
+            buf.append(ch)
+            started = True
+    if started or buf:
+        args.append("".join(buf))
+    return args
 
 
 def _systemd_escape_description(description: str) -> str:
@@ -106,11 +147,7 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
     with open(os.path.join(unit_dir, f"{quick_name}.timer"), "w") as f:
         f.write(timer_content)
 
-    _subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    _subprocess.run(["systemctl", "--user", "enable", "--now", f"{quick_name}.timer"],
-                    check=True)
-    print(f"  ✓ Installed: {quick_name}.timer + .service")
-
+    full_name = None
     if full_cmd and full_at:
         full_name = f"rotbyte-full-{dhash}"
 
@@ -127,6 +164,15 @@ def _install_systemd(target_dir: str, dhash: str, quick_cmd: List[str],
         with open(os.path.join(unit_dir, f"{full_name}.timer"), "w") as f:
             f.write(timer_content)
 
+    # Reload once, after every unit file is on disk, so systemd sees the
+    # full unit before its enable runs (previously the reload happened
+    # between the quick and full writes, leaving the full timer to be
+    # enabled against a stale unit cache).
+    _subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    _subprocess.run(["systemctl", "--user", "enable", "--now", f"{quick_name}.timer"],
+                    check=True)
+    print(f"  ✓ Installed: {quick_name}.timer + .service")
+    if full_name:
         _subprocess.run(["systemctl", "--user", "enable", "--now", f"{full_name}.timer"],
                         check=True)
         print(f"  ✓ Installed: {full_name}.timer + .service")
@@ -220,7 +266,7 @@ def _discover_systemd() -> Dict[str, Dict]:
         if not exec_line:
             continue
 
-        args = exec_line.split()
+        args = _split_exec_start(exec_line)
         target_dir = args[-1] if args else None
         if not target_dir or not os.path.isabs(target_dir):
             continue
@@ -235,6 +281,7 @@ def _discover_systemd() -> Dict[str, Dict]:
             capture_output=True, text=True,
         )
         active = result.stdout.strip() == "active"
+        missing_exe = _missing_command_path(args)
 
         is_quick = "-quick-" in name
 
@@ -257,6 +304,8 @@ def _discover_systemd() -> Dict[str, Dict]:
             tracked[target_dir]["quick"] = {
                 "interval": interval,
                 "active": active,
+                "missing_exe": missing_exe,
+                **_parse_cmd_flags(args),
             }
         else:
             # Parse calendar times from timer file
@@ -276,6 +325,7 @@ def _discover_systemd() -> Dict[str, Dict]:
             tracked[target_dir]["full"] = {
                 "times": times,
                 "active": active,
+                "missing_exe": missing_exe,
                 **_parse_cmd_flags(args),
             }
 

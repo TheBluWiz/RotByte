@@ -2686,7 +2686,7 @@ class TestNotifyFreshness:
             def sendmail(self, frm, to, msg):
                 sent_messages.append(msg)
 
-        with unittest.mock.patch("rotbyte._load_notify_config", return_value=cfg), \
+        with unittest.mock.patch("_rotbyte.notify._load_notify_config", return_value=cfg), \
              unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
             rotbyte._send_email_notification(
                 "/data/photos", failed=1, count_missing=0,
@@ -2766,7 +2766,7 @@ class TestNotifyOutcome:
         )
         defaults.update(kwargs)
 
-        with unittest.mock.patch("rotbyte._load_notify_config", return_value=cfg), \
+        with unittest.mock.patch("_rotbyte.notify._load_notify_config", return_value=cfg), \
              unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
             rotbyte._send_email_notification(**defaults)
 
@@ -3192,8 +3192,23 @@ class TestQuoteWindowsArgs:
         assert rotbyte._quote_windows_args(["--check", "--quiet"]) == "--check --quiet"
 
     def test_arg_with_space_is_quoted(self):
+        # Per CommandLineToArgvW, backslashes are literal unless they
+        # precede a quote — mid-path separators must NOT be doubled.
+        # (The old blanket-doubling produced "C:\\Program Files\\Media",
+        # which parses back with doubled separators.)
         out = rotbyte._quote_windows_args(["--path", "C:\\Program Files\\Media"])
-        assert out == '--path "C:\\\\Program Files\\\\Media"'
+        assert out == '--path "C:\\Program Files\\Media"'
+
+    def test_trailing_backslash_in_quoted_arg_is_doubled(self):
+        # A trailing backslash would otherwise escape the closing quote.
+        out = rotbyte._quote_windows_args(["C:\\My Files\\"])
+        assert out == '"C:\\My Files\\\\"'
+
+    def test_split_round_trip(self):
+        args = ["--path", "C:\\Program Files\\Media", 'say "hi"',
+                "--quiet", "", "C:\\My Files\\"]
+        joined = rotbyte._quote_windows_args(args)
+        assert rotbyte._split_windows_args(joined) == args
 
     def test_empty_string_becomes_empty_quotes(self):
         # Preserves argv position for deliberately empty arguments.
@@ -3332,8 +3347,10 @@ class TestGenerateTaskXML:
             ["python.exe", "rotbyte.py", "D:\\My Media"],
             self._triggers(), run_on_battery=False,
         )
-        # The path with a space is wrapped in XML-escaped quotes.
-        assert "&quot;D:\\\\My Media&quot;" in xml
+        # The path with a space is wrapped in XML-escaped quotes. Per
+        # CommandLineToArgvW, mid-path backslashes stay single — only
+        # backslashes preceding a quote need doubling.
+        assert "&quot;D:\\My Media&quot;" in xml
 
     def test_description_is_xml_escaped(self):
         # Path containing an ampersand must not break XML parsing.
@@ -3881,6 +3898,385 @@ class TestPreventSleep:
             pass
 
         assert popen_called == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Scheduler robustness — Homebrew path stability, discovery parsing, health
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStableHomebrewPath:
+    """Version-pinned Cellar paths must be rewritten to the opt symlink so
+    scheduled commands survive `brew upgrade` + `brew cleanup`."""
+
+    def _make_cellar(self, tmp_path, with_opt=True):
+        cellar = tmp_path / "Cellar" / "rotbyte" / "1.1.0" / "libexec" / "rotbyte.py"
+        cellar.parent.mkdir(parents=True)
+        cellar.write_text("# script")
+        if with_opt:
+            opt = tmp_path / "opt" / "rotbyte" / "libexec" / "rotbyte.py"
+            opt.parent.mkdir(parents=True)
+            opt.write_text("# script")
+        return str(cellar)
+
+    def test_cellar_path_rewritten_to_opt(self, tmp_path):
+        cellar = self._make_cellar(tmp_path)
+        expected = str(tmp_path / "opt" / "rotbyte" / "libexec" / "rotbyte.py")
+        assert rotbyte._stable_homebrew_path(cellar) == expected
+
+    def test_missing_opt_leaves_path_alone(self, tmp_path):
+        # Better a Cellar path that works today than an opt path that doesn't.
+        cellar = self._make_cellar(tmp_path, with_opt=False)
+        assert rotbyte._stable_homebrew_path(cellar) == cellar
+
+    def test_non_cellar_path_unchanged(self):
+        assert (rotbyte._stable_homebrew_path("/usr/local/bin/rotbyte")
+                == "/usr/local/bin/rotbyte")
+
+    def test_find_rotbyte_executable_returns_arg_list(self):
+        exe = rotbyte._find_rotbyte_executable()
+        assert isinstance(exe, list) and exe
+        assert all(isinstance(part, str) for part in exe)
+
+
+class TestMissingCommandPath:
+    """--status uses this to flag schedules whose command no longer exists."""
+
+    def test_missing_interpreter_flagged(self, tmp_path):
+        gone = str(tmp_path / "nope" / "python3")
+        assert rotbyte._missing_command_path([gone, "x.py"]) == gone
+
+    def test_missing_script_flagged(self, tmp_path):
+        gone = str(tmp_path / "gone" / "rotbyte.py")
+        assert rotbyte._missing_command_path([sys.executable, gone]) == gone
+
+    def test_intact_command_passes(self):
+        assert rotbyte._missing_command_path([sys.executable]) is None
+
+    def test_non_absolute_ignored(self):
+        assert rotbyte._missing_command_path(["rotbyte", "--check"]) is None
+
+    def test_empty_args(self):
+        assert rotbyte._missing_command_path([]) is None
+
+
+class TestSystemdExecStartParsing:
+    """Discovery must invert the 1.1.0 ExecStart quoting, not str.split() it."""
+
+    def test_round_trip_with_spaces(self):
+        cmd = ["/usr/bin/python3", "/opt/my tools/rotbyte.py", "--notify", "email",
+               "--scheduled", "--quiet", "/mnt/media drive"]
+        unit = rotbyte._generate_systemd_unit("desc", cmd)
+        exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
+        assert rotbyte._split_exec_start(exec_line[len("ExecStart="):]) == cmd
+
+    def test_escaped_quote_and_backslash_round_trip(self):
+        cmd = ['/usr/bin/rotbyte', '--quiet', '/data/say "hi"/back\\slash']
+        joined = " ".join(rotbyte._systemd_escape_arg(c) for c in cmd)
+        assert rotbyte._split_exec_start(joined) == cmd
+
+    def test_legacy_unquoted_line_still_splits(self):
+        assert rotbyte._split_exec_start("/usr/bin/rotbyte --quiet /data") == [
+            "/usr/bin/rotbyte", "--quiet", "/data"]
+
+    def test_discovery_recovers_quoted_target_and_flags(self, tmp_path, monkeypatch):
+        """End-to-end: units written by the current generators are read back
+        with target, interval, times, and flags intact."""
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        target = "/mnt/media"
+        script = tmp_path / "rotbyte.py"
+        script.write_text("# script")
+        dhash = rotbyte._dir_hash(target)
+
+        quick_cmd = [sys.executable, str(script), "--notify", "email",
+                     "--scheduled", "--quiet", target]
+        (unit_dir / f"rotbyte-quick-{dhash}.service").write_text(
+            rotbyte._generate_systemd_unit(f"rotbyte quick scan ({target})", quick_cmd))
+        (unit_dir / f"rotbyte-quick-{dhash}.timer").write_text(
+            rotbyte._generate_systemd_timer("t", interval_seconds=1800))
+
+        full_cmd = [sys.executable, str(script), "--check", "--quiet", "--notify",
+                    "email", "--scheduled", "--due", "30d", "--budget", "2h", target]
+        (unit_dir / f"rotbyte-full-{dhash}.service").write_text(
+            rotbyte._generate_systemd_unit(f"rotbyte full scan ({target})", full_cmd))
+        (unit_dir / f"rotbyte-full-{dhash}.timer").write_text(
+            rotbyte._generate_systemd_timer("t", calendar_times=[(2, 0)]))
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        monkeypatch.setattr(
+            _rotbyte_pkg.scheduler.systemd._subprocess, "run",
+            lambda *a, **k: unittest.mock.MagicMock(
+                returncode=0, stdout="active\n", stderr=""))
+
+        tracked = rotbyte._discover_systemd()
+        assert target in tracked
+        q = tracked[target]["quick"]
+        assert q["interval"] == 1800
+        assert q["notify"] == "email"
+        assert q["active"] is True
+        assert q["missing_exe"] is None
+        f = tracked[target]["full"]
+        assert f["times"] == [(2, 0)]
+        assert f["due"] == "30d"
+        assert f["budget"] == "2h"
+        assert f["notify"] == "email"
+
+
+class TestParseSchtasksXml:
+    """Windows discovery must produce the same shape launchd/systemd do,
+    so --status renders it instead of showing '(not configured)'."""
+
+    def _build_xml(self, target):
+        script = os.path.abspath(__file__)  # any existing file
+        quick_cmd = [sys.executable, script, "--notify", "email",
+                     "--scheduled", "--quiet", target]
+        quick_triggers = (
+            '<Triggers>\n'
+            '    <TimeTrigger>\n'
+            '      <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n'
+            '      <Enabled>true</Enabled>\n'
+            '      <Repetition>\n'
+            '        <Interval>PT30M</Interval>\n'
+            '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
+            '      </Repetition>\n'
+            '    </TimeTrigger>\n'
+            '  </Triggers>'
+        )
+        quick_xml = rotbyte._generate_task_xml(
+            f"rotbyte quick scan ({target})", quick_cmd, quick_triggers,
+            run_on_battery=False, task_name="rotbyte-quick-t")
+
+        full_cmd = [sys.executable, script, "--check", "--quiet", "--notify",
+                    "email", "--scheduled", "--due", "30d", "--budget", "2h", target]
+        full_triggers = (
+            '<Triggers>\n'
+            '    <CalendarTrigger>\n'
+            '      <StartBoundary>2026-01-01T02:30:00</StartBoundary>\n'
+            '      <Enabled>true</Enabled>\n'
+            '      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n'
+            '    </CalendarTrigger>\n'
+            '  </Triggers>'
+        )
+        full_xml = rotbyte._generate_task_xml(
+            f"rotbyte full scan ({target})", full_cmd, full_triggers,
+            run_on_battery=False, execution_time_limit="PT2H",
+            task_name="rotbyte-full-t")
+        return quick_xml + full_xml
+
+    def test_parses_common_shape(self):
+        target = "/data/media"
+        found = rotbyte._parse_schtasks_xml(self._build_xml(target))
+        assert target in found
+        q = found[target]["quick"]
+        assert q["interval"] == 1800
+        assert q["notify"] == "email"
+        assert q["active"] is True
+        f = found[target]["full"]
+        assert f["times"] == [(2, 30)]
+        assert f["due"] == "30d"
+        assert f["budget"] == "2h"
+
+    def test_malformed_doc_skipped(self):
+        target = "/data/media"
+        xml = "<?xml version=\"1.0\"?><broken" + self._build_xml(target)
+        found = rotbyte._parse_schtasks_xml(xml)
+        assert target in found
+
+
+class TestScheduleHealthLabel:
+    """--status must distinguish 'loaded' from 'actually working'."""
+
+    def test_broken_wins_over_active(self):
+        label = rotbyte._schedule_health_label(
+            {"missing_exe": "/gone/python", "active": True})
+        assert label == "BROKEN ✗"
+
+    def test_inactive(self):
+        assert rotbyte._schedule_health_label({"active": False}) == "inactive ✗"
+
+    def test_active_with_failing_runs(self):
+        label = rotbyte._schedule_health_label({"active": True, "last_exit": 2})
+        assert "⚠" in label and "2" in label
+
+    def test_active_healthy(self):
+        assert rotbyte._schedule_health_label(
+            {"active": True, "last_exit": 0}) == "active ✓"
+        assert rotbyte._schedule_health_label({"active": True}) == "active ✓"
+
+
+class TestLaunchdAgentState:
+    """launchctl-list parsing: wait(2) status decodes to the real exit code."""
+
+    def _state(self, monkeypatch, returncode, stdout):
+        monkeypatch.setattr(
+            _rotbyte_pkg.scheduler.launchd._subprocess, "run",
+            lambda *a, **k: unittest.mock.MagicMock(
+                returncode=returncode, stdout=stdout, stderr=""))
+        return _rotbyte_pkg.scheduler.launchd._agent_state("com.rotbyte.quick.x")
+
+    def test_wait_status_high_byte_decoded(self, monkeypatch):
+        out = '{\n\t"LastExitStatus" = 512;\n\t"Label" = "com.rotbyte.quick.x";\n};\n'
+        assert self._state(monkeypatch, 0, out) == {"active": True, "last_exit": 2}
+
+    def test_clean_exit(self, monkeypatch):
+        out = '{\n\t"LastExitStatus" = 0;\n};\n'
+        assert self._state(monkeypatch, 0, out) == {"active": True, "last_exit": 0}
+
+    def test_never_ran_has_no_exit(self, monkeypatch):
+        assert self._state(monkeypatch, 0, "{\n};\n") == {
+            "active": True, "last_exit": None}
+
+    def test_not_loaded(self, monkeypatch):
+        assert self._state(monkeypatch, 113, "") == {
+            "active": False, "last_exit": None}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Notification config — from-address support and interpolation safety
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNotifyFromAddress:
+    """The 'from' key (alias support, per docs and --notify-setup) must be
+    used as the header From and the envelope sender when present."""
+
+    def _send_and_capture(self, extra_cfg=None):
+        import configparser
+        cfg = configparser.ConfigParser(interpolation=None)
+        section = {
+            "smtp_host": "smtp.example.com",
+            "smtp_port": "587",
+            "username": "login@example.com",
+            "password": "secret",
+            "to": "dest@example.com",
+        }
+        if extra_cfg:
+            section.update(extra_cfg)
+        cfg["email"] = section
+
+        captured = {}
+
+        class FakeSMTP:
+            def __init__(self, *a, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def starttls(self): pass
+            def login(self, *a): pass
+            def sendmail(self, frm, to, msg):
+                captured["envelope_from"] = frm
+                captured["msg"] = msg
+
+        with unittest.mock.patch("_rotbyte.notify._load_notify_config", return_value=cfg), \
+             unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
+            rotbyte._send_email_notification(
+                "/data", failed=0, count_missing=0, failed_files=[])
+        assert captured, "No email was sent"
+        return captured
+
+    def test_from_key_used_when_present(self):
+        captured = self._send_and_capture({"from": "alias@example.com"})
+        assert captured["envelope_from"] == "alias@example.com"
+        assert "From: alias@example.com" in captured["msg"]
+
+    def test_defaults_to_username_when_absent(self):
+        captured = self._send_and_capture()
+        assert captured["envelope_from"] == "login@example.com"
+        assert "From: login@example.com" in captured["msg"]
+
+    def test_blank_from_falls_back_to_username(self):
+        captured = self._send_and_capture({"from": "   "})
+        assert captured["envelope_from"] == "login@example.com"
+
+
+class TestNotifyConfigInterpolationSafety:
+    """A '%' in an SMTP password must not blow up configparser at read time."""
+
+    def test_percent_in_password_survives(self, tmp_path, monkeypatch):
+        conf = tmp_path / "notify.conf"
+        conf.write_text(
+            "[email]\n"
+            "smtp_host = smtp.example.com\n"
+            "smtp_port = 587\n"
+            "username = u@example.com\n"
+            "to = u@example.com\n"
+            "password = 100%secret\n"
+        )
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path",
+                            lambda: str(conf))
+        cfg = rotbyte._load_notify_config()
+        assert cfg["email"]["password"] == "100%secret"
+
+
+class TestScheduledNotifyMissingConfig:
+    """A broken/missing email config must never disable scheduled scanning —
+    but manual runs should still fail fast so misconfiguration is noticed."""
+
+    def _isolated_env(self, tmp_path):
+        env = os.environ.copy()
+        home = tmp_path / "isolated_home"
+        home.mkdir()
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        return env
+
+    def _run(self, args, env):
+        cmd = [sys.executable,
+               os.path.join(os.path.dirname(__file__), "rotbyte.py")] + args
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              env=env, timeout=60)
+
+    def test_scheduled_scan_proceeds_without_config(self, tmp, tmp_path):
+        env = self._isolated_env(tmp_path)
+        r = self._run(["--scheduled", "--notify", "email", "--quiet",
+                       "--workers", "1", str(tmp)], env)
+        assert r.returncode == 0, r.stderr
+        assert "Warning" in r.stderr and "no email will be sent" in r.stderr
+
+    def test_manual_scan_still_aborts_without_config(self, tmp, tmp_path):
+        env = self._isolated_env(tmp_path)
+        r = self._run(["--notify", "email", "--quiet",
+                       "--workers", "1", str(tmp)], env)
+        assert r.returncode == 1
+        assert "No notification config found" in r.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# --track install-time guardrails
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrackBudgetOverlapWarning:
+    """--budget >= --every guarantees quick scans collide with the full
+    scan's database lock; --track should say so at install time."""
+
+    def _mock_installers(self, monkeypatch):
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd, "_install_launchd",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd, "_install_systemd",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.schtasks, "_install_schtasks",
+                            lambda *a, **k: None)
+
+    def test_budget_ge_every_warns(self, tmp_path, capsys, monkeypatch):
+        self._mock_installers(monkeypatch)
+        rotbyte._run_track(str(tmp_path), 3600, [(2, 0)], 3600,
+                           [sys.executable, "rotbyte.py"])
+        err = capsys.readouterr().err
+        assert "not shorter than" in err
+
+    def test_budget_below_every_is_silent(self, tmp_path, capsys, monkeypatch):
+        self._mock_installers(monkeypatch)
+        rotbyte._run_track(str(tmp_path), 3600, [(2, 0)], 1800,
+                           [sys.executable, "rotbyte.py"])
+        err = capsys.readouterr().err
+        assert "not shorter than" not in err
+
+    def test_string_exe_still_accepted(self, tmp_path, capsys, monkeypatch):
+        """Back-compat: a plain 'python script.py' string is split as before."""
+        self._mock_installers(monkeypatch)
+        rotbyte._run_track(str(tmp_path), 3600, None, None,
+                           f"{sys.executable} rotbyte.py")
+        out = capsys.readouterr().out
+        assert "Installing scheduled scans" in out
 
 
 if __name__ == "__main__":

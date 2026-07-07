@@ -206,7 +206,11 @@ def _load_notify_config() -> configparser.ConfigParser:
         print(f"Error: No notification config found at {path}", file=sys.stderr)
         print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
         sys.exit(1)
-    config = configparser.ConfigParser()
+    # interpolation=None: values are opaque strings, and SMTP passwords may
+    # legitimately contain '%' — with the default BasicInterpolation a lone
+    # '%' raises InterpolationSyntaxError at *read* time, long after setup
+    # appeared to succeed.
+    config = configparser.ConfigParser(interpolation=None)
     config.read(path)
     if "email" not in config:
         print(f"Error: No [email] section in {path}", file=sys.stderr)
@@ -273,6 +277,13 @@ def _run_notify_setup():
     if not to_addr:
         to_addr = username
 
+    # Sender address may differ from the login username — e.g. iCloud
+    # aliases, where mail must appear to come from the alias rather than
+    # the primary login address. Defaults to the username.
+    from_addr = input(f"  Send alerts from [{username}]: ").strip()
+    if not from_addr:
+        from_addr = username
+
     # Test the connection
     print()
     print("  Testing connection...", end="", flush=True)
@@ -286,9 +297,9 @@ def _run_notify_setup():
                 "If you received this, email notifications are working correctly.\n"
             )
             msg["Subject"] = "rotbyte: test notification"
-            msg["From"] = username
+            msg["From"] = from_addr
             msg["To"] = to_addr
-            server.sendmail(username, [to_addr], msg.as_string())
+            server.sendmail(from_addr, [to_addr], msg.as_string())
     except Exception as e:  # noqa: BLE001 — SMTP raises a zoo of types
         # smtplib can raise SMTPException, TimeoutError, socket.gaierror,
         # ConnectionRefusedError, ssl.SSLError, and OSError. Catch the
@@ -308,12 +319,13 @@ def _run_notify_setup():
     account = _keychain_account(username, smtp_host)
     stored, backend = _keychain_set(account, password)
 
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
     email_section: Dict[str, str] = {
         "smtp_host": smtp_host,
         "smtp_port": str(smtp_port),
         "username": username,
         "to": to_addr,
+        "from": from_addr,
     }
     if stored:
         email_section["password_backend"] = backend
@@ -466,14 +478,17 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
     try:
         msg = email.mime.text.MIMEText(body)
         msg["Subject"] = subject
-        msg["From"] = section["username"]
+        # 'from' is optional (added by --notify-setup for alias support,
+        # e.g. iCloud aliases); fall back to the login username.
+        from_addr = section.get("from", "").strip() or section["username"]
+        msg["From"] = from_addr
         msg["To"] = section["to"]
 
         with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
                           timeout=30) as server:
             server.starttls()
             server.login(section["username"], section["password"])
-            server.sendmail(section["username"], [section["to"]], msg.as_string())
+            server.sendmail(from_addr, [section["to"]], msg.as_string())
     except Exception as e:  # noqa: BLE001 — best-effort notification
         # smtplib/socket/ssl can raise across an entire type hierarchy.
         # Email delivery is best-effort: log and continue so a transient

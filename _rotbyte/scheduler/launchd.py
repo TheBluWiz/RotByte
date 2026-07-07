@@ -5,10 +5,11 @@ from __future__ import annotations
 import glob as _glob
 import os
 import plistlib as _plistlib
+import re as _re
 import subprocess as _subprocess
 from typing import Dict, List, Optional, Tuple
 
-from . import _parse_cmd_flags
+from . import _missing_command_path, _parse_cmd_flags
 
 
 def _launchd_log_path(label: str) -> str:
@@ -196,6 +197,37 @@ def _bootout_and_unlink(labels: List[str]) -> Tuple[List[str], List[str]]:
     return removed, errors
 
 
+# Matches launchd's `launchctl list <label>` output, e.g.:
+#     "LastExitStatus" = 512;
+# The value is a wait(2) status: exit code in the high byte.
+_LAST_EXIT_STATUS_RE = _re.compile(r'"LastExitStatus"\s*=\s*(\d+)')
+
+
+def _agent_state(label: str) -> Dict[str, object]:
+    """Query launchd for an agent's load state and last exit status.
+
+    Returns ``{"active": bool, "last_exit": Optional[int]}``. ``active``
+    means the plist is loaded; ``last_exit`` is the exit code of the most
+    recent run (None when launchd doesn't report one, e.g. never ran).
+    A loaded agent whose every run fails still counts as "active", which
+    is exactly why callers should surface ``last_exit`` too.
+    """
+    result = _subprocess.run(
+        ["launchctl", "list", label],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return {"active": False, "last_exit": None}
+    last_exit: Optional[int] = None
+    m = _LAST_EXIT_STATUS_RE.search(result.stdout or "")
+    if m:
+        raw = int(m.group(1))
+        # launchctl reports a wait(2) status; a plain exit(N) shows up as
+        # N << 8. Values under 256 are signal terminations — report as-is.
+        last_exit = raw >> 8 if raw >= 256 else raw
+    return {"active": True, "last_exit": last_exit}
+
+
 def _discover_launchd() -> Dict[str, Dict]:
     """Parse installed launchd plists to discover tracked directories."""
     agents_dir = os.path.expanduser("~/Library/LaunchAgents")
@@ -225,18 +257,17 @@ def _discover_launchd() -> Dict[str, Dict]:
         if target_dir not in tracked:
             tracked[target_dir] = {}
 
-        # Check if this agent is loaded
-        result = _subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True, text=True,
-        )
-        active = result.returncode == 0
+        state = _agent_state(label)
+        missing_exe = _missing_command_path(args)
 
         if ".quick." in label:
             interval = plist.get("StartInterval", 3600)
             tracked[target_dir]["quick"] = {
                 "interval": interval,
-                "active": active,
+                "active": state["active"],
+                "last_exit": state["last_exit"],
+                "missing_exe": missing_exe,
+                **_parse_cmd_flags(args),
             }
         elif ".full." in label:
             times = []
@@ -248,7 +279,9 @@ def _discover_launchd() -> Dict[str, Dict]:
 
             tracked[target_dir]["full"] = {
                 "times": times,
-                "active": active,
+                "active": state["active"],
+                "last_exit": state["last_exit"],
+                "missing_exe": missing_exe,
                 **_parse_cmd_flags(args),
             }
 

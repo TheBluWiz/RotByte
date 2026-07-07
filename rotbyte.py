@@ -111,10 +111,12 @@ from _rotbyte.scheduler import (
     _dir_hash,
     _discover_tracked,
     _find_rotbyte_executable,
+    _missing_command_path,
     _parse_cmd_flags,
     _run_track,
     _run_untrack,
     _run_untrack_all,
+    _stable_homebrew_path,
 )
 from _rotbyte.scheduler.launchd import (
     _discover_launchd,
@@ -131,7 +133,9 @@ from _rotbyte.scheduler.schtasks import (
     _install_schtasks,
     _iso_duration,
     _parse_iso_duration,
+    _parse_schtasks_xml,
     _quote_windows_args,
+    _split_windows_args,
     _uninstall_all_schtasks,
     _uninstall_schtasks,
     _xml_escape,
@@ -141,6 +145,7 @@ from _rotbyte.scheduler.systemd import (
     _generate_systemd_timer,
     _generate_systemd_unit,
     _install_systemd,
+    _split_exec_start,
     _systemd_escape_arg,
     _systemd_escape_description,
     _uninstall_all_systemd,
@@ -152,7 +157,7 @@ import smtplib  # noqa: F401
 
 # ── Version and process exit codes ────────────────────────────────────────────
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 # Documented process exit codes. Callers (cron, monitoring, CI) rely on
 # these — keep them stable and add new codes rather than reusing existing
@@ -398,8 +403,22 @@ Exit codes:
                   "Supported: email", file=sys.stderr)
             sys.exit(1)
         # Verify config exists early so the user doesn't wait through a full
-        # scan only to discover notifications aren't configured.
-        _load_notify_config()
+        # scan only to discover notifications aren't configured. On scheduled
+        # runs, degrade to a warning: a broken email config must never
+        # disable the integrity scanning itself (the send path already
+        # warns-and-continues on failure, this check would otherwise abort
+        # the whole run before a single file is hashed).
+        if getattr(args, "scheduled", False):
+            try:
+                _load_notify_config()
+            except SystemExit:
+                print("Warning: email notification config is unavailable — "
+                      "the scheduled scan will run, but no email will be sent.",
+                      file=sys.stderr)
+                print("  Run `rotbyte --notify-setup email` to fix notifications.",
+                      file=sys.stderr)
+        else:
+            _load_notify_config()
 
     # --status doesn't need a target directory or any other validation
     if args.status:
@@ -1104,7 +1123,11 @@ def _run_track_setup(path_arg: str):
 
     # 7. Confirmation summary
     rotbyte_exe = _find_rotbyte_executable()
-    cli_parts = [rotbyte_exe, "--track", "--every", every_display]
+    # _find_rotbyte_executable returns an argument list; a plain string is
+    # tolerated (tests stub it that way) for the echoed command below.
+    exe_display = (rotbyte_exe if isinstance(rotbyte_exe, str)
+                   else " ".join(rotbyte_exe))
+    cli_parts = [exe_display, "--track", "--every", every_display]
     if full_at_display:
         cli_parts.extend(["--full-at", *full_at_display])
     if budget_display:
@@ -1130,6 +1153,28 @@ def _run_track_setup(path_arg: str):
 
 
 # ── --status dispatch ──────────────────────────────────────────────────────────
+
+def _schedule_health_label(entry: dict) -> str:
+    """One-word-ish health label for a discovered schedule entry.
+
+    "active ✓" previously meant only "the unit is loaded" — a job whose
+    every run dies at exec (e.g. a Homebrew upgrade deleted the pinned
+    Cellar path) still read as healthy. Distinguish:
+
+      - BROKEN ✗   — the scheduled command's executable no longer exists
+      - active ⚠   — loaded, but the last run exited non-zero
+      - active ✓   — loaded and last run (if any) succeeded
+      - inactive ✗ — not loaded
+    """
+    if entry.get("missing_exe"):
+        return "BROKEN ✗"
+    if not entry.get("active"):
+        return "inactive ✗"
+    last_exit = entry.get("last_exit")
+    if last_exit not in (None, 0):
+        return f"active ⚠ (last run exited {last_exit})"
+    return "active ✓"
+
 
 def _run_status():
     """Display status of all tracked directories with schedule and health info.
@@ -1166,19 +1211,19 @@ def _run_status():
         # Quick scan info
         if info.get("quick"):
             q = info["quick"]
-            active = "active ✓" if q["active"] else "inactive ✗"
-            print(f"    Quick : every {_format_duration(q['interval'])}".ljust(40) + active)
+            print(f"    Quick : every {_format_duration(q['interval'])}".ljust(40)
+                  + _schedule_health_label(q))
         else:
             print(f"    Quick : (not configured)")
 
         # Full scan info
         if info.get("full"):
             f = info["full"]
-            active = "active ✓" if f["active"] else "inactive ✗"
             times_str = ", ".join(
                 _format_clock_time(h, m) for h, m in f["times"]
             ) if f.get("times") else "scheduled"
-            print(f"    Full  : daily at {times_str}".ljust(40) + active)
+            print(f"    Full  : daily at {times_str}".ljust(40)
+                  + _schedule_health_label(f))
             # Show extra flags
             extras = []
             if f.get("due"):
@@ -1189,10 +1234,26 @@ def _run_status():
                 extras.append(f"--workers {f['workers']}")
             if extras:
                 print(f"            {' '.join(extras)}")
-            if f.get("notify"):
-                print(f"    Notify: {f['notify']}")
         else:
             print(f"    Full  : (not configured)")
+
+        # Notification state — shown for every tracked dir so a schedule
+        # installed without --notify is visible rather than silently mute.
+        notify_val = ((info.get("full") or {}).get("notify")
+                      or (info.get("quick") or {}).get("notify"))
+        if notify_val:
+            print(f"    Notify: {notify_val}")
+        else:
+            print("    Notify: (off — re-run --track with --notify email to enable)")
+
+        # A schedule whose command no longer exists fails at exec on every
+        # run — say so loudly, with the remedy.
+        missing = ((info.get("quick") or {}).get("missing_exe")
+                   or (info.get("full") or {}).get("missing_exe"))
+        if missing:
+            print(f"    ⚠ Scheduled command is broken: {missing} no longer exists.")
+            print(f"      Every scheduled run is failing. Re-run --track for this")
+            print(f"      directory to regenerate the schedule.")
 
         # Database health
         db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
