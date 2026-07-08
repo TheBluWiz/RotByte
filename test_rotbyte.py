@@ -1123,6 +1123,48 @@ class TestCLIReport:
         rc, out, err = _run_cli("--report", str(tmp))
         assert "Failed files" in out
 
+    def test_report_failed_shows_tracked_since_and_localized_time(self, tmp):
+        _run_cli_ok(str(tmp))
+        _corrupt_file(tmp / "a.txt")
+        _run_cli("--check", str(tmp))
+        rc, out, err = _run_cli("--report", str(tmp))
+        assert "Tracked since" in out
+        # Localized timestamps render AM/PM (raw UTC would not).
+        assert "AM" in out or "PM" in out
+
+    def test_report_stale_window_follows_due(self, tmp):
+        _run_cli_ok(str(tmp))
+        # Backdate everything so it's stale under any reasonable window.
+        db_path = next(Path(str(tmp)).glob(".*_rotbyte.db"))
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE checksums SET last_verified = datetime('now', '-100 days')")
+        conn.commit()
+        conn.close()
+        # Default window is 90 days.
+        rc, out, err = _run_cli("--report", str(tmp))
+        assert "not verified in 90+ days" in out
+        # --due narrows the window the report uses.
+        rc, out, err = _run_cli("--report", "--due", "30d", str(tmp))
+        assert "not verified in 30+ days" in out
+
+    def test_report_stale_listing_caps_at_20(self, tmp):
+        _run_cli_ok(str(tmp))
+        db_path = next(Path(str(tmp)).glob(".*_rotbyte.db"))
+        conn = sqlite3.connect(str(db_path))
+        for i in range(25):
+            conn.execute(
+                "INSERT INTO checksums (file_path, file_name, file_size, "
+                "file_mtime, checksum, baseline_checksum, algorithm, status, "
+                "first_seen, last_verified) VALUES "
+                "(?, ?, 1, '2020-01-01T00:00:00Z', 'h', 'h', 'BLAKE2b', 'OK', "
+                "'2020-01-01T00:00:00Z', datetime('now', '-100 days'))",
+                (f"/fake/stale{i}.txt", f"stale{i}.txt"),
+            )
+        conn.commit()
+        conn.close()
+        rc, out, err = _run_cli("--report", str(tmp))
+        assert "showing first 20 of 25" in out
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 18. CLI — --json
@@ -1995,6 +2037,30 @@ class TestRepair:
         assert rc == 0
         assert "No scheduled scans found" in out
 
+    def test_cli_repair_dispatches_to_run_repair(self, monkeypatch):
+        """`rotbyte --repair` routes to _run_repair and exits with its code.
+
+        _run_repair is mocked so the real ~/Library/LaunchAgents is never
+        touched — this only exercises the argparse flag + dispatch wiring.
+        """
+        called = {}
+
+        def fake_repair():
+            called["ran"] = True
+            return 0
+
+        monkeypatch.setattr(rotbyte, "_run_repair", fake_repair)
+        monkeypatch.setattr(sys, "argv", ["rotbyte", "--repair"])
+        with pytest.raises(SystemExit) as ei:
+            rotbyte.main()
+        assert called.get("ran") is True
+        assert ei.value.code == 0
+
+    def test_budget_cutoff_note(self):
+        assert rotbyte._budget_cutoff_note(False) == []
+        lines = rotbyte._budget_cutoff_note(True)
+        assert any("not every file was verified this run" in ln for ln in lines)
+
 
 class TestRunUntrackDispatch:
     """Tests for the platform-dispatch wrappers _run_untrack[_all] and
@@ -2729,6 +2795,13 @@ class TestStatusFreshness:
             rotbyte._run_status()
         return captured.getvalue()
 
+    def test_status_shows_new_distinct_from_ok(self, tmp, db_path):
+        # A single index leaves files as NEW (never re-verified). --status
+        # must show them as NEW, not fold them into OK.
+        _run_cli(str(tmp))
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
+        assert "NEW" in out
+
     def test_status_shows_next_full_run(self, tmp, db_path):
         _run_cli_ok(str(tmp))
         out = self._capture_status(self._make_tracked(str(tmp), "30d"))
@@ -3162,6 +3235,43 @@ class TestNotifyOutcome:
         _, body = self._send_and_capture(
             failed=1, failed_files=[{"file_path": "/x"}])
         assert "Change since last run" not in body
+
+    def test_scan_time_in_body_when_provided(self):
+        _, body = self._send_and_capture(scan_time="2026-07-08 20:15 PDT")
+        assert "2026-07-08 20:15 PDT" in body
+
+    def test_change_line_also_rendered_in_html_part(self):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg["email"] = {
+            "smtp_host": "h", "smtp_port": "587",
+            "username": "u@x.com", "password": "p", "to": "u@x.com",
+        }
+        sent = []
+
+        class F:
+            def __init__(s, *a, **k): pass
+            def __enter__(s): return s
+            def __exit__(s, *a): pass
+            def starttls(s): pass
+            def login(s, *a): pass
+            def sendmail(s, fr, to, m): sent.append(m)
+
+        with unittest.mock.patch("_rotbyte.notify._load_notify_config", return_value=cfg), \
+             unittest.mock.patch("rotbyte.smtplib.SMTP", F):
+            rotbyte._send_email_notification(
+                "/data", failed=3, count_missing=0,
+                failed_files=[{"file_path": "/x"}], previous_counts=(1, 0))
+        import email as _email_mod
+        msg = _email_mod.message_from_string(sent[0])
+        html = [p for p in msg.walk() if p.get_content_type() == "text/html"][0]
+        htmlbody = html.get_payload(decode=True).decode(
+            html.get_content_charset() or "utf-8")
+        assert "1 → 3" in htmlbody
+
+    def test_scan_time_absent_when_not_provided(self):
+        _, body = self._send_and_capture()
+        assert "Scan time" not in body
 
 
 # ══════════════════════════════════════════════════════════════════════════════

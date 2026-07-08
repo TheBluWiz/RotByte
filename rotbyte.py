@@ -202,6 +202,23 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 
+def _budget_cutoff_note(budget_exceeded: bool) -> List[str]:
+    """Terminal lines warning that a --budget scan didn't verify everything.
+
+    Returns an empty list when the budget wasn't hit, so the caller can
+    splice it into the summary unconditionally. Extracted from _run_phases
+    so the message is unit-testable without a real timed-out scan.
+    """
+    if not budget_exceeded:
+        return []
+    return [
+        "",
+        "  Note: time budget reached — not every file was verified this run.",
+        "        Stalest files were checked first; re-run to continue,",
+        "        or raise --budget to cover more per run.",
+    ]
+
+
 def print_report(db: ChecksumDB, stale_days: int = 90):
     """Print a human-readable status report from the database.
 
@@ -1574,11 +1591,9 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         # A --budget scan that ran out of time verified only the stalest
         # files. That was previously visible only in the email; say so at
         # the terminal too so a truncated run isn't mistaken for a full one.
-        if not quiet and getattr(result, "budget_exceeded", False):
-            print()
-            print("  Note: time budget reached — not every file was verified this run.")
-            print("        Stalest files were checked first; re-run to continue,")
-            print("        or raise --budget to cover more per run.")
+        if not quiet:
+            for line in _budget_cutoff_note(getattr(result, "budget_exceeded", False)):
+                print(line)
 
         # Hint about likely renames when new files match missing checksums
         if result.new > 0 and count_missing > 0:
