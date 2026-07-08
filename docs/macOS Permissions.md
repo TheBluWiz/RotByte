@@ -102,6 +102,22 @@ A blank log means success — `--quiet` suppresses normal output. If you see
 > **Note:** When Homebrew upgrades Python (e.g. 3.14 → 3.15), the binary path
 > changes and you'll need to re-add the new version to Full Disk Access.
 
+### After any `brew upgrade`: run `rotbyte --repair`
+
+Scheduled scans bake the interpreter and script path into their launchd
+plists. A Homebrew upgrade can delete those exact paths, and every scheduled
+run then fails silently at launch (`rotbyte --status` shows `BROKEN ✗`). After
+upgrading, run:
+
+```bash
+rotbyte --repair
+```
+
+This re-points every installed schedule at the current paths in place —
+preserving all flags — and reloads it. It's safe to run anytime; schedules
+already current are left untouched. (Re-granting Full Disk Access, above, is
+still required separately when the *Python* version itself changed.)
+
 ---
 
 ## 2. Allow background items
@@ -206,6 +222,11 @@ Python process does not. Grant FDA to Python directly and restart.
 → Check `which rotbyte`. If it resolves to `~/.bin/rotbyte` or similar instead
 of `/opt/homebrew/bin/rotbyte`, the wrong version is generating the plist.
 Remove the personal copy or use the full Homebrew path with `--track`.
+
+**`--status` shows `BROKEN ✗` for a schedule**
+→ The plist's interpreter/script path no longer exists (usually after a
+Homebrew upgrade). Run `rotbyte --repair` to re-point every schedule at the
+current path and reload it.
 
 **`--status` shows "no scheduled scans found"**
 → The plist may be malformed. Verify with:

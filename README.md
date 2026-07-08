@@ -79,6 +79,8 @@ rotbyte --track /Volumes/Media
 rotbyte --status
 ```
 
+After a package upgrade (`brew upgrade`), run `rotbyte --repair` once. Scheduled scans bake in an absolute interpreter/script path that an upgrade can delete, silently breaking every run (`--status` shows `BROKEN ✗`); `--repair` re-points and reloads each schedule in place, preserving all flags.
+
 ### Scheduling with full re-verifies
 
 Combine `--track` with `--full-at` (daily full re-verify time), `--budget` (cap how long the full re-verify runs), and `--notify email` (email health reports and problem alerts):

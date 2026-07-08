@@ -405,7 +405,8 @@ class ChecksumDB:
     def failed_files(self) -> List[Dict]:
         """Return details for all FAILED files."""
         rows = self.conn.execute(
-            "SELECT file_path, file_size, checksum, baseline_checksum, last_verified "
+            "SELECT file_path, file_size, checksum, baseline_checksum, "
+            "first_seen, last_verified "
             "FROM checksums WHERE status = 'FAILED'"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -413,7 +414,7 @@ class ChecksumDB:
     def stale_files(self, days: int) -> List[Dict]:
         """Return files not verified in the given number of days."""
         rows = self.conn.execute(
-            "SELECT file_path, last_verified FROM checksums "
+            "SELECT file_path, first_seen, last_verified FROM checksums "
             "WHERE last_verified < datetime('now', ?)",
             (f"-{days} days",),
         ).fetchall()

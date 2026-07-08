@@ -1847,6 +1847,154 @@ class TestUntrackBackends:
         assert all("Access is denied" in e for e in errors)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 31c. --repair: re-point stale scheduler exe paths after an upgrade
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRepair:
+    """Pure prefix-swap helpers plus launchd/systemd in-place rewrite."""
+
+    FRESH = ["/opt/homebrew/opt/python@3.14/bin/python3.14",
+             "/opt/homebrew/opt/rotbyte/libexec/rotbyte.py"]
+
+    def _ok_run(self):
+        return unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+
+    def _write_plist(self, path, program_args, calendar=True):
+        import plistlib
+        plist = {
+            "Label": path.stem,
+            "ProgramArguments": program_args,
+            "StandardOutPath": "/tmp/x.log",
+            "StandardErrorPath": "/tmp/x.log",
+            "Nice": 10,
+        }
+        if calendar:
+            plist["StartCalendarInterval"] = [{"Hour": 2, "Minute": 30}]
+        else:
+            plist["StartInterval"] = 3600
+        with open(path, "wb") as f:
+            plistlib.dump(plist, f)
+
+    def test_prefix_helpers_preserve_trailing_args(self):
+        old = ["/old/python", "/old/rotbyte.py", "--check", "--notify", "email",
+               "--auto-export", "--scheduled", "/data/My Photos"]
+        assert rotbyte._parse_cmd_flags(old)  # sanity: recognizable command
+        from _rotbyte.scheduler import _repair_exe_prefix, _exe_prefix_current
+        assert _exe_prefix_current(old, self.FRESH) is False
+        repaired = _repair_exe_prefix(old, self.FRESH)
+        assert repaired == self.FRESH + old[2:]
+        # Idempotent: a command already on the fresh prefix is unchanged.
+        assert _exe_prefix_current(repaired, self.FRESH) is True
+
+    def test_repair_launchd_rewrites_stale_and_preserves_schedule(self, tmp_path, monkeypatch):
+        import plistlib
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        target = "/data/My Photos"
+        dhash = rotbyte._dir_hash(target)
+        # A stale full plist: dead interpreter + dead script, real flags.
+        stale = ["/opt/homebrew/Cellar/python@3.14/3.14.5/bin/python3.14",
+                 "/opt/homebrew/Cellar/rotbyte/1.1.0/libexec/rotbyte.py",
+                 "--check", "--quiet", "--notify", "email", "--auto-export",
+                 "--scheduled", target]
+        plist_path = agents / f"com.rotbyte.full.{dhash}.plist"
+        self._write_plist(plist_path, stale, calendar=True)
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        calls = []
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess, "run",
+                            lambda cmd, **kw: calls.append(cmd) or self._ok_run())
+
+        repaired, already_ok, errors = \
+            _rotbyte_pkg.scheduler.launchd._repair_launchd(self.FRESH)
+
+        assert errors == []
+        assert already_ok == []
+        assert len(repaired) == 1
+        label, tdir, oldp, newp = repaired[0]
+        assert tdir == target
+        # Plist file now carries the fresh prefix + every original flag.
+        with open(plist_path, "rb") as f:
+            written = plistlib.load(f)
+        assert written["ProgramArguments"] == self.FRESH + stale[2:]
+        # Schedule and Nice survived the rewrite untouched.
+        assert written["StartCalendarInterval"] == [{"Hour": 2, "Minute": 30}]
+        assert written["Nice"] == 10
+        # launchd was reloaded (unload then load).
+        assert ["launchctl", "unload", str(plist_path)] in calls
+        assert ["launchctl", "load", str(plist_path)] in calls
+
+    def test_repair_launchd_skips_already_current(self, tmp_path, monkeypatch):
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        target = "/data/ok"
+        dhash = rotbyte._dir_hash(target)
+        current = list(self.FRESH) + ["--scheduled", "--quiet", target]
+        plist_path = agents / f"com.rotbyte.quick.{dhash}.plist"
+        self._write_plist(plist_path, current, calendar=False)
+
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        calls = []
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd._subprocess, "run",
+                            lambda cmd, **kw: calls.append(cmd) or self._ok_run())
+
+        repaired, already_ok, errors = \
+            _rotbyte_pkg.scheduler.launchd._repair_launchd(self.FRESH)
+
+        assert repaired == []
+        assert len(already_ok) == 1
+        assert errors == []
+        # No reload attempted for an already-current schedule.
+        assert calls == []
+
+    def test_repair_systemd_rewrites_execstart(self, tmp_path, monkeypatch):
+        unit_dir = tmp_path / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        target = "/data/My Photos"
+        dhash = rotbyte._dir_hash(target)
+        service = unit_dir / f"rotbyte-full-{dhash}.service"
+        # ExecStart with a dead Cellar prefix and a space-bearing target.
+        service.write_text(
+            "[Unit]\nDescription=rotbyte full scan\n\n"
+            "[Service]\nType=oneshot\n"
+            'ExecStart="/old/python" "/old/rotbyte.py" "--check" "--scheduled" '
+            '"/data/My Photos"\nNice=10\n\n[Install]\nWantedBy=default.target\n'
+        )
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd._subprocess, "run",
+                            lambda cmd, **kw: self._ok_run())
+
+        repaired, already_ok, errors = \
+            _rotbyte_pkg.scheduler.systemd._repair_systemd(self.FRESH)
+
+        assert errors == []
+        assert len(repaired) == 1
+        content = service.read_text()
+        # New ExecStart carries the fresh prefix and preserves the quoted
+        # space-bearing target directory.
+        assert "/opt/homebrew/opt/rotbyte/libexec/rotbyte.py" in content
+        assert '"/data/My Photos"' in content
+        assert "/old/python" not in content
+        # Other directives untouched.
+        assert "Nice=10" in content
+        assert "Type=oneshot" in content
+
+    def test_run_repair_no_schedules(self, tmp_path, monkeypatch, capsys):
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        with _force_rotbyte_platform("macos"):
+            rc = _rotbyte_pkg.scheduler._run_repair()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "No scheduled scans found" in out
+
+
 class TestRunUntrackDispatch:
     """Tests for the platform-dispatch wrappers _run_untrack[_all] and
     the main() wiring. Patches the platform flags so the test runs the
@@ -2657,6 +2805,24 @@ class TestStatusFreshness:
 # 44. Freshness stats in --notify email body
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _extract_text_part(msg):
+    """Return the decoded text/plain body from a (possibly multipart) message.
+
+    Notification emails are multipart/alternative (plain + HTML); the
+    assertions target the plain-text rendering.
+    """
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                charset = part.get_content_charset() or "utf-8"
+                return payload.decode(charset)
+        raise AssertionError("no text/plain part in multipart message")
+    payload = msg.get_payload(decode=True)
+    charset = msg.get_content_charset() or "utf-8"
+    return payload.decode(charset)
+
+
 class TestNotifyFreshness:
     def _capture_email_body(self, freshness=None):
         """Call _send_email_notification with a mocked SMTP and return the body."""
@@ -2698,9 +2864,7 @@ class TestNotifyFreshness:
         # Parse the raw RFC 2822 message and return the decoded text body
         import email as _email_mod
         msg_obj = _email_mod.message_from_string(sent_messages[0])
-        payload = msg_obj.get_payload(decode=True)
-        charset = msg_obj.get_content_charset() or "utf-8"
-        return payload.decode(charset)
+        return _extract_text_part(msg_obj)
 
     def test_freshness_present_when_provided(self):
         """Email body includes freshness summary when freshness tuple is supplied."""
@@ -2782,16 +2946,16 @@ class TestNotifyOutcome:
             (part.decode(charset or "utf-8") if isinstance(part, bytes) else part)
             for part, charset in decoded
         )
-        payload = msg.get_payload(decode=True)
-        charset = msg.get_content_charset() or "utf-8"
-        return subject, payload.decode(charset)
+        return subject, _extract_text_part(msg)
 
     def test_clean_no_due_subject_is_pass(self):
         subject, _ = self._send_and_capture()
         assert subject.startswith("rotbyte: PASS")
         assert "DETECTED" not in subject
         assert "%" not in subject
-        assert subject.endswith("/data/photos")
+        # Directory is present; the host now trails the subject for
+        # per-machine inbox filtering.
+        assert "/data/photos" in subject
 
     def test_clean_body_mentions_clean_completion(self):
         _, body = self._send_and_capture()
@@ -2889,6 +3053,74 @@ class TestNotifyOutcome:
         # We pass (0,0) but the caller in _run_phases only sets due_progress
         # when start > 0. Still, be defensive: 100% is reasonable.
         assert "0/0 due" in subject or "PASS —" in subject or "PASS " in subject
+
+    def test_host_appears_in_subject_and_body(self):
+        subject, body = self._send_and_capture(host="nas-01")
+        assert "nas-01" in subject
+        assert "nas-01" in body
+
+    def test_host_defaults_to_gethostname(self):
+        with unittest.mock.patch("_rotbyte.notify.socket.gethostname",
+                                 return_value="fallback-host"):
+            subject, body = self._send_and_capture()
+        assert "fallback-host" in subject
+
+    def test_file_paths_never_appear_in_body(self):
+        """Privacy: affected file paths must not travel over SMTP."""
+        _, body = self._send_and_capture(
+            failed=2,
+            failed_files=[{"file_path": "/data/photos/secret-vacation.jpg"},
+                          {"file_path": "/data/photos/private.raw"}],
+        )
+        assert "secret-vacation.jpg" not in body
+        assert "private.raw" not in body
+        # Instead it names the local command that lists them.
+        assert "rotbyte --report /data/photos" in body
+
+    def test_scan_summary_rendered_on_pass(self):
+        _, body = self._send_and_capture(
+            stats={"ok": 1200, "new": 3, "updated": 2, "skipped": 40,
+                   "bytes_hashed": 5 * 1024 * 1024 * 1024},
+        )
+        assert "Scan summary" in body
+        assert "1,200" in body      # verified OK, thousands-separated
+        assert "Data hashed" in body
+
+    def test_html_alternative_part_present(self):
+        """Message carries an HTML alternative alongside the text part."""
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg["email"] = {
+            "smtp_host": "smtp.example.com", "smtp_port": "587",
+            "username": "user@example.com", "password": "secret",
+            "to": "user@example.com",
+        }
+        sent = []
+
+        class FakeSMTP:
+            def __init__(self, *a, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def starttls(self): pass
+            def login(self, *a): pass
+            def sendmail(self, frm, to, msg): sent.append(msg)
+
+        with unittest.mock.patch("_rotbyte.notify._load_notify_config", return_value=cfg), \
+             unittest.mock.patch("rotbyte.smtplib.SMTP", FakeSMTP):
+            rotbyte._send_email_notification(
+                "/data/photos", failed=1, count_missing=0,
+                failed_files=[{"file_path": "/data/photos/x.jpg"}])
+        import email as _email_mod
+        msg = _email_mod.message_from_string(sent[0])
+        types = {p.get_content_type() for p in msg.walk()}
+        assert "text/plain" in types
+        assert "text/html" in types
+        # HTML part must also be path-free.
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                htmlbody = part.get_payload(decode=True).decode(
+                    part.get_content_charset() or "utf-8")
+                assert "x.jpg" not in htmlbody
 
 
 # ══════════════════════════════════════════════════════════════════════════════

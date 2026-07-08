@@ -10,15 +10,18 @@ and a stderr warning when no platform store is usable.
 from __future__ import annotations
 
 import configparser
+import email.mime.multipart
 import email.mime.text
+import html as _html
 import os
 import shutil
 import smtplib
+import socket
 import subprocess as _subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
-from .helpers import _format_duration
+from .helpers import _format_duration, _format_size
 from .platform import _IS_MACOS, _IS_WINDOWS
 
 # Service identifier under which we register SMTP passwords with the OS keychain.
@@ -362,13 +365,18 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
                              due_progress: Optional[Tuple[int, int]] = None,
                              interrupted: bool = False,
                              budget_exceeded: bool = False,
-                             errors: int = 0):
+                             errors: int = 0,
+                             stats: Optional[Dict] = None,
+                             host: Optional[str] = None,
+                             scan_time: Optional[str] = None):
     """Send an email notification summarizing a completed scan.
 
-    Subject distinguishes three outcomes:
+    Subject distinguishes two outcomes:
       - PASS: no bit rot and no missing files
       - DETECTED: failed hashes or missing files
-    Interruption is appended to the subject as ``(interrupted)``.
+    Interruption is appended to the subject as ``(interrupted)``. The
+    sending host is appended so an alert is attributable at a glance on a
+    multi-machine / NAS setup.
 
     ``due_progress`` is ``(done, start)`` — files verified this run out of
     those that were overdue at scan start. When present, the subject
@@ -378,6 +386,19 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
     progress is < 100%, the body explains whether the gap was the
     ``--budget`` cap or per-file read errors (distinct causes, same
     observable outcome of "files still due").
+
+    ``stats`` is an optional per-outcome counts dict (``ok``, ``new``,
+    ``updated``, ``skipped``, ``bytes_hashed``); when present it is
+    rendered on every email — including clean PASS ones — so a healthy
+    report carries the numbers that prove it, not just "completed cleanly".
+
+    File paths are deliberately never included: an integrity alert routed
+    through SMTP is not a private channel, and the affected paths would sit
+    in the mailbox unencrypted. The body instead names the exact terminal
+    command that lists them locally.
+
+    A message is always sent as ``multipart/alternative`` (plain text +
+    HTML) so terminal and rich mail clients each get an appropriate view.
 
     Best-effort: prints a warning on failure but never prevents the scan
     from completing with its normal exit code.
@@ -392,6 +413,14 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         return
 
     section = config["email"]
+
+    if host is None:
+        # Attribute the alert to a machine. gethostname() can raise on a
+        # misconfigured box — never let that sink the notification.
+        try:
+            host = socket.gethostname() or "unknown-host"
+        except OSError:
+            host = "unknown-host"
 
     has_problems = failed > 0 or count_missing > 0
     outcome = "DETECTED" if has_problems else "PASS"
@@ -413,28 +442,36 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
             detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
         subject += f" — {', '.join(detail)}"
     subject += f" — {target_dir}"
+    # Host trails the subject so inbox rules can group by machine without
+    # disturbing the outcome/detail prefix the body mirrors.
+    subject += f"  ·  {host}"
 
-    # Build body
+    # ── Plain-text body ────────────────────────────────────────────────
+    lines: List[str] = [f"Host      : {host}"]
+    if scan_time:
+        lines.append(f"Scan time : {scan_time}")
+    lines.append(f"Directory : {target_dir}")
+    lines.append("")
+
     if has_problems:
-        lines = [f"rotbyte detected problems in {target_dir}:\n"]
+        lines.append(f"rotbyte detected problems in {target_dir}:\n")
         if failed > 0:
             lines.append(f"  Bit rot detected: {failed} file{'s' if failed != 1 else ''}")
         if count_missing > 0:
             lines.append(f"  Missing files:    {count_missing}")
         lines.append("")
     else:
-        lines = [f"rotbyte scan completed cleanly for {target_dir}.\n"]
+        lines.append(f"rotbyte scan completed cleanly for {target_dir}.\n")
 
     if interrupted:
         lines.append("Scan was interrupted before completion (Ctrl-C / SIGTERM).")
         lines.append("")
 
-    if has_problems and failed_files:
-        lines.append("Affected files:")
-        for f in failed_files[:50]:
-            lines.append(f"  ✗ {f['file_path']}")
-        if len(failed_files) > 50:
-            lines.append(f"  ... and {len(failed_files) - 50} more")
+    counts = _stats_rows(stats, failed, count_missing)
+    if counts:
+        lines.append("Scan summary:")
+        for label, value in counts:
+            lines.append(f"  {label:<12}: {value}")
         lines.append("")
 
     if due_progress is not None:
@@ -470,19 +507,33 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         lines.append("")
 
     if has_problems:
-        lines.append("Run `rotbyte --report` for full details.")
+        # Paths stay out of the email (privacy over SMTP); point at the
+        # local command that lists them instead.
+        lines.append(f"To list the affected files, run this on {host}:")
+        lines.append(f"  rotbyte --report {target_dir}")
         lines.append("Run `rotbyte --accept <file>` after restoring a file from backup.")
 
     body = "\n".join(lines)
+    html_body = _build_html_body(
+        target_dir=target_dir, host=host, scan_time=scan_time,
+        has_problems=has_problems, outcome=outcome, failed=failed,
+        count_missing=count_missing, interrupted=interrupted,
+        counts=counts, due_progress=due_progress, freshness=freshness,
+        elapsed_seconds=elapsed_seconds,
+    )
 
     try:
-        msg = email.mime.text.MIMEText(body)
+        msg = email.mime.multipart.MIMEMultipart("alternative")
         msg["Subject"] = subject
         # 'from' is optional (added by --notify-setup for alias support,
         # e.g. iCloud aliases); fall back to the login username.
         from_addr = section.get("from", "").strip() or section["username"]
         msg["From"] = from_addr
         msg["To"] = section["to"]
+        # Order matters: the last part is the client's preferred rendering,
+        # so HTML goes last and plain text is the graceful fallback.
+        msg.attach(email.mime.text.MIMEText(body, "plain", "utf-8"))
+        msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
 
         with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
                           timeout=30) as server:
@@ -494,3 +545,122 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         # Email delivery is best-effort: log and continue so a transient
         # SMTP blip never masks the real scan exit code.
         print(f"\n  Warning: failed to send email notification: {e}", file=sys.stderr)
+
+
+def _stats_rows(stats: Optional[Dict], failed: int,
+                count_missing: int) -> List[Tuple[str, str]]:
+    """Build the (label, value) rows for the scan-summary block.
+
+    Returns an empty list when ``stats`` is absent so callers can decide
+    whether to render the block at all. Failed/missing come from the
+    caller's authoritative counts, not ``stats``, so the summary always
+    agrees with the outcome line above it.
+    """
+    if not stats:
+        return []
+    rows: List[Tuple[str, str]] = [
+        ("Verified OK", f"{stats.get('ok', 0):,}"),
+        ("New", f"{stats.get('new', 0):,}"),
+        ("Updated", f"{stats.get('updated', 0):,}"),
+        ("Failed", f"{failed:,}"),
+        ("Missing", f"{count_missing:,}"),
+        ("Skipped", f"{stats.get('skipped', 0):,}"),
+    ]
+    if stats.get("bytes_hashed"):
+        rows.append(("Data hashed", _format_size(stats["bytes_hashed"])))
+    return rows
+
+
+def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
+                     has_problems: bool, outcome: str, failed: int,
+                     count_missing: int, interrupted: bool,
+                     counts: List[Tuple[str, str]],
+                     due_progress: Optional[Tuple[int, int]],
+                     freshness: Optional[tuple],
+                     elapsed_seconds: Optional[float]) -> str:
+    """Render the HTML alternative part.
+
+    Deliberately path-free, like the plain-text part. Uses only inline
+    styles (many mail clients strip <style> blocks) and a restrained
+    palette so it reads in both light and dark clients.
+    """
+    esc = _html.escape
+    accent = "#c0392b" if has_problems else "#1e8449"
+    banner = ("Problems detected" if has_problems
+              else ("Scan interrupted" if interrupted else "Scan passed"))
+
+    parts: List[str] = []
+    parts.append('<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+                 'max-width:640px;margin:0 auto;color:#222;">')
+    parts.append(f'<div style="background:{accent};color:#fff;padding:14px 18px;'
+                 f'border-radius:6px 6px 0 0;font-size:16px;font-weight:600;">'
+                 f'rotbyte — {esc(banner)}</div>')
+    parts.append('<div style="border:1px solid #ddd;border-top:none;'
+                 'border-radius:0 0 6px 6px;padding:16px 18px;">')
+
+    # Metadata table
+    parts.append('<table style="border-collapse:collapse;font-size:14px;margin-bottom:12px;">')
+    meta_rows = [("Host", host), ("Directory", target_dir)]
+    if scan_time:
+        meta_rows.insert(1, ("Scan time", scan_time))
+    for k, v in meta_rows:
+        parts.append(f'<tr><td style="padding:2px 12px 2px 0;color:#777;">{esc(k)}</td>'
+                     f'<td style="padding:2px 0;"><code>{esc(str(v))}</code></td></tr>')
+    parts.append('</table>')
+
+    if has_problems:
+        detail = []
+        if failed > 0:
+            detail.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+        if count_missing > 0:
+            detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+        parts.append(f'<p style="font-size:14px;margin:0 0 12px;">'
+                     f'rotbyte detected <strong>{esc(", ".join(detail))}</strong>.</p>')
+    else:
+        parts.append('<p style="font-size:14px;margin:0 0 12px;">'
+                     'Scan completed cleanly — no bit rot and no missing files.</p>')
+
+    if interrupted:
+        parts.append('<p style="font-size:14px;margin:0 0 12px;color:#b9770e;">'
+                     'Scan was interrupted before completion (Ctrl-C / SIGTERM).</p>')
+
+    # Counts table
+    if counts:
+        parts.append('<table style="border-collapse:collapse;font-size:14px;'
+                     'width:100%;margin-bottom:12px;">')
+        for label, value in counts:
+            emphasize = label in ("Failed", "Missing") and value not in ("0", "0,")
+            style = f'color:{accent};font-weight:600;' if emphasize else ''
+            parts.append(f'<tr><td style="padding:4px 12px 4px 0;border-bottom:1px solid #eee;">'
+                         f'{esc(label)}</td>'
+                         f'<td style="padding:4px 0;border-bottom:1px solid #eee;'
+                         f'text-align:right;{style}">{esc(value)}</td></tr>')
+        parts.append('</table>')
+
+    # Progress / freshness / duration
+    detail_lines: List[str] = []
+    if due_progress is not None:
+        done, start = due_progress
+        pct = (done / start * 100) if start > 0 else 100.0
+        detail_lines.append(f"Due-file progress: {done:,} / {start:,} verified this run ({pct:.1f}%)")
+    if freshness is not None:
+        f_total, f_verified, f_due = freshness
+        f_pct = (f_verified / f_total * 100) if f_total else 0.0
+        detail_lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} "
+                            f"verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
+    if elapsed_seconds is not None:
+        detail_lines.append(f"Scan duration: {_format_duration(elapsed_seconds)}")
+    for dl in detail_lines:
+        parts.append(f'<p style="font-size:13px;color:#555;margin:2px 0;">{esc(dl)}</p>')
+
+    if has_problems:
+        parts.append('<div style="margin-top:14px;padding:12px;background:#f7f7f7;'
+                     'border-radius:4px;font-size:13px;">'
+                     f'To list the affected files, run this on <strong>{esc(host)}</strong>:'
+                     f'<pre style="margin:6px 0 0;font-size:13px;">'
+                     f'rotbyte --report {esc(target_dir)}</pre>'
+                     'After restoring a file from backup, run '
+                     '<code>rotbyte --accept &lt;file&gt;</code>.</div>')
+
+    parts.append('</div></div>')
+    return "".join(parts)

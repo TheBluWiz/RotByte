@@ -16,6 +16,7 @@ complete -c rotbyte -l due -r -x -a '7d 14d 30d 60d 90d' -d 'Re-verify files not
 complete -c rotbyte -l track -d 'Install scheduled scans (launchd/systemd)'
 complete -c rotbyte -l track-setup -d 'Interactive setup wizard for --track'
 complete -c rotbyte -l status -d 'Show status of all scheduled scans'
+complete -c rotbyte -l repair -d 'Re-point broken scheduled scans after an upgrade'
 complete -c rotbyte -l untrack -d 'Remove scheduled scans for a directory'
 complete -c rotbyte -l untrack-all -d 'Remove all scheduled scans'
 complete -c rotbyte -l every -r -x -a '30m 1h 2h 4h' -d 'Quick scan frequency for --track'

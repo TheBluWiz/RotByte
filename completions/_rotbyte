@@ -20,6 +20,7 @@ _rotbyte() {
         '--track[Install scheduled scans (launchd/systemd)]' \
         '--track-setup[Interactive setup wizard for --track]' \
         '--status[Show status of all scheduled scans]' \
+        '--repair[Re-point broken scheduled scans after an upgrade]' \
         '--untrack[Remove scheduled scans for a directory]' \
         '--untrack-all[Remove all scheduled scans]' \
         '--every[Quick scan frequency for --track]:interval:(30m 1h 2h 4h)' \

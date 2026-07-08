@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0 — 2026-07-07
+
+### Added
+- **`--repair` re-points broken scheduled scans after an upgrade.** Installed launchd plists / systemd units pin an absolute interpreter + script path; a Homebrew upgrade that deletes the old path leaves every scheduled run failing silently at exec. `--repair` rewrites each installed schedule in place to the executable this rotbyte resolves to today and reloads it, preserving every flag (`--due`, `--budget`, `--notify`, `--auto-export`, …) and the target directory. Idempotent — schedules already on the current path are reported and left untouched. macOS (launchd) and Linux (systemd) rewrite in place; Windows tasks use stable paths and need no repair. The Homebrew formula's `caveats` now tells users to run it after `brew upgrade` (Homebrew sandboxes `post_install`, so it can't be automatic)
+- **Notification emails are substantially more informative.** Sent as `multipart/alternative` (plain text + a formatted HTML view). Every email now names the **sending host** (in both subject and body) so an alert is attributable on a multi-machine / NAS setup, includes the **scan timestamp**, and carries the full **scan summary counts** — including on clean PASS emails, which previously said only "completed cleanly". For privacy, affected file **paths are never included** (an integrity alert over SMTP is not a private channel); the body instead names the exact local command — `rotbyte --report <dir>` — that lists them
+- **The terminal scan summary reports a time-budget cutoff.** A `--budget` scan that runs out of time now prints a note that not every file was verified this run — previously visible only in the email
+
+### Changed
+- **`--status` shows the `NEW` state instead of hiding it.** Newly-indexed-but-never-re-verified files were folded into the `OK` count; they now display as a distinct `N NEW` token, so files that have never actually been checked for rot are visible
+- **`--report` timestamps are localized**, matching `--status` (both were reading the same stored UTC instant but rendering it in different timezones). The "not verified recently" window now follows the schedule's `--due` value when one is configured (was hardcoded to 90 days), and the stale-file listing states "showing first 20 of N" instead of announcing the full count then silently printing only 10
+
 ## 1.1.2 — 2026-07-07
 
 ### Fixed

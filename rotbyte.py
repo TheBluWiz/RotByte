@@ -113,6 +113,7 @@ from _rotbyte.scheduler import (
     _find_rotbyte_executable,
     _missing_command_path,
     _parse_cmd_flags,
+    _run_repair,
     _run_track,
     _run_untrack,
     _run_untrack_all,
@@ -157,7 +158,7 @@ import smtplib  # noqa: F401
 
 # ── Version and process exit codes ────────────────────────────────────────────
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 # Documented process exit codes. Callers (cron, monitoring, CI) rely on
 # these — keep them stable and add new codes rather than reusing existing
@@ -185,6 +186,7 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
     if args.track:               flags.append("--track")
     if args.track_setup:         flags.append("--track-setup")
     if args.status:              flags.append("--status")
+    if args.repair:              flags.append("--repair")
     if args.report:              flags.append("--report")
     if args.check:               flags.append("--check")
     if args.accept:              flags.append("--accept")
@@ -198,8 +200,25 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 
-def print_report(db: ChecksumDB):
-    """Print a human-readable status report from the database."""
+def print_report(db: ChecksumDB, stale_days: int = 90):
+    """Print a human-readable status report from the database.
+
+    ``stale_days`` bounds the "not verified recently" section. It defaults
+    to 90 but the caller passes the schedule's ``--due`` window when one is
+    configured, so the report's notion of "stale" matches the freshness
+    target rather than an unrelated constant.
+    """
+    def _fmt_ts(value):
+        # Localize like --status; fall back to the raw stored string on any
+        # unexpected format so the report never crashes on a stray row (the
+        # pre-localization code printed the raw value and couldn't fail).
+        if not value:
+            return "—"
+        try:
+            return _utc_to_local(value)
+        except (ValueError, TypeError):
+            return value
+
     print()
     print("═" * 60)
     print("  rotbyte — Integrity Report")
@@ -223,22 +242,27 @@ def print_report(db: ChecksumDB):
         print(f"  ✗ Failed files ({len(failed)}):")
         print(f"  {'─' * 56}")
         for f in failed:
+            # Localize the timestamp so --report and --status agree instead
+            # of showing the same instant in two different timezones.
             print(f"    {f['file_path']}")
-            print(f"      Size: {_format_size(f['file_size'])}  |  Last verified: {f['last_verified']}")
+            print(f"      Size: {_format_size(f['file_size'])}  |  "
+                  f"Tracked since: {_fmt_ts(f.get('first_seen'))}  |  "
+                  f"Last verified: {_fmt_ts(f['last_verified'])}")
             print(f"      Expected: {f['baseline_checksum'][:32]}...")
             print(f"      Got:      {f['checksum'][:32]}...")
         print()
 
-    stale = db.stale_files(90)
+    stale = db.stale_files(stale_days)
     if stale:
-        print(f"  ⏰ Files not verified in 90+ days: {len(stale):,}")
-        if len(stale) <= 20:
-            for s in stale:
-                print(f"    {s['file_path']}  (last: {s['last_verified']})")
-        else:
-            print("    (showing first 10)")
-            for s in stale[:10]:
-                print(f"    {s['file_path']}  (last: {s['last_verified']})")
+        # Cap the listing but be honest about it — the previous code
+        # announced the full count then silently printed only the first 10.
+        stale_cap = 20
+        print(f"  ⏰ Files not verified in {stale_days}+ days: {len(stale):,}")
+        shown = stale if len(stale) <= stale_cap else stale[:stale_cap]
+        if len(stale) > stale_cap:
+            print(f"    (showing first {stale_cap} of {len(stale):,})")
+        for s in shown:
+            print(f"    {s['file_path']}  (last: {_fmt_ts(s['last_verified'])})")
         print()
 
 
@@ -351,6 +375,11 @@ Exit codes:
                              "on this machine across every tracked directory.")
     parser.add_argument("--status", action="store_true",
                         help="Show status of all scheduled scans and file health")
+    parser.add_argument("--repair", action="store_true",
+                        help="Re-point every installed scheduled scan at the current "
+                             "rotbyte/Python path and reload it. Fixes schedules broken "
+                             "by a Homebrew upgrade (interpreter/script path deleted). "
+                             "Safe to run anytime; schedules already current are left as-is.")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
@@ -424,6 +453,11 @@ Exit codes:
     if args.status:
         _run_status()
         return
+
+    # --repair rewrites installed scheduler configs in place; like --status
+    # it needs no target directory, database, or lock.
+    if args.repair:
+        sys.exit(_run_repair())
 
     # --untrack / --untrack-all: tear down installed scheduler units.
     # Mutually-exclusive validation already happened up front, so by the
@@ -605,7 +639,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
 
     # ── Dispatch to the requested mode ─────────────────────────────────
     if args.report:
-        print_report(db)
+        print_report(db, stale_days=getattr(args, "due_days", None) or 90)
         db.close()
         return
 
@@ -1279,9 +1313,15 @@ def _run_status():
             counts = db.status_counts()
             if counts:
                 parts = []
-                ok = counts.get("OK", 0) + counts.get("NEW", 0)
+                ok = counts.get("OK", 0)
                 if ok:
                     parts.append(f"{ok:,} OK")
+                new = counts.get("NEW", 0)
+                if new:
+                    # NEW = indexed but not yet re-verified against a baseline.
+                    # Folding it into OK (as before) hid files that have never
+                    # actually been checked for rot; show it distinctly.
+                    parts.append(f"{new:,} NEW")
                 failed = counts.get("FAILED", 0)
                 if failed:
                     parts.append(f"{failed:,} FAILED")
@@ -1436,6 +1476,13 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                 due_end_count = len(db.due_file_paths(target_dir, due_days))
                 due_done = max(due_start_count - due_end_count, 0)
                 due_progress = (due_done, due_start_count)
+            scan_stats = {
+                "ok": result.ok,
+                "new": result.new,
+                "updated": result.updated,
+                "skipped": skip_count,
+                "bytes_hashed": result.bytes_hashed,
+            }
             _send_email_notification(
                 target_dir, result.failed, count_missing,
                 failed_details,
@@ -1445,6 +1492,8 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                 interrupted=interrupted[0],
                 budget_exceeded=result.budget_exceeded,
                 errors=result.errors,
+                stats=scan_stats,
+                scan_time=time.strftime("%Y-%m-%d %H:%M %Z", time.localtime()),
             )
 
     if args.json_output:
@@ -1492,6 +1541,15 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         if not quiet:
             print(f"  Errors       : {result.errors:,}  (could not read/hash)")
         print("═" * 60)
+
+        # A --budget scan that ran out of time verified only the stalest
+        # files. That was previously visible only in the email; say so at
+        # the terminal too so a truncated run isn't mistaken for a full one.
+        if not quiet and getattr(result, "budget_exceeded", False):
+            print()
+            print("  Note: time budget reached — not every file was verified this run.")
+            print("        Stalest files were checked first; re-run to continue,")
+            print("        or raise --budget to cover more per run.")
 
         # Hint about likely renames when new files match missing checksums
         if result.new > 0 and count_missing > 0:

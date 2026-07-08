@@ -9,7 +9,8 @@ import subprocess as _subprocess
 import textwrap as _textwrap
 from typing import Dict, List, Optional, Tuple
 
-from . import _missing_command_path, _parse_cmd_flags
+from . import (_exe_prefix_current, _exe_prefix_len, _missing_command_path,
+               _parse_cmd_flags, _repair_exe_prefix)
 
 
 def _systemd_escape_arg(arg: str) -> str:
@@ -239,6 +240,83 @@ def _disable_and_unlink(names: List[str]) -> Tuple[List[str], List[str]]:
             capture_output=True, text=True,
         )
     return removed, errors
+
+
+def _repair_systemd(fresh_exe: List[str]) -> Tuple[List[Tuple[str, str, str, str]],
+                                                   List[str], List[str]]:
+    """Rewrite the ExecStart interpreter/script prefix in every rotbyte unit.
+
+    Returns ``(repaired, already_ok, errors)`` in the same shape as
+    :func:`launchd._repair_launchd`. Only the leading interpreter/script of
+    ``ExecStart=`` is replaced; the schedule (in the sibling ``.timer``),
+    the flags, and the target directory are preserved. A single
+    ``daemon-reload`` runs at the end when anything changed so systemd
+    forgets the stale ExecStart.
+    """
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    repaired: List[Tuple[str, str, str, str]] = []
+    already_ok: List[str] = []
+    errors: List[str] = []
+    changed = False
+
+    for service_path in sorted(_glob.glob(os.path.join(unit_dir, "rotbyte-*.service"))):
+        name = os.path.basename(service_path).replace(".service", "")
+        try:
+            with open(service_path, "r") as f:
+                content = f.read()
+        except OSError as e:
+            errors.append(f"{name}: could not read unit: {e}")
+            continue
+
+        exec_line = None
+        for line in content.splitlines():
+            if line.startswith("ExecStart="):
+                exec_line = line[len("ExecStart="):]
+                break
+        if not exec_line:
+            errors.append(f"{name}: no ExecStart line")
+            continue
+
+        args = _split_exec_start(exec_line)
+        if not args:
+            errors.append(f"{name}: empty ExecStart")
+            continue
+
+        if _exe_prefix_current(args, fresh_exe):
+            already_ok.append(name)
+            continue
+
+        old_prefix = " ".join(args[: _exe_prefix_len(args)])
+        new_args = _repair_exe_prefix(args, fresh_exe)
+        new_exec = " ".join(_systemd_escape_arg(a) for a in new_args)
+        target_dir = args[-1]
+
+        # Replace only the ExecStart line; leave every other directive intact.
+        new_lines = []
+        for line in content.splitlines():
+            if line.startswith("ExecStart="):
+                new_lines.append("ExecStart=" + new_exec)
+            else:
+                new_lines.append(line)
+        new_content = "\n".join(new_lines)
+        if content.endswith("\n"):
+            new_content += "\n"
+
+        try:
+            with open(service_path, "w") as f:
+                f.write(new_content)
+        except OSError as e:
+            errors.append(f"{name}: could not write unit: {e}")
+            continue
+
+        repaired.append((name, target_dir, old_prefix, " ".join(fresh_exe)))
+        changed = True
+
+    if changed:
+        _subprocess.run(["systemctl", "--user", "daemon-reload"],
+                        capture_output=True, text=True)
+
+    return repaired, already_ok, errors
 
 
 def _discover_systemd() -> Dict[str, Dict]:

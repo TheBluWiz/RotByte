@@ -1,4 +1,4 @@
-.TH ROTBYTE 1 "2026-05-16" "rotbyte 1.1.1" "User Commands"
+.TH ROTBYTE 1 "2026-07-07" "rotbyte 1.1.2" "User Commands"
 .SH NAME
 rotbyte \- detect bit rot by tracking BLAKE2b checksums
 .SH SYNOPSIS
@@ -180,10 +180,24 @@ directory, displays: the quick and full scan schedule and whether each
 timer is active; any extra flags baked into the schedule (such as
 .BR \-\-budget ", " \-\-due ", " \-\-notify );
 the time of the most recent scan converted to local time; and a count of
-files by health status (OK, FAILED, MISSING) with the paths of up to five
+files by health status (OK, NEW, FAILED, MISSING) with the paths of up to five
 FAILED files. If no scheduled scans are found, suggests the
 .B \-\-track
 command.
+.TP
+.B \-\-repair
+Re-point every installed scheduled scan at the interpreter and script path
+that this rotbyte resolves to today, then reload it. Fixes schedules broken
+by a package upgrade that deleted the old paths (which otherwise fail
+silently at launch and show as
+.B BROKEN
+in
+.BR \-\-status ).
+The rewrite happens in place and preserves every flag and the target
+directory; schedules already on the current path are left untouched. Safe to
+run at any time — in particular after every
+.B brew upgrade
+of rotbyte or Python.
 .TP
 .BI \-\-untrack " [PATH]"
 Remove the scheduled rotbyte runs that were installed for the given

@@ -9,7 +9,8 @@ import re as _re
 import subprocess as _subprocess
 from typing import Dict, List, Optional, Tuple
 
-from . import _missing_command_path, _parse_cmd_flags
+from . import (_exe_prefix_current, _exe_prefix_len, _missing_command_path,
+               _parse_cmd_flags, _repair_exe_prefix)
 
 
 def _launchd_log_path(label: str) -> str:
@@ -226,6 +227,71 @@ def _agent_state(label: str) -> Dict[str, object]:
         # N << 8. Values under 256 are signal terminations — report as-is.
         last_exit = raw >> 8 if raw >= 256 else raw
     return {"active": True, "last_exit": last_exit}
+
+
+def _repair_launchd(fresh_exe: List[str]) -> Tuple[List[Tuple[str, str, str, str]],
+                                                   List[str], List[str]]:
+    """Re-point every installed rotbyte plist at ``fresh_exe`` and reload it.
+
+    Returns ``(repaired, already_ok, errors)`` where ``repaired`` is a list
+    of ``(label, target_dir, old_prefix, new_prefix)`` tuples, ``already_ok``
+    is the labels whose command already matched, and ``errors`` is
+    human-readable failure strings.
+
+    Only the interpreter/script prefix of ``ProgramArguments`` is rewritten;
+    the schedule (StartInterval / StartCalendarInterval), log paths, Nice,
+    and every scan flag are loaded from the existing plist and preserved. A
+    rewritten plist is reloaded (``unload`` then ``load``) because launchd
+    ignores on-disk edits to an already-loaded agent.
+    """
+    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    repaired: List[Tuple[str, str, str, str]] = []
+    already_ok: List[str] = []
+    errors: List[str] = []
+
+    for plist_path in sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist"))):
+        label = os.path.basename(plist_path)[: -len(".plist")]
+        try:
+            with open(plist_path, "rb") as f:
+                plist = _plistlib.load(f)
+        except Exception:  # noqa: BLE001 — a broken plist shouldn't stop the rest
+            errors.append(f"{label}: could not parse plist; re-run --track for this directory")
+            continue
+
+        args = list(plist.get("ProgramArguments", []))
+        if not args:
+            errors.append(f"{label}: plist has no ProgramArguments")
+            continue
+
+        if _exe_prefix_current(args, fresh_exe):
+            already_ok.append(label)
+            continue
+
+        old_prefix = " ".join(args[: _exe_prefix_len(args)])
+        new_args = _repair_exe_prefix(args, fresh_exe)
+        target_dir = args[-1]
+
+        plist["ProgramArguments"] = new_args
+        try:
+            with open(plist_path, "wb") as f:
+                _plistlib.dump(plist, f)
+        except OSError as e:
+            errors.append(f"{label}: could not write plist: {e}")
+            continue
+
+        # Reload so launchd adopts the new command. Failures here are worth
+        # reporting but the file is already fixed, so the next login/reboot
+        # would pick it up regardless.
+        _subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
+        result = _subprocess.run(["launchctl", "load", plist_path],
+                                 capture_output=True, text=True)
+        if result.returncode != 0:
+            errors.append(f"{label}: reloaded plist but launchctl load failed: "
+                          f"{(result.stderr or '').strip()}")
+
+        repaired.append((label, target_dir, old_prefix, " ".join(fresh_exe)))
+
+    return repaired, already_ok, errors
 
 
 def _discover_launchd() -> Dict[str, Dict]:

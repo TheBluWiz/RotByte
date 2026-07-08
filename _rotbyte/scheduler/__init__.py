@@ -141,6 +141,126 @@ def _missing_command_path(args: List[str]) -> Optional[str]:
     return None
 
 
+def _exe_prefix_len(args: List[str]) -> int:
+    """Length of the interpreter/script prefix at the head of a command.
+
+    ``[python, rotbyte.py, --flag, dir]`` → 2; ``[rotbyte-wrapper, dir]`` → 1.
+    Mirrors the shape :func:`_find_rotbyte_executable` produces and the
+    shape :func:`_missing_command_path` inspects.
+    """
+    if len(args) > 1 and args[1].endswith(".py"):
+        return 2
+    return 1
+
+
+def _exe_prefix_current(args: List[str], fresh_exe: List[str]) -> bool:
+    """True when a command already begins with the fresh executable prefix.
+
+    A schedule whose prefix matches needs no repair; one that differs is
+    either broken (the old path was deleted by an upgrade) or merely stale
+    (still a Cellar path that the next upgrade will delete). Both should be
+    rewritten to the current upgrade-stable form.
+    """
+    return list(args[:_exe_prefix_len(args)]) == list(fresh_exe)
+
+
+def _repair_exe_prefix(args: List[str], fresh_exe: List[str]) -> List[str]:
+    """Swap a command's interpreter/script prefix for ``fresh_exe``.
+
+    Every trailing argument — flags like ``--due``/``--notify``/
+    ``--auto-export`` and the target directory — is preserved verbatim, so
+    repair never silently drops behavior the way a reconstruct-from-scratch
+    would.
+    """
+    return list(fresh_exe) + list(args[_exe_prefix_len(args):])
+
+
+def _run_repair() -> int:
+    """Rewrite installed schedules to the current rotbyte/Python paths.
+
+    The launchd plists / systemd units persist an absolute interpreter and
+    script path. A Homebrew upgrade that deletes the old Cellar tree (or a
+    schedule written before paths were stabilized) leaves those pointing at
+    a file that no longer exists, so every scheduled run dies at exec —
+    silently. ``--repair`` re-points each schedule at the executable this
+    rotbyte resolves to today and reloads it, in place, preserving all
+    flags and the target directory. Idempotent: schedules already on the
+    current path are reported as such and left untouched.
+
+    Returns a process exit code mirroring the untrack helpers (0 ok,
+    6 if any platform command failed, 7 if unsupported).
+    """
+    if not (_IS_MACOS or _IS_LINUX or _IS_WINDOWS):
+        print(f"Error: --repair is not supported on {sys.platform}.", file=sys.stderr)
+        return _UNTRACK_INTERNAL
+
+    fresh_exe = _find_rotbyte_executable()
+
+    print("═" * 60)
+    print("  rotbyte — Repairing scheduled scans")
+    print("═" * 60)
+    print(f"  Current command: {' '.join(fresh_exe)}")
+    print()
+
+    if _IS_WINDOWS:
+        # Task Scheduler tasks don't suffer the Homebrew Cellar-path
+        # breakage (no Homebrew on Windows), so there's nothing to rewrite.
+        from . import schtasks
+        tracked = schtasks._discover_schtasks()
+        if not tracked:
+            print("  No scheduled scans found.")
+            return _UNTRACK_OK
+        print("  Windows scheduled tasks use stable paths — no repair needed.")
+        print("  If a task is genuinely broken, re-run --track for its directory:")
+        for d in sorted(tracked):
+            print(f"    {d}")
+        print("═" * 60)
+        return _UNTRACK_OK
+
+    if _IS_MACOS:
+        from . import launchd
+        backend = "launchd"
+        try:
+            repaired, already_ok, errors = launchd._repair_launchd(fresh_exe)
+        except Exception as e:  # noqa: BLE001 — platform repair failure
+            print(f"Error: launchd repair failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    else:
+        from . import systemd
+        backend = "systemd"
+        try:
+            repaired, already_ok, errors = systemd._repair_systemd(fresh_exe)
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: systemd repair failed: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+
+    if not repaired and not already_ok and not errors:
+        print("  No scheduled scans found.")
+        print()
+        print("  Use --track to set up scheduled scanning.")
+        print("═" * 60)
+        return _UNTRACK_OK
+
+    for label, target_dir, old_prefix, new_prefix in repaired:
+        print(f"  ✓ Repaired: {label}")
+        print(f"      {target_dir}")
+        print(f"      was: {old_prefix}")
+        print(f"      now: {new_prefix}")
+    for label in already_ok:
+        print(f"  · Already current: {label}")
+    if errors:
+        for msg in errors:
+            print(f"  ! {msg}", file=sys.stderr)
+
+    print()
+    n = len(repaired)
+    print(f"  Repaired {n} schedule{'s' if n != 1 else ''} ({backend}).")
+    if repaired:
+        print("  Scheduled runs now use the current, upgrade-stable path.")
+    print("═" * 60)
+    return _UNTRACK_IO_ERROR if errors else _UNTRACK_OK
+
+
 def _run_track(target_dir: str, every_seconds: int,
                full_at: Optional[List[Tuple[int, int]]],
                budget_seconds: Optional[int],
