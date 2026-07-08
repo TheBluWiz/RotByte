@@ -47,6 +47,7 @@ import signal
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from typing import List, Optional, Set
 
 # ── Re-exports from the _rotbyte package ──────────────────────────────────────
@@ -79,6 +80,7 @@ from _rotbyte.helpers import (
     _format_size,
     _is_tty,
     _mtime_iso,
+    _next_calendar_run,
     _now,
     _resolve,
     _term_width,
@@ -1268,6 +1270,16 @@ def _run_status():
                 extras.append(f"--workers {f['workers']}")
             if extras:
                 print(f"            {' '.join(extras)}")
+            # Next fire time — only meaningful for a loaded, non-broken
+            # calendar schedule (interval timers fire relative to an opaque
+            # load time the scheduler doesn't expose, so quick scans can't
+            # show this reliably).
+            if f.get("times") and f.get("active") and not f.get("missing_exe"):
+                nxt = _next_calendar_run(f["times"], datetime.now().astimezone())
+                if nxt:
+                    ndt, secs = nxt
+                    print(f"            next {_format_clock_time(ndt.hour, ndt.minute)}"
+                          f" (in {_format_duration(secs)})")
         else:
             print(f"    Full  : (not configured)")
 
@@ -1304,11 +1316,24 @@ def _run_status():
             continue
 
         try:
-            last = db.last_activity()
-            if last:
-                print(f"    Last  : {_utc_to_local(last)}")
+            # Prefer the actual last-run time (when a scan process finished)
+            # over max(last_verified): a run that verified nothing new still
+            # updates finished_at, and it distinguishes "finished" from
+            # "started but never completed" (in progress or hard-killed).
+            run = db.last_run_info()
+            if run and run.get("finished_at"):
+                print(f"    Last  : {_utc_to_local(run['finished_at'])}")
+            elif run and run.get("status") == "RUNNING" and run.get("started_at"):
+                print(f"    Last  : started {_utc_to_local(run['started_at'])}"
+                      f" — in progress or interrupted")
             else:
-                print(f"    Last  : no scans completed yet")
+                # Legacy DB with no last_run row: fall back to newest file
+                # verification time.
+                last = db.last_activity()
+                if last:
+                    print(f"    Last  : {_utc_to_local(last)}")
+                else:
+                    print(f"    Last  : no scans completed yet")
 
             counts = db.status_counts()
             if counts:
@@ -1449,7 +1474,10 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         with Spinner("Checking for missing files", quiet=quiet):
             count_missing = detect_missing(db, target_dir, set(all_files), existing, now)
 
-    db.finish_run()
+    # Capture the previous run's problem counts before finish_run overwrites
+    # them, so the notification can report the change ("bit rot 1 → 3").
+    previous_counts = db.previous_run_counts()
+    db.finish_run(failed=result.failed, missing=count_missing)
 
     # ── Summary ────────────────────────────────────────────────────────
     elapsed = time.monotonic() - start_time
@@ -1494,6 +1522,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
                 errors=result.errors,
                 stats=scan_stats,
                 scan_time=time.strftime("%Y-%m-%d %H:%M %Z", time.localtime()),
+                previous_counts=previous_counts,
             )
 
     if args.json_output:

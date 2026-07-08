@@ -49,7 +49,11 @@ CREATE TABLE IF NOT EXISTS last_run (
     started_at  TEXT    NOT NULL,
     finished_at TEXT,
     target_dir  TEXT    NOT NULL,
-    status      TEXT    NOT NULL DEFAULT 'RUNNING'
+    status      TEXT    NOT NULL DEFAULT 'RUNNING',
+    -- Problem counts from the last completed run, so the next notification
+    -- can report the change ("bit rot 1 → 3"). NULL until a run records them.
+    failed      INTEGER,
+    missing     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -58,7 +62,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Current DB filename shape: ".{dirname}_rotbyte.db". The leading dot keeps
 # the file hidden on POSIX; the {dirname} prefix keeps DBs distinguishable
@@ -159,6 +163,18 @@ class ChecksumDB:
             )
             current = 3
 
+        # ── Migration 3 → 4: last_run gains failed/missing counts ────────
+        # Lets a notification report the change since the previous run
+        # ("bit rot 1 → 3"). Nullable — existing rows report "no prior
+        # counts" until the next run records them.
+        if current < 4:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(last_run)")}
+            if "failed" not in cols:
+                self.conn.execute("ALTER TABLE last_run ADD COLUMN failed INTEGER")
+            if "missing" not in cols:
+                self.conn.execute("ALTER TABLE last_run ADD COLUMN missing INTEGER")
+            current = 4
+
         self.conn.execute(
             "UPDATE schema_version SET version = ? WHERE id = 1",
             (current,),
@@ -213,18 +229,65 @@ class ChecksumDB:
             print()
 
     def start_run(self, target_dir: str):
-        """Mark a run as in progress. Overwrites any previous record."""
-        self.conn.execute(
-            "INSERT OR REPLACE INTO last_run (id, started_at, finished_at, target_dir, status) "
-            "VALUES (1, ?, NULL, ?, 'RUNNING')",
-            (_now(), target_dir),
-        )
+        """Mark a run as in progress.
 
-    def finish_run(self):
-        """Mark the current run as complete."""
+        Resets only the run-state fields (started_at, finished_at, status,
+        target_dir) and deliberately preserves the prior run's ``failed`` /
+        ``missing`` counts so :meth:`previous_run_counts` can report the
+        change after this run finishes. On the very first run the row is
+        created with NULL counts (no prior run to compare against).
+        """
+        updated = self.conn.execute(
+            "UPDATE last_run SET started_at = ?, finished_at = NULL, "
+            "target_dir = ?, status = 'RUNNING' WHERE id = 1",
+            (_now(), target_dir),
+        ).rowcount
+        if not updated:
+            self.conn.execute(
+                "INSERT INTO last_run "
+                "(id, started_at, finished_at, target_dir, status, failed, missing) "
+                "VALUES (1, ?, NULL, ?, 'RUNNING', NULL, NULL)",
+                (_now(), target_dir),
+            )
+
+    def previous_run_counts(self) -> Optional[Tuple[int, int]]:
+        """Return ``(failed, missing)`` from the last recorded run, or None.
+
+        Returns None when no run has recorded counts yet (fresh database or
+        a row migrated from before schema v4), so the first notification
+        doesn't invent a bogus "was 0 last run" comparison. Must be read
+        *before* :meth:`finish_run` overwrites the counts for this run.
+        """
+        row = self.conn.execute(
+            "SELECT failed, missing FROM last_run WHERE id = 1"
+        ).fetchone()
+        if row is None or row["failed"] is None or row["missing"] is None:
+            return None
+        return (row["failed"], row["missing"])
+
+    def last_run_info(self) -> Optional[Dict]:
+        """Return the last run's timing/state, or None if none recorded.
+
+        ``{"started_at", "finished_at", "status"}``. ``finished_at`` is None
+        when the last run is still in progress or was hard-killed before it
+        could mark itself COMPLETE (the same signal
+        :meth:`check_interrupted_run` uses).
+        """
+        row = self.conn.execute(
+            "SELECT started_at, finished_at, status FROM last_run WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {"started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "status": row["status"]}
+
+    def finish_run(self, failed: int = 0, missing: int = 0):
+        """Mark the current run as complete and record its problem counts."""
         self.conn.execute(
-            "UPDATE last_run SET finished_at = ?, status = 'COMPLETE' WHERE id = 1",
-            (_now(),),
+            "UPDATE last_run SET finished_at = ?, status = 'COMPLETE', "
+            "failed = ?, missing = ? WHERE id = 1",
+            (_now(), int(failed), int(missing)),
         )
 
     # ── Bulk lookups ──────────────────────────────────────────────────────

@@ -177,11 +177,13 @@ installing a broken schedule.
 .B \-\-status
 Show the status of all installed scheduled scans. For each tracked
 directory, displays: the quick and full scan schedule and whether each
-timer is active; any extra flags baked into the schedule (such as
+timer is active; the next scheduled full-scan time with a countdown (for
+active calendar schedules); any extra flags baked into the schedule (such as
 .BR \-\-budget ", " \-\-due ", " \-\-notify );
-the time of the most recent scan converted to local time; and a count of
-files by health status (OK, NEW, FAILED, MISSING) with the paths of up to five
-FAILED files. If no scheduled scans are found, suggests the
+the finish time of the most recent run converted to local time (a run that
+started but never completed is shown as in progress or interrupted); and a
+count of files by health status (OK, NEW, FAILED, MISSING) with the paths of
+up to five FAILED files. If no scheduled scans are found, suggests the
 .B \-\-track
 command.
 .TP

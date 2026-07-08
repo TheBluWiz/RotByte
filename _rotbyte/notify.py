@@ -368,7 +368,8 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
                              errors: int = 0,
                              stats: Optional[Dict] = None,
                              host: Optional[str] = None,
-                             scan_time: Optional[str] = None):
+                             scan_time: Optional[str] = None,
+                             previous_counts: Optional[Tuple[int, int]] = None):
     """Send an email notification summarizing a completed scan.
 
     Subject distinguishes two outcomes:
@@ -425,6 +426,19 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
     has_problems = failed > 0 or count_missing > 0
     outcome = "DETECTED" if has_problems else "PASS"
 
+    # Change vs the previous run — highlights a regression (1 → 3) or a
+    # recovery (3 → 0). None when there's no prior run to compare against.
+    change_line: Optional[str] = None
+    if previous_counts is not None:
+        prev_failed, prev_missing = previous_counts
+        deltas = []
+        if prev_failed != failed:
+            deltas.append(f"bit rot {prev_failed:,} → {failed:,}")
+        if prev_missing != count_missing:
+            deltas.append(f"missing {prev_missing:,} → {count_missing:,}")
+        if deltas:
+            change_line = "Change since last run: " + ", ".join(deltas)
+
     # Build subject
     subject_parts = [f"rotbyte: {outcome}"]
     if due_progress is not None:
@@ -462,6 +476,10 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         lines.append("")
     else:
         lines.append(f"rotbyte scan completed cleanly for {target_dir}.\n")
+
+    if change_line:
+        lines.append(change_line)
+        lines.append("")
 
     if interrupted:
         lines.append("Scan was interrupted before completion (Ctrl-C / SIGTERM).")
@@ -519,7 +537,7 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         has_problems=has_problems, outcome=outcome, failed=failed,
         count_missing=count_missing, interrupted=interrupted,
         counts=counts, due_progress=due_progress, freshness=freshness,
-        elapsed_seconds=elapsed_seconds,
+        elapsed_seconds=elapsed_seconds, change_line=change_line,
     )
 
     try:
@@ -577,7 +595,8 @@ def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
                      counts: List[Tuple[str, str]],
                      due_progress: Optional[Tuple[int, int]],
                      freshness: Optional[tuple],
-                     elapsed_seconds: Optional[float]) -> str:
+                     elapsed_seconds: Optional[float],
+                     change_line: Optional[str] = None) -> str:
     """Render the HTML alternative part.
 
     Deliberately path-free, like the plain-text part. Uses only inline
@@ -619,6 +638,10 @@ def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
     else:
         parts.append('<p style="font-size:14px;margin:0 0 12px;">'
                      'Scan completed cleanly — no bit rot and no missing files.</p>')
+
+    if change_line:
+        parts.append(f'<p style="font-size:13px;margin:0 0 12px;color:#555;">'
+                     f'{esc(change_line)}</p>')
 
     if interrupted:
         parts.append('<p style="font-size:14px;margin:0 0 12px;color:#b9770e;">'

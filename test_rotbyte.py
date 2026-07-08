@@ -47,6 +47,7 @@ import subprocess
 import sys
 import time
 import unittest.mock
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -2728,6 +2729,26 @@ class TestStatusFreshness:
             rotbyte._run_status()
         return captured.getvalue()
 
+    def test_status_shows_next_full_run(self, tmp, db_path):
+        _run_cli_ok(str(tmp))
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
+        assert "next 2 AM" in out
+        assert "(in " in out          # duration-until suffix
+
+    def test_status_no_next_run_when_broken(self, tmp, db_path):
+        _run_cli_ok(str(tmp))
+        tracked = self._make_tracked(str(tmp), "30d")
+        tracked[str(tmp)]["full"]["missing_exe"] = "/dead/python"
+        out = self._capture_status(tracked)
+        assert "next 2 AM" not in out
+
+    def test_status_last_uses_finished_at(self, tmp, db_path):
+        _run_cli_ok(str(tmp))
+        out = self._capture_status(self._make_tracked(str(tmp), "30d"))
+        assert "Last  :" in out
+        # A cleanly completed run is not flagged as interrupted.
+        assert "in progress or interrupted" not in out
+
     def test_freshness_shown_when_due_configured(self, tmp, db_path):
         """--status shows freshness stats when --due is in the tracked config."""
         _run_cli(str(tmp))  # create database with 4 files verified now
@@ -3121,6 +3142,26 @@ class TestNotifyOutcome:
                 htmlbody = part.get_payload(decode=True).decode(
                     part.get_content_charset() or "utf-8")
                 assert "x.jpg" not in htmlbody
+
+    def test_change_since_last_run_regression(self):
+        _, body = self._send_and_capture(
+            failed=3, failed_files=[{"file_path": "/x"}], previous_counts=(1, 0))
+        assert "Change since last run: bit rot 1 → 3" in body
+
+    def test_change_since_last_run_recovery(self):
+        # Previous run had 3 failures; this one is clean.
+        _, body = self._send_and_capture(previous_counts=(3, 0))
+        assert "bit rot 3 → 0" in body
+
+    def test_no_change_line_when_counts_identical(self):
+        _, body = self._send_and_capture(
+            failed=2, failed_files=[{"file_path": "/x"}], previous_counts=(2, 0))
+        assert "Change since last run" not in body
+
+    def test_no_change_line_without_previous_counts(self):
+        _, body = self._send_and_capture(
+            failed=1, failed_files=[{"file_path": "/x"}])
+        assert "Change since last run" not in body
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3960,7 +4001,7 @@ class TestSchemaV3:
             conn.close()
         assert "idx_baseline_checksum" in names
 
-    def test_schema_version_is_three(self, tmp_path):
+    def test_schema_version_is_current(self, tmp_path):
         (tmp_path / "a.txt").write_text("x")
         _run_cli_ok(str(tmp_path))
         db_path = next(tmp_path.glob(".*_rotbyte.db"))
@@ -3972,7 +4013,7 @@ class TestSchemaV3:
         finally:
             conn.close()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] == rotbyte.SCHEMA_VERSION
 
     def test_v2_db_is_upgraded_in_place(self, tmp_path):
         """A v2 database (no idx_baseline_checksum) gains the index on open."""
@@ -4000,7 +4041,52 @@ class TestSchemaV3:
             row = db.conn.execute(
                 "SELECT version FROM schema_version WHERE id = 1"
             ).fetchone()
-            assert row[0] == 3
+            assert row[0] == rotbyte.SCHEMA_VERSION
+        finally:
+            db.close()
+
+    def test_v3_last_run_gains_failed_missing_columns(self, tmp_path):
+        """A v3 database (last_run without failed/missing) is migrated to v4."""
+        db_path = str(tmp_path / ".v3db_rotbyte.db")
+        conn = sqlite3.connect(db_path)
+        try:
+            # v3 last_run had no failed/missing columns.
+            conn.executescript("""
+                CREATE TABLE checksums (
+                    file_path TEXT PRIMARY KEY, file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL, file_mtime TEXT NOT NULL,
+                    checksum TEXT NOT NULL, baseline_checksum TEXT,
+                    algorithm TEXT NOT NULL DEFAULT 'BLAKE2b',
+                    status TEXT NOT NULL DEFAULT 'NEW', first_seen TEXT NOT NULL,
+                    last_verified TEXT NOT NULL, notes TEXT
+                );
+                CREATE TABLE last_run (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), started_at TEXT NOT NULL,
+                    finished_at TEXT, target_dir TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'RUNNING'
+                );
+                CREATE TABLE schema_version (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO schema_version (id, version) VALUES (1, 3);
+                INSERT INTO last_run (id, started_at, finished_at, target_dir, status)
+                VALUES (1, '2020-01-01T00:00:00Z', '2020-01-01T00:01:00Z', '/x', 'COMPLETE');
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        db = rotbyte.ChecksumDB(db_path)
+        try:
+            cols = {r[1] for r in db.conn.execute("PRAGMA table_info(last_run)")}
+            assert "failed" in cols and "missing" in cols
+            assert db.conn.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()[0] == rotbyte.SCHEMA_VERSION
+            # Migrated row has NULL counts → no bogus comparison.
+            assert db.previous_run_counts() is None
+            # And the pre-existing timing survived the migration.
+            assert db.last_run_info()["finished_at"] == "2020-01-01T00:01:00Z"
         finally:
             db.close()
 
@@ -4016,6 +4102,69 @@ class TestSchemaV3:
             conn.execute("SELECT 1").fetchone()
         finally:
             conn.close()
+
+
+class TestNextCalendarRun:
+    """Pure next-fire computation for calendar (full) schedules."""
+
+    def test_soonest_later_today(self):
+        from _rotbyte.helpers import _next_calendar_run
+        now = datetime(2026, 7, 8, 14, 30, 0)
+        nxt, secs = _next_calendar_run([(2, 0), (20, 0)], now)
+        assert (nxt.hour, nxt.minute) == (20, 0)
+        assert secs == 5.5 * 3600
+
+    def test_rolls_over_to_tomorrow(self):
+        from _rotbyte.helpers import _next_calendar_run
+        now = datetime(2026, 7, 8, 14, 30, 0)
+        nxt, secs = _next_calendar_run([(2, 0)], now)
+        assert nxt.day == 9 and nxt.hour == 2
+        assert secs == 11.5 * 3600
+
+    def test_exact_now_rolls_forward(self):
+        """A time equal to now counts as passed → next day, never 0s."""
+        from _rotbyte.helpers import _next_calendar_run
+        now = datetime(2026, 7, 8, 2, 0, 0)
+        nxt, secs = _next_calendar_run([(2, 0)], now)
+        assert nxt.day == 9
+        assert secs == 24 * 3600
+
+    def test_empty_times_returns_none(self):
+        from _rotbyte.helpers import _next_calendar_run
+        assert _next_calendar_run([], datetime(2026, 7, 8, 14, 30, 0)) is None
+
+
+class TestRunTrackingCounts:
+    """last_run failed/missing bookkeeping and last-run timing accessors."""
+
+    def test_start_run_preserves_prior_counts(self, tmp_path):
+        db = rotbyte.ChecksumDB(str(tmp_path / ".rt_rotbyte.db"))
+        try:
+            assert db.previous_run_counts() is None      # no run yet
+            db.start_run("/x")
+            db.finish_run(failed=1, missing=2)
+            # A new run keeps the prior counts until it finishes.
+            db.start_run("/x")
+            assert db.previous_run_counts() == (1, 2)
+            db.finish_run(failed=0, missing=0)
+            assert db.previous_run_counts() == (0, 0)
+        finally:
+            db.close()
+
+    def test_last_run_info_reports_finished_and_running(self, tmp_path):
+        db = rotbyte.ChecksumDB(str(tmp_path / ".rt2_rotbyte.db"))
+        try:
+            assert db.last_run_info() is None
+            db.start_run("/x")
+            info = db.last_run_info()
+            assert info["status"] == "RUNNING"
+            assert info["finished_at"] is None
+            db.finish_run(failed=0, missing=0)
+            info = db.last_run_info()
+            assert info["status"] == "COMPLETE"
+            assert info["finished_at"] is not None
+        finally:
+            db.close()
 
 
 class TestPreventSleep:

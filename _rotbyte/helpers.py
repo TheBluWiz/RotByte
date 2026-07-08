@@ -11,8 +11,8 @@ import os
 import re as _re
 import shutil
 import sys
-from datetime import datetime, timezone
-from typing import Tuple
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 
 # rotbyte calls os.path.realpath() in many hot paths: skip-file dedup,
@@ -134,6 +134,33 @@ def _format_clock_time(hour: int, minute: int) -> str:
     if minute:
         return f"{display_hour}:{minute:02d} {ampm}"
     return f"{display_hour} {ampm}"
+
+
+def _next_calendar_run(times: List[Tuple[int, int]],
+                       now: datetime) -> Optional[Tuple[datetime, float]]:
+    """Return the soonest future occurrence of a set of daily clock times.
+
+    ``times`` is a list of ``(hour, minute)`` daily fire times (as stored in
+    a full-scan schedule); ``now`` is the reference moment (pass a
+    timezone-aware local ``datetime``). Returns ``(next_dt, seconds_until)``
+    for the earliest time that is strictly after ``now`` — rolling over to
+    tomorrow when today's slot has already passed — or ``None`` when
+    ``times`` is empty.
+
+    Pure (takes ``now`` explicitly) so it is deterministic to test; only
+    calendar-based schedules are computed — interval timers fire relative to
+    an opaque load time the scheduler doesn't expose.
+    """
+    if not times:
+        return None
+    candidates = []
+    for hour, minute in times:
+        cand = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if cand <= now:
+            cand = cand + timedelta(days=1)
+        candidates.append(cand)
+    nxt = min(candidates)
+    return nxt, (nxt - now).total_seconds()
 
 
 def _utc_to_local(utc_iso: str) -> str:
