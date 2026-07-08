@@ -314,6 +314,7 @@ Examples:
   rotbyte --untrack /Volumes/Media       Remove scheduled scans for one directory
   rotbyte --untrack-all                  Remove every scheduled rotbyte run
   rotbyte --status                       Show all scheduled scans and health
+  rotbyte --repair                       Fix scheduled scans after an upgrade
 
 Exit codes:
   0  All files verified OK

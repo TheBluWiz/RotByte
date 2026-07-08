@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 — 2026-07-07
+## 1.2.0 — 2026-07-08
 
 ### Added
 - **`--repair` re-points broken scheduled scans after an upgrade.** Installed launchd plists / systemd units pin an absolute interpreter + script path; a Homebrew upgrade that deletes the old path leaves every scheduled run failing silently at exec. `--repair` rewrites each installed schedule in place to the executable this rotbyte resolves to today and reloads it, preserving every flag (`--due`, `--budget`, `--notify`, `--auto-export`, …) and the target directory. Idempotent — schedules already on the current path are reported and left untouched. macOS (launchd) and Linux (systemd) rewrite in place; Windows tasks use stable paths and need no repair. The Homebrew formula's `caveats` now tells users to run it after `brew upgrade` (Homebrew sandboxes `post_install`, so it can't be automatic)
