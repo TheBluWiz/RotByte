@@ -18,8 +18,11 @@ from typing import List, Optional, Tuple
 # rotbyte calls os.path.realpath() in many hot paths: skip-file dedup,
 # exclude-dir normalisation, scheduler discovery, and --verify-file DB
 # lookup. Each call is a syscall chain that resolves symlinks. rotbyte
-# is one-shot, so a process-scoped LRU cache is safe and bounded.
-@functools.lru_cache(maxsize=None)
+# is one-shot, so a process-scoped LRU cache is safe. maxsize is bounded
+# (not None) so scanning a huge tree can't grow the cache to hundreds of
+# MB — 8192 entries covers the repeatedly-resolved paths (db files,
+# exclude dirs) while capping worst-case memory.
+@functools.lru_cache(maxsize=8192)
 def _resolve(path: str) -> str:
     """Cached ``os.path.realpath`` for the lifetime of this process.
 
@@ -174,7 +177,13 @@ def _utc_to_local(utc_iso: str) -> str:
     clean = utc_iso
     if "." in clean:
         clean = clean[:clean.index(".")] + "Z"
-    dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    # A malformed or Z-less timestamp would make strptime raise ValueError
+    # and take down the whole display path. Degrade gracefully by showing
+    # the raw stored value instead of crashing.
+    try:
+        dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return utc_iso
     local = dt.astimezone()
     # Get timezone abbreviation
     tz_name = local.strftime("%Z")

@@ -2,7 +2,7 @@
 
 Passwords are routed through the platform credential store at setup
 time: macOS Keychain (``security``), Windows Credential Manager
-(``cmdkey`` + ``CredReadW`` via ctypes), Linux libsecret (``secret-tool``)
+(``CredWriteW`` + ``CredReadW`` via ctypes), Linux libsecret (``secret-tool``)
 when available. Falls back to plaintext ``notify.conf`` with chmod 0600
 and a stderr warning when no platform store is usable.
 """
@@ -12,11 +12,13 @@ from __future__ import annotations
 import configparser
 import email.mime.multipart
 import email.mime.text
+import getpass
 import html as _html
 import os
 import shutil
 import smtplib
 import socket
+import ssl
 import subprocess as _subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -44,17 +46,21 @@ def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
     (macOS), ``"secret-service"`` (Linux libsecret), ``"credential-manager"``
     (Windows), or ``"plaintext"`` if no platform store was usable.
 
-    Shells out to platform tools so rotbyte stays stdlib-only:
-      - macOS:   ``security add-generic-password -U``
+    Uses platform tools/APIs so rotbyte stays stdlib-only:
+      - macOS:   ``security add-generic-password -U`` (secret fed via stdin)
       - Linux:   ``secret-tool store`` (from libsecret-tools, optional)
-      - Windows: ``cmdkey /generic:...``
+      - Windows: Win32 ``CredWriteW`` via ctypes
     """
     if _IS_MACOS:
         try:
+            # Pass ``-w`` with no value and feed the secret over stdin so the
+            # password never appears in the process argv (visible via `ps`).
+            # `security` prompts for the password and a retype, so feed it
+            # twice.
             _subprocess.run(
                 ["security", "add-generic-password",
-                 "-U", "-a", account, "-s", _KEYCHAIN_SERVICE,
-                 "-w", password],
+                 "-U", "-a", account, "-s", _KEYCHAIN_SERVICE, "-w"],
+                input=f"{password}\n{password}\n",
                 check=True, capture_output=True, text=True, timeout=10,
             )
             return True, "keychain"
@@ -62,17 +68,15 @@ def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
                 _subprocess.TimeoutExpired):
             return False, "plaintext"
     if _IS_WINDOWS:
+        # Write via CredWriteW rather than `cmdkey /pass:...` so the password
+        # never lands in the process argv (visible via tasklist).
         target = f"{_KEYCHAIN_SERVICE}:{account}"
         try:
-            _subprocess.run(
-                ["cmdkey", f"/generic:{target}", f"/user:{account}",
-                 f"/pass:{password}"],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-            return True, "credential-manager"
-        except (FileNotFoundError, _subprocess.CalledProcessError,
-                _subprocess.TimeoutExpired):
-            return False, "plaintext"
+            if _windows_credential_set(target, account, password):
+                return True, "credential-manager"
+        except OSError:
+            pass
+        return False, "plaintext"
     # Linux (and any other POSIX): try libsecret if present, else plaintext.
     if shutil.which("secret-tool"):
         try:
@@ -175,13 +179,76 @@ def _windows_credential_get(target: str) -> Optional[str]:
         if size <= 0:
             return ""
         blob = ctypes.string_at(cred.CredentialBlob, size)
-        # cmdkey stores generic credentials as UTF-16-LE.
+        # Generic credentials are stored as UTF-16-LE (see
+        # _windows_credential_set, which writes them the same way).
         try:
             return blob.decode("utf-16-le").rstrip("\x00")
         except UnicodeDecodeError:
             return None
     finally:
         advapi32.CredFree(cred_ptr)
+
+
+def _windows_credential_set(target: str, username: str, password: str) -> bool:
+    """Store a Windows generic credential by target name via Win32 CredWriteW.
+
+    Writes ``password`` as the credential blob (UTF-16-LE, matching what
+    ``_windows_credential_get`` reads back), overwriting any existing entry
+    for ``target``. Returns True on success, False on failure. ctypes is
+    stdlib so this keeps rotbyte's zero-runtime-deps guarantee on Windows,
+    and the secret never touches the process argv.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+
+    CRED_TYPE_GENERIC = 1
+    CRED_PERSIST_LOCAL_MACHINE = 2
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD]
+
+    blob = password.encode("utf-16-le")
+    # Keep this buffer alive until CredWriteW returns — CredentialBlob points
+    # into it. create_string_buffer(blob, len(blob)) holds exactly the blob
+    # bytes with no extra trailing NUL, matching CredentialBlobSize.
+    blob_buf = ctypes.create_string_buffer(blob, len(blob))
+
+    cred = CREDENTIAL()
+    cred.Flags = 0
+    cred.Type = CRED_TYPE_GENERIC
+    cred.TargetName = target
+    cred.Comment = None
+    cred.CredentialBlobSize = len(blob)
+    cred.CredentialBlob = ctypes.cast(blob_buf, ctypes.POINTER(ctypes.c_byte))
+    cred.Persist = CRED_PERSIST_LOCAL_MACHINE
+    cred.AttributeCount = 0
+    cred.Attributes = None
+    cred.TargetAlias = None
+    cred.UserName = username
+
+    return bool(advapi32.CredWriteW(ctypes.byref(cred), 0))
 
 
 def _notify_config_path() -> str:
@@ -247,6 +314,30 @@ def _load_notify_config() -> configparser.ConfigParser:
     return config
 
 
+def _smtp_connect(host: str, port: int, timeout: float) -> smtplib.SMTP:
+    """Open a certificate-verifying SMTP connection.
+
+    Port 465 uses implicit TLS via ``SMTP_SSL``; every other port connects
+    in the clear and immediately upgrades with ``STARTTLS``. Both paths use
+    ``ssl.create_default_context()``, which verifies the server certificate
+    chain and hostname (unlike a bare ``starttls()``, which does neither).
+
+    The returned server is a context manager, so callers use it under
+    ``with``. On a STARTTLS failure the plaintext socket is closed before
+    the exception propagates so it is not leaked.
+    """
+    ctx = ssl.create_default_context()
+    if port == 465:
+        return smtplib.SMTP_SSL(host, port, context=ctx, timeout=timeout)
+    server = smtplib.SMTP(host, port, timeout=timeout)
+    try:
+        server.starttls(context=ctx)
+    except Exception:
+        server.close()
+        raise
+    return server
+
+
 def _run_notify_setup():
     """Interactive setup for email notifications."""
     print("═" * 60)
@@ -264,14 +355,22 @@ def _run_notify_setup():
         sys.exit(1)
 
     smtp_port_str = input("  SMTP port [587]: ").strip()
-    smtp_port = int(smtp_port_str) if smtp_port_str else 587
+    if smtp_port_str:
+        try:
+            smtp_port = int(smtp_port_str)
+        except ValueError:
+            print(f"  Warning: '{smtp_port_str}' is not a valid port number — "
+                  "using default 587.", file=sys.stderr)
+            smtp_port = 587
+    else:
+        smtp_port = 587
 
     username = input("  Username (your email address): ").strip()
     if not username:
         print("Error: Username is required.", file=sys.stderr)
         sys.exit(1)
 
-    password = input("  Password / app password: ").strip()
+    password = getpass.getpass("  Password / app password: ").strip()
     if not password:
         print("Error: Password is required.", file=sys.stderr)
         sys.exit(1)
@@ -291,8 +390,7 @@ def _run_notify_setup():
     print()
     print("  Testing connection...", end="", flush=True)
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-            server.starttls()
+        with _smtp_connect(smtp_host, smtp_port, timeout=15) as server:
             server.login(username, password)
 
             msg = email.mime.text.MIMEText(
@@ -336,8 +434,15 @@ def _run_notify_setup():
         email_section["password"] = password
         email_section["password_backend"] = "plaintext"
     config["email"] = email_section
-    with open(config_path, "w") as f:
+    # Create the file restricted from the start (0600) rather than writing
+    # under the umask and chmod'ing afterwards — otherwise a plaintext
+    # password is briefly world-readable between write and chmod. On Windows
+    # the mode bits are best-effort, which is fine here.
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         config.write(f)
+    # Belt-and-suspenders: tighten an already-existing file, whose perms
+    # O_CREAT would not have changed.
     os.chmod(config_path, 0o600)
 
     print(f"  Config saved to {config_path}")
@@ -355,6 +460,20 @@ def _run_notify_setup():
     print("  Usage:")
     print("    rotbyte --check --notify email /Volumes/Media")
     print("    rotbyte --track --notify email --every 1h /Volumes/Media")
+
+
+def _problem_detail(failed: int, count_missing: int) -> List[str]:
+    """Human-readable phrases for the detected problems.
+
+    Shared verbatim by the subject line and the HTML body so both stay in
+    lockstep — e.g. ``["bit rot in 3 files", "1 file missing"]``.
+    """
+    detail: List[str] = []
+    if failed > 0:
+        detail.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
+    if count_missing > 0:
+        detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+    return detail
 
 
 def _send_email_notification(target_dir: str, failed: int, count_missing: int,
@@ -449,11 +568,7 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         subject_parts.append("(interrupted)")
     subject = " ".join(subject_parts)
     if has_problems:
-        detail = []
-        if failed > 0:
-            detail.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
-        if count_missing > 0:
-            detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+        detail = _problem_detail(failed, count_missing)
         subject += f" — {', '.join(detail)}"
     subject += f" — {target_dir}"
     # Host trails the subject so inbox rules can group by machine without
@@ -553,9 +668,8 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         msg.attach(email.mime.text.MIMEText(body, "plain", "utf-8"))
         msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
 
-        with smtplib.SMTP(section["smtp_host"], int(section["smtp_port"]),
-                          timeout=30) as server:
-            server.starttls()
+        with _smtp_connect(section["smtp_host"], int(section["smtp_port"]),
+                           timeout=30) as server:
             server.login(section["username"], section["password"])
             server.sendmail(from_addr, [section["to"]], msg.as_string())
     except Exception as e:  # noqa: BLE001 — best-effort notification
@@ -628,11 +742,7 @@ def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
     parts.append('</table>')
 
     if has_problems:
-        detail = []
-        if failed > 0:
-            detail.append(f"bit rot in {failed} file{'s' if failed != 1 else ''}")
-        if count_missing > 0:
-            detail.append(f"{count_missing} file{'s' if count_missing != 1 else ''} missing")
+        detail = _problem_detail(failed, count_missing)
         parts.append(f'<p style="font-size:14px;margin:0 0 12px;">'
                      f'rotbyte detected <strong>{esc(", ".join(detail))}</strong>.</p>')
     else:

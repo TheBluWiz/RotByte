@@ -236,7 +236,10 @@ def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
     quick_name = f"rotbyte-quick-{dhash}"
     quick_path = f"\\rotbyte\\{quick_name}"
     interval_iso = _iso_duration(every_seconds)
-    # Start trigger a minute from now so the task has a concrete StartBoundary.
+    # Anchor the trigger at the current time so the task has a concrete
+    # StartBoundary; the <Repetition><Interval> below drives every run after
+    # that, so a StartBoundary in the (immediate) past is fine and simply
+    # lets the first repetition fire right away.
     start = datetime.now().replace(microsecond=0).isoformat()
     quick_triggers = (
         '<Triggers>\n'
@@ -259,10 +262,7 @@ def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
     with open(quick_xml_path, "wb") as f:
         f.write(quick_xml.encode("utf-16"))
 
-    _subprocess.run(
-        ["schtasks.exe", "/Create", "/TN", quick_path, "/XML", quick_xml_path, "/F"],
-        check=True,
-    )
+    _create_task_or_cleanup(quick_path, quick_xml_path)
     print(f"  ✓ Installed: {quick_path}")
 
     # ── Full scan ──────────────────────────────────────────────────────
@@ -294,11 +294,33 @@ def _install_schtasks(target_dir: str, dhash: str, quick_cmd: List[str],
         full_xml_path = os.path.join(tasks_dir, f"{full_name}.xml")
         with open(full_xml_path, "wb") as f:
             f.write(full_xml.encode("utf-16"))
-        _subprocess.run(
-            ["schtasks.exe", "/Create", "/TN", full_task_path, "/XML", full_xml_path, "/F"],
-            check=True,
-        )
+        _create_task_or_cleanup(full_task_path, full_xml_path)
         print(f"  ✓ Installed: {full_task_path}")
+
+
+def _create_task_or_cleanup(task_path: str, xml_path: str) -> None:
+    """Register a task via ``schtasks /Create``; on failure clean up and raise.
+
+    Replaces a bare ``check=True`` so a rejected /Create doesn't dump a
+    traceback and doesn't leave its input XML lingering in the tasks dir.
+    The successful path is unchanged — the XML file is kept on success, as
+    before. The caller (_run_track) turns the RuntimeError into a friendly
+    message.
+    """
+    result = _subprocess.run(
+        ["schtasks.exe", "/Create", "/TN", task_path, "/XML", xml_path, "/F"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        try:
+            os.unlink(xml_path)
+        except OSError:
+            pass
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"schtasks /Create {task_path} failed (exit {result.returncode})"
+            + (f": {detail}" if detail else "")
+        )
 
 
 def _uninstall_schtasks(target_dir: str) -> Tuple[List[str], List[str]]:
@@ -319,6 +341,16 @@ def _uninstall_all_schtasks() -> Tuple[List[str], List[str]]:
     discovered = _discover_schtasks()
     names: List[str] = []
     for target_dir in discovered:
+        # NOTE (fragility, left intentionally): the target_dir keys come from
+        # regex-parsing the task Description ("rotbyte * scan (TARGET)") in
+        # _parse_schtasks_xml, and we re-derive the task name by re-hashing
+        # that recovered path. If a Description were ever truncated or a path
+        # contained an unbalanced ")", the recovered target would hash to a
+        # different dhash and the real task would be missed. Deleting by the
+        # discovered task NAMES directly would be more robust, but discovery
+        # doesn't currently surface the registered "\rotbyte\<name>" URIs and
+        # threading them through would change the well-tested discovery shape,
+        # so we prefer the safe, minimal change of documenting the coupling.
         dhash = _dir_hash(target_dir)
         names.extend([f"rotbyte-quick-{dhash}", f"rotbyte-full-{dhash}"])
     return _delete_tasks(names)

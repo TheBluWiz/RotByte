@@ -78,7 +78,7 @@ class PreventSleep:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except (OSError, FileNotFoundError):
+        except OSError:  # FileNotFoundError is a subclass of OSError
             self._caffeinate = None
 
     def _set_execution_state(self) -> None:

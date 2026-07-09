@@ -15,6 +15,38 @@ from typing import Optional
 from .helpers import _format_size, _is_tty, _term_width
 
 
+def _enable_windows_vt() -> None:
+    """Enable ANSI escape handling on legacy Windows consoles.
+
+    The spinner/progress renderers emit VT sequences ('\\r\\033[2K'). On
+    Windows 10+ these only render if virtual-terminal processing is turned
+    on for the console; otherwise they show as literal garbage. Flip the
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING bit on stdout and stderr once, via
+    ctypes (stdlib — no third-party dependency). A no-op everywhere but
+    Windows, and best-effort: any failure (old console, redirected handle)
+    is swallowed so a non-tty / automation path is unaffected.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(
+                    handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                )
+    except Exception:  # noqa: BLE001 — best-effort; never break rendering
+        pass
+
+
+_enable_windows_vt()
+
+
 class Spinner:
     """Animated spinner for indeterminate-length blocking operations.
 
@@ -82,7 +114,7 @@ class Spinner:
 
     @staticmethod
     def _clear_line():
-        print(f"\r\033[2K", end="", file=sys.stderr, flush=True)
+        print("\r\033[2K", end="", file=sys.stderr, flush=True)
 
 
 class ProgressBar:

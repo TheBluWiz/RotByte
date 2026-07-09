@@ -60,6 +60,7 @@ from _rotbyte.database import (
     LEGACY_DB_FILENAME_SUFFIX,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SchemaTooNewError,
     _migrate_legacy_db_name,
 )
 from _rotbyte.hashing import (
@@ -288,6 +289,21 @@ def print_report(db: ChecksumDB, stale_days: int = 90):
 # ── Main orchestration ─────────────────────────────────────────────────────────
 
 def main():
+    # Force UTF-8 on stdout/stderr before any output. The tool prints
+    # box-drawing (═), status glyphs (✓ ✗ ⚠), and bar glyphs (█) — including
+    # on the quiet/problem path — which raise UnicodeEncodeError when the
+    # stream is bound to a non-UTF-8 encoding (e.g. a Windows redirect/pipe
+    # such as `rotbyte --check > run.log`). errors="replace" keeps a bad
+    # console from crashing a scan. The --json path is unaffected:
+    # json.dumps defaults to ensure_ascii=True and is already safe.
+    for _stream in (sys.stdout, sys.stderr):
+        reconfig = getattr(_stream, "reconfigure", None)
+        if reconfig is not None:
+            try:
+                reconfig(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
     parser = argparse.ArgumentParser(
         prog="rotbyte",
         description="Detect bit rot by tracking BLAKE2b checksums in a SQLite database.",
@@ -344,7 +360,7 @@ Exit codes:
                         help="Print status report and exit")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Only output problems (for cron jobs and automation)")
-    parser.add_argument("--workers", type=int, default=os.cpu_count() or 4,
+    parser.add_argument("--workers", type=int, default=None,
                         help=f"Parallel hashing workers (default: {os.cpu_count() or 4})")
     parser.add_argument("--skip-missing", action="store_true",
                         help="Don't check for files that have been removed")
@@ -513,8 +529,8 @@ Exit codes:
             lock.release()
         return
 
-    # Validate --workers
-    if args.workers < 1:
+    # Validate --workers (None means "not passed — use the host default")
+    if args.workers is not None and args.workers < 1:
         print("Error: --workers must be at least 1.", file=sys.stderr)
         sys.exit(1)
 
@@ -593,8 +609,10 @@ Exit codes:
                     sys.exit(1)
 
         rotbyte_exe = _find_rotbyte_executable()
-        # Only pass --workers through if explicitly set (not the default)
-        track_workers = args.workers if args.workers != (os.cpu_count() or 4) else None
+        # Only pass --workers through if explicitly set. args.workers is None
+        # unless the user passed --workers, so an explicit value equal to the
+        # host default is now recorded instead of being silently dropped.
+        track_workers = args.workers
         _run_track(target_dir, every_seconds, full_at_times,
                    args.budget_seconds, rotbyte_exe, workers=track_workers,
                    due_days=args.due_days, notify=args.notify,
@@ -623,6 +641,14 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     # automation can distinguish a corrupted tripwire from normal findings.
     try:
         db = ChecksumDB(db_path)
+    except SchemaTooNewError as e:
+        # A healthy DB from a newer rotbyte — not corruption. Tell the user
+        # to upgrade rather than to delete their intact history.
+        print(f"Error: Could not open database — {e}", file=sys.stderr)
+        print(f"  Path: {db_path}", file=sys.stderr)
+        print("  This database was created by a newer version of rotbyte.", file=sys.stderr)
+        print("  Upgrade rotbyte to the latest version and try again.", file=sys.stderr)
+        sys.exit(EXIT_DB_CORRUPT)
     except sqlite3.DatabaseError as e:
         print(f"Error: Could not open database — {e}", file=sys.stderr)
         print(f"  Path: {db_path}", file=sys.stderr)
@@ -649,8 +675,12 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     # Informational one-liner when the DB lives on a different volume than
     # the data it tracks — the recommended durability pattern. Silent when
     # they share a volume (no nagging users on default layouts). Suppressed
-    # in quiet and JSON modes.
-    if not getattr(args, "quiet", False) and not getattr(args, "json_output", False):
+    # in quiet and JSON modes, and in single-file --verify-file mode (a
+    # scripting mode with documented 0/1/2 exit codes whose stdout must not
+    # carry this human banner).
+    if (not getattr(args, "quiet", False)
+            and not getattr(args, "json_output", False)
+            and not getattr(args, "verify_file", None)):
         try:
             if os.stat(target_dir).st_dev != os.stat(db_path).st_dev:
                 print("  DB on separate volume: ✓")
@@ -701,8 +731,9 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
             print("\n  Aborting immediately.\n", file=sys.stderr)
             sys.exit(EXIT_INTERRUPTED)
         interrupted[0] = True
-        print("\n\n  Interrupt received — finishing current batch and saving progress...")
-        print("  Press Ctrl-C again to abort immediately.\n")
+        print("\n\n  Interrupt received — finishing current batch and saving progress...",
+              file=sys.stderr)
+        print("  Press Ctrl-C again to abort immediately.\n", file=sys.stderr)
 
     # SIGTERM is POSIX-only; Windows delivers CTRL_BREAK_EVENT etc. instead.
     # We register SIGINT everywhere and SIGTERM only where it exists.
@@ -734,7 +765,7 @@ def _auto_export_manifest(db: ChecksumDB, manifest_path: str,
     records = db.all_records()
     tmp_path = manifest_path + ".tmp"
     count = 0
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         for r in records:
             if r["status"] == "MISSING":
                 continue
@@ -760,12 +791,12 @@ def _run_export(db: ChecksumDB, export_path: str):
         sys.exit(1)
 
     try:
-        with open(export_path, "w") as f:
+        with open(export_path, "w", encoding="utf-8") as f:
             for r in records:
                 if r["status"] == "MISSING":
                     continue
                 f.write(f"{r['baseline_checksum']}  {r['file_path']}\n")
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         print(f"Error: Could not write to {export_path} — {e}", file=sys.stderr)
         sys.exit(EXIT_IO)
 
@@ -845,9 +876,9 @@ def _run_import(db: ChecksumDB, target_dir: str, include_hidden: bool = False,
 
         # Parse the hash (format: "<128 hex chars>  <filename>")
         try:
-            with open(hash_path, "r") as f:
+            with open(hash_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read().strip()
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             print(f"  ✗ Cannot read {hash_path}: {e}")
             errors += 1
             continue
@@ -1088,6 +1119,21 @@ def _run_accept_all(db: ChecksumDB, target_dir: str):
 def _run_track_setup(path_arg: str):
     """Interactive setup wizard for --track.
 
+    Thin guard around the wizard body: Ctrl-C (KeyboardInterrupt) or a
+    closed/piped stdin (EOFError) at any prompt aborts cleanly with the
+    interrupted exit code instead of dumping a traceback. The normal flow
+    (including the "Install? [Y/n]" → "Aborted." early return) is unchanged.
+    """
+    try:
+        _run_track_setup_wizard(path_arg)
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Aborted.", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPTED)
+
+
+def _run_track_setup_wizard(path_arg: str):
+    """Interactive setup wizard body for --track.
+
     Collects the same inputs --track accepts as flags, validating each with
     the existing parsers, then calls _run_track() to perform the actual
     platform install. No install logic is duplicated here.
@@ -1268,7 +1314,7 @@ def _run_status():
             print(f"    Quick : every {_format_duration(q['interval'])}".ljust(40)
                   + _schedule_health_label(q))
         else:
-            print(f"    Quick : (not configured)")
+            print("    Quick : (not configured)")
 
         # Full scan info
         if info.get("full"):
@@ -1299,7 +1345,7 @@ def _run_status():
                     print(f"            next {_format_clock_time(ndt.hour, ndt.minute)}"
                           f" (in {_format_duration(secs)})")
         else:
-            print(f"    Full  : (not configured)")
+            print("    Full  : (not configured)")
 
         # Notification state — shown for every tracked dir so a schedule
         # installed without --notify is visible rather than silently mute.
@@ -1316,21 +1362,21 @@ def _run_status():
                    or (info.get("full") or {}).get("missing_exe"))
         if missing:
             print(f"    ⚠ Scheduled command is broken: {missing} no longer exists.")
-            print(f"      Every scheduled run is failing. Re-run --track for this")
-            print(f"      directory to regenerate the schedule.")
+            print("      Every scheduled run is failing. Re-run --track for this")
+            print("      directory to regenerate the schedule.")
 
         # Database health
         db_name = "." + os.path.basename(target_dir) + DB_FILENAME_SUFFIX
         db_path = os.path.join(target_dir, db_name)
 
         if not os.path.isfile(db_path):
-            print(f"    Last  : no database yet (first scan has not run)")
+            print("    Last  : no database yet (first scan has not run)")
             continue
 
         try:
             db = ChecksumDB(db_path)
         except sqlite3.DatabaseError:
-            print(f"    Last  : database error (may be corrupt)")
+            print("    Last  : database error (may be corrupt)")
             continue
 
         try:
@@ -1351,7 +1397,7 @@ def _run_status():
                 if last:
                     print(f"    Last  : {_utc_to_local(last)}")
                 else:
-                    print(f"    Last  : no scans completed yet")
+                    print("    Last  : no scans completed yet")
 
             counts = db.status_counts()
             if counts:
@@ -1409,6 +1455,10 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     budget_seconds = getattr(args, "budget_seconds", None)
     due_days = getattr(args, "due_days", None)
     case_insensitive = getattr(args, "case_insensitive", False)
+    # --workers defaults to None ("not passed"); resolve to the host default
+    # only here, at the point of use, so an explicit value is preserved for
+    # recording in a scheduled command.
+    workers = args.workers if args.workers is not None else (os.cpu_count() or 4)
 
     if not quiet:
         print("═" * 60)
@@ -1416,7 +1466,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         print("═" * 60)
         print(f"  Directory  : {target_dir}")
         print(f"  Database   : {db.db_path}")
-        print(f"  Workers    : {args.workers}")
+        print(f"  Workers    : {workers}")
         mode = "full re-verify (--check)" if args.check else "quick (changed files only)"
         if due_days:
             mode = f"due files only (not verified in {due_days}d)"
@@ -1476,7 +1526,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     now = _now()
     start_time = time.monotonic()
     try:
-        result = run_hashing(db, to_hash, args.workers, now, interrupted, quiet,
+        result = run_hashing(db, to_hash, workers, now, interrupted, quiet,
                              budget_seconds=budget_seconds)
     except Exception as e:
         # Unexpected worker-pool or orchestration failure — exit with the
@@ -1617,7 +1667,7 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         manifest_path = db.db_path + ".manifest"
         try:
             _auto_export_manifest(db, manifest_path, args)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             print(f"  ! auto-export failed: {e}", file=sys.stderr)
 
     if result.failed > 0:

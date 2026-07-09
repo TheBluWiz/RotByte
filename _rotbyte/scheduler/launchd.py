@@ -13,6 +13,17 @@ from . import (_exe_prefix_current, _exe_prefix_len, _missing_command_path,
                _parse_cmd_flags, _repair_exe_prefix)
 
 
+def _launch_agents_dir() -> str:
+    """Return ``~/Library/LaunchAgents``, resolved fresh on each call.
+
+    Kept as a function (rather than an import-time constant) so it honors a
+    later-patched ``$HOME`` / ``os.path.expanduser`` — the test suite
+    redirects HOME per-test — while still giving every function in this
+    module one source of truth for the LaunchAgents directory.
+    """
+    return os.path.expanduser("~/Library/LaunchAgents")
+
+
 def _launchd_log_path(label: str) -> str:
     """Return the rotated log path for a launchd job label.
 
@@ -95,7 +106,7 @@ def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
                      every_seconds: int, full_cmd: Optional[List[str]],
                      full_at: Optional[List[Tuple[int, int]]]):
     """Write and load macOS launchd plist files."""
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    agents_dir = _launch_agents_dir()
     os.makedirs(agents_dir, exist_ok=True)
     # Logs live under ~/Library/Logs/rotbyte/ (matches XDG/AppData on
     # other platforms and survives reboots, unlike /tmp). Created up
@@ -118,7 +129,7 @@ def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
     )
     with open(quick_plist, "w") as f:
         f.write(plist_content)
-    _subprocess.run(["launchctl", "load", quick_plist], check=True)
+    _load_or_cleanup(quick_plist)
     print(f"  ✓ Installed: {quick_plist}")
 
     if full_cmd and full_at:
@@ -134,8 +145,30 @@ def _install_launchd(target_dir: str, dhash: str, quick_cmd: List[str],
         )
         with open(full_plist, "w") as f:
             f.write(plist_content)
-        _subprocess.run(["launchctl", "load", full_plist], check=True)
+        _load_or_cleanup(full_plist)
         print(f"  ✓ Installed: {full_plist}")
+
+
+def _load_or_cleanup(plist_path: str) -> None:
+    """``launchctl load`` a plist; on failure unlink it and raise.
+
+    Replaces a bare ``check=True`` so a rejected load doesn't dump a
+    traceback and leave an orphaned, never-loaded plist behind that a
+    future login/reboot might partially adopt. The caller (_run_track)
+    turns the RuntimeError into a friendly message.
+    """
+    result = _subprocess.run(["launchctl", "load", plist_path],
+                             capture_output=True, text=True)
+    if result.returncode != 0:
+        try:
+            os.unlink(plist_path)
+        except OSError:
+            pass
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"launchctl load {plist_path} failed (exit {result.returncode})"
+            + (f": {detail}" if detail else "")
+        )
 
 
 def _uninstall_launchd(target_dir: str) -> Tuple[List[str], List[str]]:
@@ -153,7 +186,7 @@ def _uninstall_launchd(target_dir: str) -> Tuple[List[str], List[str]]:
 
 def _uninstall_all_launchd() -> Tuple[List[str], List[str]]:
     """Bootout and delete every ``com.rotbyte.*`` launchd agent."""
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    agents_dir = _launch_agents_dir()
     plists = sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist")))
     labels = [os.path.basename(p)[: -len(".plist")] for p in plists]
     return _bootout_and_unlink(labels)
@@ -169,7 +202,7 @@ def _bootout_and_unlink(labels: List[str]) -> Tuple[List[str], List[str]]:
     Bootout/unload failures are best-effort (the agent may already be
     stopped); only ``unlink`` failures count as errors.
     """
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    agents_dir = _launch_agents_dir()
     removed: List[str] = []
     errors: List[str] = []
     uid = os.getuid()
@@ -244,7 +277,7 @@ def _repair_launchd(fresh_exe: List[str]) -> Tuple[List[Tuple[str, str, str, str
     rewritten plist is reloaded (``unload`` then ``load``) because launchd
     ignores on-disk edits to an already-loaded agent.
     """
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    agents_dir = _launch_agents_dir()
     repaired: List[Tuple[str, str, str, str]] = []
     already_ok: List[str] = []
     errors: List[str] = []
@@ -296,7 +329,7 @@ def _repair_launchd(fresh_exe: List[str]) -> Tuple[List[Tuple[str, str, str, str
 
 def _discover_launchd() -> Dict[str, Dict]:
     """Parse installed launchd plists to discover tracked directories."""
-    agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    agents_dir = _launch_agents_dir()
     tracked: Dict[str, Dict] = {}
 
     for plist_path in sorted(_glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist"))):

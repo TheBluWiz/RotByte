@@ -637,6 +637,54 @@ class TestSchemaMigration:
         assert version["version"] == rotbyte.SCHEMA_VERSION
         db.close()
 
+    def test_empty_legacy_db_migrates_not_bricked(self, tmp):
+        """Regression: an EMPTY pre-versioning DB (checksums table present but
+        no baseline_checksum column, no schema_version row, zero rows) must be
+        recognised as legacy and migrated. The old row-count heuristic misread
+        it as fresh, stamped it version=SCHEMA_VERSION, skipped the
+        baseline_checksum migration, then failed index creation — permanently
+        bricking an intact DB and reporting it to the user as corrupt."""
+        db_path = str(tmp / ".empty_legacy_checksums.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE checksums (
+                file_path TEXT PRIMARY KEY, file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL, file_mtime TEXT NOT NULL,
+                checksum TEXT NOT NULL, algorithm TEXT NOT NULL DEFAULT 'BLAKE2b',
+                status TEXT NOT NULL DEFAULT 'NEW', first_seen TEXT NOT NULL,
+                last_verified TEXT NOT NULL, notes TEXT
+            );
+            CREATE TABLE last_run (
+                id INTEGER PRIMARY KEY CHECK (id = 1), started_at TEXT NOT NULL,
+                finished_at TEXT, target_dir TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'RUNNING'
+            );
+        """)
+        conn.close()  # note: no schema_version table, checksums left EMPTY
+
+        db = rotbyte.ChecksumDB(db_path)  # must NOT raise
+        cols = [r[1] for r in db.conn.execute("PRAGMA table_info(checksums)")]
+        assert "baseline_checksum" in cols
+        version = db.conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+        assert version["version"] == rotbyte.SCHEMA_VERSION
+        db.close()
+
+    def test_newer_schema_refused_with_upgrade_message(self, tmp):
+        """A DB written by a newer rotbyte must be refused as SchemaTooNewError
+        (a DatabaseError subclass), not silently operated on and not misreported
+        as corrupt."""
+        db_path = str(tmp / ".newer_checksums.db")
+        db = rotbyte.ChecksumDB(db_path)
+        db.conn.execute("UPDATE schema_version SET version = ? WHERE id = 1",
+                        (rotbyte.SCHEMA_VERSION + 1,))
+        db.conn.commit()
+        db.close()
+
+        from _rotbyte.database import SchemaTooNewError
+        assert issubclass(SchemaTooNewError, sqlite3.DatabaseError)
+        with pytest.raises(SchemaTooNewError):
+            rotbyte.ChecksumDB(db_path)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. File Scanning
@@ -696,14 +744,16 @@ class TestScanFiles:
         files = rotbyte.scan_files(str(empty), db_p)
         assert files == []
 
-    def test_case_insensitive_normalises_to_lowercase(self, tmp, db_path):
-        # With --case-insensitive, returned paths are lowercased so a
-        # rename like "foo.mkv" → "Foo.mkv" doesn't produce a phantom
-        # MISSING on case-insensitive filesystems.
+    def test_case_insensitive_preserves_real_path(self, tmp, db_path):
+        # With --case-insensitive, paths differing only by case are
+        # de-duplicated via a case-folded key, but the real on-disk path
+        # must be returned unchanged. A previous bug lowercased the path,
+        # which broke stat()/open() on case-sensitive filesystems and
+        # silently dropped the file from the scan.
         (tmp / "MixedCase.TXT").write_text("x")
         files = rotbyte.scan_files(str(tmp), db_path, case_insensitive=True)
-        assert all(f == f.lower() for f in files)
-        assert any(f.endswith("mixedcase.txt") for f in files)
+        assert any(f.endswith("MixedCase.TXT") for f in files)
+        assert not any(f.endswith("mixedcase.txt") for f in files)
 
     def test_walk_error_continues(self, tmp, db_path, capsys, monkeypatch):
         # A walk-time OSError (e.g. a network drive vanishing) should
@@ -2310,6 +2360,28 @@ class TestEdgeCases:
         # 4 fixture files + 1 symlink to a.txt = 5 files scanned
         assert data["new"] == 5
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"),
+                        reason="requires POSIX mkfifo / special files")
+    def test_special_files_skipped_without_hanging(self, tmp):
+        """Regression: a FIFO must not make the scan hang forever, a symlink
+        to a character device (/dev/zero) must not loop forever, and a broken
+        symlink must be skipped — while a symlink to a regular file is still
+        hashed. Previously scan_files queued every walked entry and the worker
+        blocked in open()/read(). The scan-time os.stat + S_ISREG filter fixes
+        it; _run_cli's 60s timeout turns a regression into a failure, not a
+        hung suite."""
+        os.mkfifo(tmp / "pipe")                               # open() would block forever
+        (tmp / "link_real.txt").symlink_to(tmp / "a.txt")     # regular target → hashed
+        (tmp / "broken").symlink_to(tmp / "does_not_exist")   # dangling → skipped
+        if os.path.exists("/dev/zero"):
+            os.symlink("/dev/zero", tmp / "link_dev")         # char device → skipped
+        rc, out, err = _run_cli("--json", str(tmp))
+        data = _extract_json(out)
+        # 4 fixture files + the symlink to a regular file = 5; the FIFO, the
+        # device symlink, and the broken symlink are all skipped, no errors.
+        assert data["new"] == 5
+        assert data["errors"] == 0
+
     def test_empty_file_hashes(self, tmp):
         (tmp / "empty.txt").write_bytes(b"")
         _run_cli_ok(str(tmp))
@@ -2939,7 +3011,7 @@ class TestNotifyFreshness:
                 return self
             def __exit__(self, *args):
                 pass
-            def starttls(self):
+            def starttls(self, context=None):
                 pass
             def login(self, user, pwd):
                 pass
@@ -3014,7 +3086,7 @@ class TestNotifyOutcome:
             def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): pass
-            def starttls(self): pass
+            def starttls(self, context=None): pass
             def login(self, *a): pass
             def sendmail(self, frm, to, msg): sent.append(msg)
 
@@ -3195,7 +3267,7 @@ class TestNotifyOutcome:
             def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): pass
-            def starttls(self): pass
+            def starttls(self, context=None): pass
             def login(self, *a): pass
             def sendmail(self, frm, to, msg): sent.append(msg)
 
@@ -3253,7 +3325,7 @@ class TestNotifyOutcome:
             def __init__(s, *a, **k): pass
             def __enter__(s): return s
             def __exit__(s, *a): pass
-            def starttls(s): pass
+            def starttls(s, context=None): pass
             def login(s, *a): pass
             def sendmail(s, fr, to, m): sent.append(m)
 
@@ -4651,7 +4723,7 @@ class TestNotifyFromAddress:
             def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): pass
-            def starttls(self): pass
+            def starttls(self, context=None): pass
             def login(self, *a): pass
             def sendmail(self, frm, to, msg):
                 captured["envelope_from"] = frm

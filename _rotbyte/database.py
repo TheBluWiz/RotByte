@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 SCHEMA_VERSION = 4
 
+
+class SchemaTooNewError(sqlite3.DatabaseError):
+    """The database was written by a newer rotbyte than we understand.
+
+    Subclasses ``sqlite3.DatabaseError`` so callers that only catch the
+    generic open-time error still handle it, while a caller that wants to
+    tell the user "upgrade rotbyte" (rather than "your DB is corrupt") can
+    catch this more specific type first.
+    """
+
+
 # Current DB filename shape: ".{dirname}_rotbyte.db". The leading dot keeps
 # the file hidden on POSIX; the {dirname} prefix keeps DBs distinguishable
 # when users copy them side-by-side onto a backup target.
@@ -85,14 +96,47 @@ class ChecksumDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, isolation_level=None)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Record whether the `checksums` table pre-dates this open, BEFORE
+        # executescript recreates it. _migrate() uses this to tell a truly
+        # fresh database (stamp current schema) from a legacy pre-versioning
+        # one (run the migration chain) without relying on a row-count
+        # heuristic that mis-flags an empty legacy DB as fresh.
+        self._checksums_preexisted = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='checksums'"
+        ).fetchone() is not None
+
+        # WAL silently degrades to a rollback journal on network filesystems
+        # (NFS/SMB) that lack the shared-memory mmap WAL needs — and rotbyte
+        # targets NAS/backup storage. synchronous=NORMAL is only crash-durable
+        # under WAL; when WAL did NOT engage we must use FULL to stay durable.
+        mode = self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if mode and mode.lower() == "wal":
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        else:
+            self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("PRAGMA cache_size=-64000")   # 64 MB cache
         self.conn.execute("PRAGMA busy_timeout=5000")    # wait up to 5s on lock
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
         self._migrate()
         self._ensure_indexes()
+
+        # The DB (and its -wal/-shm sidecars) is created under the process
+        # umask, typically 0644 — world-readable. It holds the full tracked
+        # path/size/checksum inventory, so restrict to owner-only like
+        # notify.conf and the .lock file. chmod is a no-op/raises on some
+        # Windows setups, hence the guard.
+        self._restrict_permissions()
+
+    def _restrict_permissions(self):
+        """Restrict the DB file and its WAL/SHM sidecars to owner-only (0600)."""
+        for path in (self.db_path, self.db_path + "-wal", self.db_path + "-shm"):
+            try:
+                if os.path.exists(path):
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
 
     def _ensure_indexes(self):
         """Create indexes that depend on columns added by migrations.
@@ -117,22 +161,45 @@ class ChecksumDB:
         ).fetchone()
 
         if row is None:
-            # New database or pre-versioning database. Check whether the
-            # checksums table has data to distinguish the two cases.
-            has_data = self.conn.execute(
-                "SELECT 1 FROM checksums LIMIT 1"
-            ).fetchone()
-            current = 1 if has_data else SCHEMA_VERSION
+            # No schema_version row. Distinguish a truly fresh database from
+            # a legacy pre-versioning one STRUCTURALLY, not by row count: an
+            # EMPTY legacy DB was previously misread as fresh, stamped at the
+            # current version, and thereby skipped the migration that adds the
+            # baseline_checksum column — bricking it permanently.
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(checksums)")}
+            has_baseline = "baseline_checksum" in cols
+            if not self._checksums_preexisted:
+                # Brand-new DB: executescript just created the full current
+                # schema. Stamp it and skip migrations.
+                current = SCHEMA_VERSION
+            elif not has_baseline:
+                # Legacy pre-versioning DB missing baseline_checksum. Treat as
+                # v1 and run the migration chain regardless of row count.
+                current = 1
+            else:
+                # Pre-existing DB that already has baseline_checksum but no
+                # schema_version row (v2-shaped). Start at 2 so we skip the
+                # destructive 1→2 backfill (which would clobber the preserved
+                # known-good hash on FAILED rows); later migrations are
+                # idempotent.
+                current = 2
             self.conn.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?)",
                 (current,),
             )
-            if not has_data:
-                return  # Fresh database, schema is already current
         else:
             current = row["version"]
 
-        if current >= SCHEMA_VERSION:
+        if current > SCHEMA_VERSION:
+            # Database written by a newer rotbyte. Refuse rather than silently
+            # operating on a schema we don't understand. SchemaTooNewError
+            # subclasses DatabaseError, so it still flows through the caller's
+            # generic open-time handler if not caught more specifically.
+            raise SchemaTooNewError(
+                "database was created by a newer version of rotbyte; "
+                "please upgrade rotbyte"
+            )
+        if current == SCHEMA_VERSION:
             return
 
         # ── Migration 1 → 2: add baseline_checksum column ────────────
@@ -181,7 +248,12 @@ class ChecksumDB:
         )
 
     def verify_integrity(self) -> bool:
-        """Quick integrity check on the database file itself."""
+        """Quick integrity check on the database file itself.
+
+        Called by the caller's open path immediately after construction as
+        the integrity gate that catches corruption which doesn't prevent the
+        file from opening (exit code EXIT_DB_CORRUPT on failure).
+        """
         result = self.conn.execute("PRAGMA quick_check").fetchone()
         return result is not None and result[0] == "ok"
 
@@ -478,7 +550,12 @@ class ChecksumDB:
         """Return files not verified in the given number of days."""
         rows = self.conn.execute(
             "SELECT file_path, first_seen, last_verified FROM checksums "
-            "WHERE last_verified < datetime('now', ?)",
+            # Stored last_verified is ISO 'YYYY-MM-DDTHH:MM:SSZ'; datetime('now')
+            # yields 'YYYY-MM-DD HH:MM:SS'. Parse both sides so the T/Z don't
+            # break the comparison on the boundary day. rtrim the trailing Z
+            # for portability with SQLite < 3.42, which returns NULL for a
+            # Z-suffixed string.
+            "WHERE datetime(rtrim(last_verified, 'Z')) < datetime('now', ?)",
             (f"-{days} days",),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -512,7 +589,9 @@ class ChecksumDB:
         rows = self.conn.execute(
             "SELECT file_path FROM checksums "
             "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING' "
-            "AND last_verified < datetime('now', ?)",
+            # Parse both sides so the stored 'T'/'Z' ISO form compares
+            # correctly against datetime('now', ?); see stale_files().
+            "AND datetime(rtrim(last_verified, 'Z')) < datetime('now', ?)",
             (escaped_prefix, f"-{days} days"),
         ).fetchall()
         return {r["file_path"] for r in rows}
@@ -564,14 +643,18 @@ class ChecksumDB:
 
         Used to summarize verification coverage when --due is active.
         'verified_within' counts files whose last_verified is within the
-        given day window; 'due' is the remainder (outside window or NULL).
+        given day window; 'due' is the remainder (verified outside the
+        window). last_verified is NOT NULL, so every non-MISSING file falls
+        into exactly one of the two buckets.
         """
         escaped_prefix = self._like_prefix(prefix)[0]
         row = self.conn.execute(
             "SELECT "
             "  count(*) as total, "
-            "  sum(CASE WHEN last_verified >= datetime('now', ?) THEN 1 ELSE 0 END) "
-            "    as verified "
+            # Parse the stored 'T'/'Z' ISO timestamp so the window comparison
+            # is correct on the boundary day; see stale_files().
+            "  sum(CASE WHEN datetime(rtrim(last_verified, 'Z')) >= datetime('now', ?) "
+            "           THEN 1 ELSE 0 END) as verified "
             "FROM checksums "
             "WHERE file_path LIKE ? ESCAPE '\\' AND status != 'MISSING'",
             (f"-{days} days", escaped_prefix),
@@ -617,7 +700,7 @@ def _migrate_legacy_db_name(new_db_path: str) -> None:
     sidecar_suffixes = (".lock", "-wal", "-shm", ".manifest")
     for sfx in sidecar_suffixes:
         if os.path.exists(new_db_path + sfx) and os.path.exists(legacy_path + sfx):
-            print(f"Warning: both legacy and current rotbyte database files present:",
+            print("Warning: both legacy and current rotbyte database files present:",
                   file=sys.stderr)
             print(f"  legacy : {legacy_path}{sfx}", file=sys.stderr)
             print(f"  current: {new_db_path}{sfx}", file=sys.stderr)

@@ -20,8 +20,16 @@ from ..platform import _IS_LINUX, _IS_MACOS, _IS_WINDOWS
 
 
 def _dir_hash(target_dir: str) -> str:
-    """Short hash of the target directory path for unique config naming."""
-    return _hashlib.md5(target_dir.encode()).hexdigest()[:8]
+    """Short hash of the target directory path for unique config naming.
+
+    ``usedforsecurity=False`` (Python 3.9+) marks this as a naming digest,
+    not a security primitive, so it keeps working on FIPS-mode systems
+    (RHEL/CentOS in FIPS mode) where plain ``md5()`` raises ValueError and
+    would otherwise abort every scheduler operation. The digest value is
+    byte-identical to ``md5(...).hexdigest()`` — only the FIPS error
+    behavior changes, so existing config names are unaffected.
+    """
+    return _hashlib.md5(target_dir.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
 # Matches a Homebrew Cellar path: <prefix>/Cellar/<package>/<version>/<rest>.
@@ -281,9 +289,12 @@ def _run_track(target_dir: str, every_seconds: int,
     # don't load launchd tooling on Linux CI).
     from . import launchd, schtasks, systemd
 
+    # Use the imported platform constants as the single source of truth
+    # (previously is_linux was recomputed from sys.platform right next to
+    # the imported _IS_LINUX, which could disagree under test monkeypatching).
     is_mac = _IS_MACOS
     is_windows = _IS_WINDOWS
-    is_linux = sys.platform.startswith("linux")
+    is_linux = _IS_LINUX
 
     if not is_mac and not is_linux and not is_windows:
         print(f"Error: --track is not supported on {sys.platform}.", file=sys.stderr)
@@ -353,7 +364,7 @@ def _run_track(target_dir: str, every_seconds: int,
     if notify:
         print(f"  Notify     : {notify}")
     if auto_export:
-        print(f"  Manifest   : auto-exported after each full scan")
+        print("  Manifest   : auto-exported after each full scan")
     if is_windows:
         plat_label = "Windows (Task Scheduler)"
     elif is_mac:
@@ -382,16 +393,27 @@ def _run_track(target_dir: str, every_seconds: int,
               file=sys.stderr)
         print(file=sys.stderr)
 
-    if is_mac:
-        launchd._install_launchd(target_dir, dhash, quick_cmd, every_seconds,
-                                 full_cmd, full_at)
-    elif is_linux:
-        systemd._install_systemd(target_dir, dhash, quick_cmd, every_seconds,
-                                 full_cmd, full_at)
-    else:
-        schtasks._install_schtasks(target_dir, dhash, quick_cmd, every_seconds,
-                                   full_cmd, full_at, budget_seconds=budget_seconds,
-                                   run_on_battery=run_on_battery)
+    # Install through the platform backend. Wrap the call the same way the
+    # untrack/repair verbs already do (see _run_untrack, _run_repair) so a
+    # backend failure — a missing systemctl, a rejected systemctl/launchctl/
+    # schtasks command, a half-written config — degrades to a friendly
+    # message instead of dumping a raw traceback. The backends unlink any
+    # config file they wrote before raising, so a failed install leaves
+    # nothing orphaned behind.
+    try:
+        if is_mac:
+            launchd._install_launchd(target_dir, dhash, quick_cmd, every_seconds,
+                                     full_cmd, full_at)
+        elif is_linux:
+            systemd._install_systemd(target_dir, dhash, quick_cmd, every_seconds,
+                                     full_cmd, full_at)
+        else:
+            schtasks._install_schtasks(target_dir, dhash, quick_cmd, every_seconds,
+                                       full_cmd, full_at, budget_seconds=budget_seconds,
+                                       run_on_battery=run_on_battery)
+    except Exception as e:  # noqa: BLE001 — platform install failure
+        print(f"Error: could not install scheduled scans: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print()
     print("═" * 60)
@@ -423,9 +445,23 @@ def _discover_tracked(is_mac: bool) -> Dict[str, Dict]:
     details and active status for each tracked directory.
     """
     from . import launchd, systemd
-    if is_mac:
-        return launchd._discover_launchd()
-    return systemd._discover_systemd()
+    # Wrap discovery in the same try/except style the untrack/repair verbs
+    # use so a backend failure degrades to an empty result plus a friendly
+    # message instead of a traceback out of --status.
+    try:
+        if is_mac:
+            return launchd._discover_launchd()
+        # Linux → systemd. On distros without systemd (Alpine/OpenRC,
+        # Void/runit, Devuan) shelling out to systemctl would raise
+        # FileNotFoundError; a preflight turns that into one actionable line.
+        if shutil.which("systemctl") is None:
+            print("systemd not found; scheduled scans require systemd "
+                  "(or a manual cron entry).", file=sys.stderr)
+            return {}
+        return systemd._discover_systemd()
+    except Exception as e:  # noqa: BLE001 — platform discovery failure
+        print(f"Error: could not read scheduled scans: {e}", file=sys.stderr)
+        return {}
 
 
 # Exit-code values returned by _run_untrack[_all]. These mirror the

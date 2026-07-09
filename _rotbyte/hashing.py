@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Set, Tuple
 
 from .database import ChecksumDB
@@ -64,17 +66,28 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
     Skips by default:
       - Hidden files and directories (names starting with '.'; on
         Windows, also entries with the FILE_ATTRIBUTE_HIDDEN bit set)
+      - Anything that is not a regular file (symlinks, FIFOs, devices,
+        sockets) — hashing these would follow a symlink out of scope,
+        or block forever on a FIFO / device that never yields EOF
       - .b2sum and .b2 hash files (handled separately by --import)
       - The database file and its SQLite companion files (-wal, -shm, .lock)
       - Any directories in exclude_dirs
 
     If ``case_insensitive`` is true (on macOS APFS / NTFS users who pass
-    ``--case-insensitive``), file paths are normalised to lowercase so a
-    rename-by-case doesn't produce phantom MISSINGs.
+    ``--case-insensitive``), files whose paths differ only by case are
+    de-duplicated (the first-seen real path is kept) so a rename-by-case
+    doesn't queue the same file twice. The real on-disk path is always
+    returned unchanged — it must survive verbatim for stat()/open().
 
-    Does not follow symlinks to prevent infinite loops. On OSError during
-    walk (e.g. a network drive that vanished mid-scan), emits a warning
-    and returns what was collected so far rather than aborting the scan.
+    Directory symlinks are not followed (walked with followlinks=False),
+    which keeps the walk inside the target tree and prevents cyclic loops.
+    File symlinks that resolve to a regular file ARE hashed; anything that
+    resolves to a non-regular file (FIFO, device, socket) or dangles is
+    skipped, so an accidental named pipe or a link to /dev/zero can't make
+    a worker block or loop forever.
+    On OSError during walk (e.g. a network drive that vanished mid-scan),
+    emits a warning and returns what was collected so far rather than
+    aborting the scan.
     """
     skip_files = {
         _resolve(db_path),
@@ -84,6 +97,7 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
     }
     exclude = exclude_dirs or set()
     files = []
+    seen_casefold: Set[str] = set()  # dedup keys for --case-insensitive
 
     def _walk_err(exc: OSError) -> None:
         # A typical cause is a network drive disappearing mid-scan. Warn
@@ -109,9 +123,32 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
             if name.endswith(".b2sum") or name.endswith(".b2"):
                 continue
             full = os.path.join(root, name)
+            # Only hash regular files. stat() follows symlinks, so a file
+            # symlink that resolves to a regular file is still hashed (the
+            # tool's documented behaviour), while anything resolving to a
+            # non-regular file is skipped: a FIFO or a symlink to a device
+            # (e.g. /dev/zero) would otherwise make the worker's open()/read
+            # block or loop forever. stat() itself never blocks on a FIFO
+            # (only open() does), and it must happen at scan time — an fstat
+            # inside hash_file is too late because open() blocks first. A
+            # broken/dangling symlink raises OSError here and is skipped.
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # skip FIFOs, devices, sockets, dangling symlinks
             if _resolve(full) in skip_files:
                 continue
-            files.append(full.lower() if case_insensitive else full)
+            if case_insensitive:
+                # De-dup by a case-folded comparison key, but keep the
+                # real path for the filesystem. casefold() (not lower())
+                # for correct Unicode folding.
+                key = full.casefold()
+                if key in seen_casefold:
+                    continue
+                seen_casefold.add(key)
+            files.append(full)
     files.sort()
     return files
 
@@ -268,99 +305,120 @@ def run_hashing(
                 break
 
             batch = entries[batch_start : batch_start + BATCH_SIZE]
-            futures = {executor.submit(hash_file, e.path): e.path for e in batch}
 
-            with db.transaction():
-                for future in as_completed(futures):
-                    if interrupted[0]:
-                        break
+            # A worker dying (OOM/segfault) poisons the whole pool: the
+            # per-file `except Exception` below swallows the resulting
+            # BrokenProcessPool during future.result(), but the *next*
+            # batch's executor.submit() then raises it uncaught. Catch it
+            # here so we stop cleanly, keeping every result committed so
+            # far, instead of aborting with a raw traceback.
+            try:
+                futures = {executor.submit(hash_file, e.path): e.path for e in batch}
 
-                    # Check time budget after each completed file
-                    if budget_seconds is not None and not budget_exceeded:
-                        elapsed = time.monotonic() - budget_start
-                        if elapsed >= budget_seconds:
-                            budget_exceeded = True
-                            result.budget_exceeded = True
-                            remaining = total - processed
-                            if not quiet:
-                                print(f"\n  Time budget reached ({_format_duration(elapsed)})."
-                                      f" Stopping with {remaining:,} files remaining.")
+                with db.transaction():
+                    for future in as_completed(futures):
+                        if interrupted[0]:
                             break
 
-                    # Catch worker crashes (OOM, segfault, BrokenExecutor
-                    # when the pool dies) so one bad file doesn't abort
-                    # the entire run. BrokenExecutor is a subclass of
-                    # Exception, so this catches both — left untyped to
-                    # signal the intent to catch anything the worker
-                    # subprocess layer can raise.
-                    try:
-                        fpath, digest, hash_size, hash_mtime, hash_err = future.result()
-                    except Exception as e:  # noqa: BLE001
-                        fpath = futures[future]
-                        # Worker crashes are rare and indicate something
-                        # serious (OOM, segfault). Print these inline.
-                        print(f"\n  ! Worker error for {fpath}: {e}", file=sys.stderr)
-                        result.errors += 1
-                        processed += 1
-                        bar.update(0)
-                        continue
+                        # Check time budget after each completed file
+                        if budget_seconds is not None and not budget_exceeded:
+                            elapsed = time.monotonic() - budget_start
+                            if elapsed >= budget_seconds:
+                                budget_exceeded = True
+                                result.budget_exceeded = True
+                                remaining = total - processed
+                                if not quiet:
+                                    print(f"\n  Time budget reached ({_format_duration(elapsed)})."
+                                          f" Stopping with {remaining:,} files remaining.")
+                                break
 
-                    processed += 1
-
-                    if digest is None:
-                        # The worker couldn't read the file. Distinguish a
-                        # file that vanished between prescan and hash (route
-                        # to MISSING — that's the truth) from a real read
-                        # error (permission, I/O failure). Best-effort lstat:
-                        # if it raises, the file is gone.
+                        # Catch worker crashes (OOM, segfault, BrokenExecutor
+                        # when the pool dies) so one bad file doesn't abort
+                        # the entire run. BrokenExecutor is a subclass of
+                        # Exception, so this catches both — left untyped to
+                        # signal the intent to catch anything the worker
+                        # subprocess layer can raise.
                         try:
-                            os.lstat(fpath)
-                            existed = True
-                        except OSError:
-                            existed = False
-                        if not existed:
-                            deferred_missing.append(fpath)
-                        else:
+                            fpath, digest, hash_size, hash_mtime, hash_err = future.result()
+                        except Exception as e:  # noqa: BLE001
+                            fpath = futures[future]
+                            # Worker crashes are rare and indicate something
+                            # serious (OOM, segfault). Print these inline.
+                            print(f"\n  ! Worker error for {fpath}: {e}", file=sys.stderr)
                             result.errors += 1
-                            error_messages.append(
-                                f"  ! Error reading {fpath}: {hash_err}"
-                                if hash_err else
-                                f"  ! Error reading {fpath}"
-                            )
-                            if len(error_messages) <= ERROR_PRINT_LIMIT:
-                                print(f"\n{error_messages[-1]}", file=sys.stderr)
-                        bar.update(0)
-                        continue
+                            processed += 1
+                            bar.update(0)
+                            continue
 
-                    entry = entry_map[fpath]
+                        processed += 1
 
-                    # Determine file status based on hash comparison and
-                    # whether the file's metadata changed.
-                    if entry.old_checksum is None:
-                        status = "NEW"
-                        result.new += 1
-                    elif digest == entry.old_checksum:
-                        status = "OK"
-                        result.ok += 1
-                    elif entry.modified:
-                        # Hash changed but so did mtime/size — this is an
-                        # intentional edit, not corruption. Accept it.
-                        status = "OK"
-                        result.updated += 1
-                    else:
-                        # Hash changed with no metadata change — bit rot.
-                        status = "FAILED"
-                        result.failed += 1
-                        print(f"\n  ✗ FAILED: {fpath}")
+                        if digest is None:
+                            # The worker couldn't read the file. Distinguish a
+                            # file that vanished between prescan and hash (route
+                            # to MISSING — that's the truth) from a real read
+                            # error (permission, I/O failure). Best-effort lstat:
+                            # if it raises, the file is gone.
+                            try:
+                                os.lstat(fpath)
+                                existed = True
+                            except OSError:
+                                existed = False
+                            if not existed:
+                                deferred_missing.append(fpath)
+                            else:
+                                result.errors += 1
+                                error_messages.append(
+                                    f"  ! Error reading {fpath}: {hash_err}"
+                                    if hash_err else
+                                    f"  ! Error reading {fpath}"
+                                )
+                                if len(error_messages) <= ERROR_PRINT_LIMIT:
+                                    print(f"\n{error_messages[-1]}", file=sys.stderr)
+                            bar.update(0)
+                            continue
 
-                    result.bytes_hashed += hash_size
+                        entry = entry_map[fpath]
 
-                    db.upsert_file(
-                        fpath, entry.name, hash_size, hash_mtime,
-                        digest, entry.old_checksum, status, now,
-                    )
+                        # Determine file status based on hash comparison and
+                        # whether the file's metadata changed.
+                        if entry.old_checksum is None:
+                            status = "NEW"
+                            result.new += 1
+                        elif digest == entry.old_checksum:
+                            status = "OK"
+                            result.ok += 1
+                        elif entry.modified:
+                            # Hash changed but so did mtime/size — this is an
+                            # intentional edit, not corruption. Accept it.
+                            status = "OK"
+                            result.updated += 1
+                        else:
+                            # Hash changed with no metadata change — bit rot.
+                            status = "FAILED"
+                            result.failed += 1
+                            print(f"\n  ✗ FAILED: {fpath}")
 
-                    bar.update(hash_size)
+                        result.bytes_hashed += hash_size
+
+                        db.upsert_file(
+                            fpath, entry.name, hash_size, hash_mtime,
+                            digest, entry.old_checksum, status, now,
+                        )
+
+                        bar.update(hash_size)
+            except BrokenProcessPool as e:
+                # A worker process died and took the pool with it. The
+                # transaction for this batch has already rolled back (its
+                # context manager unwound as the exception propagated).
+                # Report via the existing error channel, stop starting new
+                # batches, and fall through to return the results committed
+                # by earlier batches rather than crashing the whole run.
+                msg = (f"  ! Worker pool crashed ({e}); stopping with "
+                       f"partial results.")
+                error_messages.append(msg)
+                print(f"\n{msg}", file=sys.stderr)
+                result.errors += 1
+                break
 
     bar.finish()
 
