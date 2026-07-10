@@ -116,6 +116,7 @@ from _rotbyte.scheduler import (
     _find_rotbyte_executable,
     _missing_command_path,
     _parse_cmd_flags,
+    _run_clear_logs,
     _run_repair,
     _run_track,
     _run_untrack,
@@ -190,6 +191,7 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
     if args.track_setup:         flags.append("--track-setup")
     if args.status:              flags.append("--status")
     if args.repair:              flags.append("--repair")
+    if args.clear_logs:          flags.append("--clear-logs")
     if args.report:              flags.append("--report")
     if args.check:               flags.append("--check")
     if args.accept:              flags.append("--accept")
@@ -416,6 +418,12 @@ Exit codes:
                              "rotbyte/Python path and reload it. Fixes schedules broken "
                              "by a Homebrew upgrade (interpreter/script path deleted). "
                              "Safe to run anytime; schedules already current are left as-is.")
+    parser.add_argument("--clear-logs", dest="clear_logs", action="store_true",
+                        help="Clear rotbyte's scheduler logs. Truncates the live log of "
+                             "each installed scan and deletes rotated generations and "
+                             "orphaned logs left behind by past --untrack / --repair. "
+                             "macOS only writes such files; on Linux/Windows it reports "
+                             "where the logs live (journald / Task Scheduler history).")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
@@ -444,6 +452,28 @@ Exit codes:
             flag = "--untrack-all" if args.untrack_all else "--untrack"
             print(f"Error: {flag} cannot be combined with {', '.join(conflicts)}.",
                   file=sys.stderr)
+            sys.exit(1)
+
+    # --clear-logs is a standalone management verb like --repair; refuse to
+    # combine it with any other mode flag (including the untrack family,
+    # which _conflicting_mode_flags doesn't list). Exclude --clear-logs
+    # itself from the list it would otherwise report against.
+    if args.clear_logs:
+        # --clear-logs is global (all rotbyte logs); it takes no PATH. Reject
+        # a stray positional so `--clear-logs /Volumes/Media` errors loudly
+        # instead of silently ignoring the path and wiping every log.
+        if args.path != ".":
+            print("Error: --clear-logs operates on all rotbyte logs and does "
+                  "not take a PATH argument.", file=sys.stderr)
+            sys.exit(1)
+        conflicts = [f for f in _conflicting_mode_flags(args) if f != "--clear-logs"]
+        if args.untrack:
+            conflicts.append("--untrack")
+        if args.untrack_all:
+            conflicts.append("--untrack-all")
+        if conflicts:
+            print(f"Error: --clear-logs cannot be combined with "
+                  f"{', '.join(conflicts)}.", file=sys.stderr)
             sys.exit(1)
 
     # --notify-setup is a standalone command
@@ -494,6 +524,11 @@ Exit codes:
     # it needs no target directory, database, or lock.
     if args.repair:
         sys.exit(_run_repair())
+
+    # --clear-logs wipes rotbyte's scheduler logs; like --status/--repair it
+    # needs no target directory, database, or lock.
+    if args.clear_logs:
+        sys.exit(_run_clear_logs())
 
     # --untrack / --untrack-all: tear down installed scheduler units.
     # Mutually-exclusive validation already happened up front, so by the

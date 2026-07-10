@@ -149,6 +149,14 @@ rotbyte --untrack-all
 
 `--untrack` canonicalises the path the same way `--track` does, so it removes exactly what was installed for that directory. If nothing is installed for the path, rotbyte prints a friendly notice and exits 0. The checksum database is left in place — only the scheduler unit (launchd plist / systemd timer+service / Task Scheduler task) is removed.
 
+To tidy up scheduler logs — for example after an upgrade leaves stale error spam or `--untrack` strands a directory's old log:
+
+```bash
+rotbyte --clear-logs
+```
+
+On macOS this truncates the live log of each still-installed scan in place (launchd keeps the log file open between runs, so deleting it would leak disk until the next reload) and deletes rotated generations (`.log.1`, `.log.2`) plus any orphaned logs whose schedule is gone. Only macOS keeps rotbyte-owned log files: on Linux the scheduled-scan output lives in the systemd journal (`journalctl --user -u 'rotbyte-*'`) and on Windows in Task Scheduler's history, so on those platforms `--clear-logs` just tells you where to look. Your checksum databases are never touched, and it exits 0 even when there's nothing to clear.
+
 On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
 > **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [docs/macOS Permissions.md](docs/macOS%20Permissions.md).

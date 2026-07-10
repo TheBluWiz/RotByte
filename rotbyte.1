@@ -238,6 +238,23 @@ Exits 0 even when nothing was found.
 Mutually exclusive with
 .BR \-\-untrack .
 .TP
+.B \-\-clear\-logs
+Clear rotbyte's scheduler logs. On macOS the live log of each still-installed
+scan is truncated in place (launchd holds the log file open between runs, so
+deleting it would leak disk until the next reload), while rotated generations
+(\fI.log.1\fR, \fI.log.2\fR) and orphaned logs left behind by a past
+.B \-\-untrack
+or
+.B \-\-repair
+are deleted. Only macOS keeps rotbyte-owned log files; on Linux the
+scheduled-scan output lives in the systemd journal and on Windows in Task
+Scheduler's history, so on those platforms
+.B \-\-clear\-logs
+prints where to look
+.RB ( journalctl " / Task Scheduler)"
+instead of deleting anything. The checksum databases are never touched. Exits 0
+even when there is nothing to clear.
+.TP
 .BI \-\-every " INTERVAL"
 Quick scan frequency when using
 .BR \-\-track .

@@ -2267,6 +2267,193 @@ class TestUntrackArgValidation:
         assert "--untrack-all cannot be combined with --status" in capsys.readouterr().err
 
 
+class TestClearLogsBackend:
+    """Backend-level tests for _clear_launchd_logs: the live log of an
+    installed job is truncated in place (launchd holds its FD open), while
+    rotated generations and orphaned logs are deleted.
+    """
+
+    def _redirect_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        agents = tmp_path / "Library" / "LaunchAgents"
+        logs = tmp_path / "Library" / "Logs" / "rotbyte"
+        agents.mkdir(parents=True)
+        logs.mkdir(parents=True)
+        return agents, logs
+
+    def test_truncates_active_deletes_rotated_and_orphans(self, tmp_path, monkeypatch):
+        agents, logs = self._redirect_home(tmp_path, monkeypatch)
+        # Installed (active) job: live log truncated, rotated generation deleted.
+        (agents / "com.rotbyte.quick.aaaa1111.plist").write_text("<plist/>")
+        active = logs / "com.rotbyte.quick.aaaa1111.log"
+        active.write_text("live content\n")
+        active_rot = logs / "com.rotbyte.quick.aaaa1111.log.1"
+        active_rot.write_text("rotated\n")
+        # Orphan job (no plist): everything deleted.
+        orphan = logs / "com.rotbyte.full.bbbb2222.log"
+        orphan.write_text("orphan\n")
+        orphan_rot = logs / "com.rotbyte.full.bbbb2222.log.2"
+        orphan_rot.write_text("orphan rotated\n")
+        # A non-rotbyte file is never touched.
+        unrelated = logs / "unrelated.log"
+        unrelated.write_text("keep me\n")
+
+        truncated, deleted, errors = \
+            _rotbyte_pkg.scheduler.launchd._clear_launchd_logs()
+
+        assert errors == []
+        assert truncated == [str(active)]
+        assert sorted(deleted) == sorted(
+            [str(active_rot), str(orphan), str(orphan_rot)])
+        # Active log still exists but is now empty.
+        assert active.exists()
+        assert active.read_text() == ""
+        # Rotated + orphan logs gone; unrelated file untouched.
+        assert not active_rot.exists()
+        assert not orphan.exists()
+        assert not orphan_rot.exists()
+        assert unrelated.read_text() == "keep me\n"
+
+    def test_truncation_preserves_inode(self, tmp_path, monkeypatch):
+        """Truncating (not unlinking) keeps launchd's open FD valid."""
+        agents, logs = self._redirect_home(tmp_path, monkeypatch)
+        (agents / "com.rotbyte.quick.cccc3333.plist").write_text("<plist/>")
+        active = logs / "com.rotbyte.quick.cccc3333.log"
+        active.write_text("some output\n")
+        ino_before = active.stat().st_ino
+
+        _rotbyte_pkg.scheduler.launchd._clear_launchd_logs()
+
+        assert active.stat().st_ino == ino_before
+        assert active.read_text() == ""
+
+    def test_empty_dir_returns_nothing(self, tmp_path, monkeypatch):
+        self._redirect_home(tmp_path, monkeypatch)
+        truncated, deleted, errors = \
+            _rotbyte_pkg.scheduler.launchd._clear_launchd_logs()
+        assert (truncated, deleted, errors) == ([], [], [])
+
+
+class TestRunClearLogsDispatch:
+    """Platform-dispatch tests for _run_clear_logs and its main() wiring."""
+
+    def _redirect_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path)))
+        (tmp_path / "Library" / "LaunchAgents").mkdir(parents=True)
+        (tmp_path / "Library" / "Logs" / "rotbyte").mkdir(parents=True)
+
+    def test_macos_clears_and_reports(self, tmp_path, monkeypatch, capsys):
+        self._redirect_home(tmp_path, monkeypatch)
+        agents = tmp_path / "Library" / "LaunchAgents"
+        logs = tmp_path / "Library" / "Logs" / "rotbyte"
+        (agents / "com.rotbyte.quick.aaaa1111.plist").write_text("<plist/>")
+        (logs / "com.rotbyte.quick.aaaa1111.log").write_text("x\n")
+        (logs / "com.rotbyte.full.bbbb2222.log").write_text("orphan\n")
+        _force_scheduler_platform(monkeypatch, "macos")
+
+        rc = rotbyte._run_clear_logs()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Cleared 2 log files (launchd)" in out
+        assert "Cleared (in place)" in out
+        assert "Removed" in out
+
+    def test_macos_no_logs_friendly_noop(self, tmp_path, monkeypatch, capsys):
+        self._redirect_home(tmp_path, monkeypatch)
+        _force_scheduler_platform(monkeypatch, "macos")
+        rc = rotbyte._run_clear_logs()
+        assert rc == 0
+        assert "No rotbyte logs found to clear" in capsys.readouterr().out
+
+    def test_macos_backend_error_exits_6(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            _rotbyte_pkg.scheduler.launchd, "_clear_launchd_logs",
+            lambda: ([], [], ["could not truncate /x: permission denied"]))
+        _force_scheduler_platform(monkeypatch, "macos")
+        rc = rotbyte._run_clear_logs()
+        assert rc == 6
+        assert "permission denied" in capsys.readouterr().err
+
+    def test_macos_internal_error_exits_7(self, monkeypatch, capsys):
+        def boom():
+            raise RuntimeError("kaboom")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd,
+                            "_clear_launchd_logs", boom)
+        _force_scheduler_platform(monkeypatch, "macos")
+        rc = rotbyte._run_clear_logs()
+        assert rc == 7
+        assert "kaboom" in capsys.readouterr().err
+
+    def test_linux_is_informational(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "linux")
+        rc = rotbyte._run_clear_logs()
+        assert rc == 0
+        assert "journalctl" in capsys.readouterr().out
+
+    def test_windows_is_informational(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "windows")
+        rc = rotbyte._run_clear_logs()
+        assert rc == 0
+        assert "Task Scheduler" in capsys.readouterr().out
+
+    def test_unsupported_platform_exits_7(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, None)
+        rc = rotbyte._run_clear_logs()
+        assert rc == 7
+
+    def test_cli_clear_logs_dispatches(self, tmp_path, monkeypatch, capsys):
+        self._redirect_home(tmp_path, monkeypatch)
+        _force_scheduler_platform(monkeypatch, "macos")
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv", ["rotbyte", "--clear-logs"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        assert "No rotbyte logs found to clear" in capsys.readouterr().out
+
+
+class TestClearLogsArgValidation:
+    """--clear-logs is a standalone verb; combining it with any other mode
+    flag is rejected before the scheduler is touched.
+    """
+
+    def test_clear_logs_with_track_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--clear-logs", "--track"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--clear-logs cannot be combined with --track" in capsys.readouterr().err
+
+    def test_clear_logs_with_status_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--clear-logs", "--status"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--clear-logs cannot be combined with --status" in capsys.readouterr().err
+
+    def test_untrack_with_clear_logs_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "--clear-logs"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--clear-logs" in capsys.readouterr().err
+
+    def test_clear_logs_with_path_rejected(self, capsys):
+        """--clear-logs is global; a stray PATH must error, not silently
+        wipe every log while the user thinks they scoped to one directory.
+        """
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--clear-logs", "/Volumes/Media"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "does not take a PATH" in capsys.readouterr().err
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 32. Notify config path
 # ══════════════════════════════════════════════════════════════════════════════

@@ -573,3 +573,67 @@ def _run_untrack_all() -> int:
     print(f"\n  Removed {n} scheduled run{plural} ({backend_label})")
 
     return _UNTRACK_IO_ERROR if errors else _UNTRACK_OK
+
+
+def _run_clear_logs() -> int:
+    """Clear rotbyte's scheduler log files.
+
+    Only macOS keeps rotbyte-owned log files on disk (launchd's
+    ``StandardOutPath``): the live log of each still-installed job is
+    truncated in place and rotated generations plus orphaned logs left
+    behind by past ``--untrack`` / ``--repair`` are deleted. On Linux the
+    scheduled-scan output lives in the systemd journal, and on Windows in
+    Task Scheduler's history — rotbyte owns no files there, so both
+    platforms print where to look instead of clearing anything.
+
+    Returns the process exit code: 0 on success (including the friendly
+    "nothing to clear" and informational no-ops), 6 if any file operation
+    failed, 7 if the platform isn't supported.
+    """
+    from . import launchd
+
+    if _IS_MACOS:
+        try:
+            truncated, deleted, errors = launchd._clear_launchd_logs()
+        except Exception as e:  # noqa: BLE001 — platform log-clear failure
+            print(f"Error: could not clear launchd logs: {e}", file=sys.stderr)
+            return _UNTRACK_INTERNAL
+    elif _IS_LINUX:
+        # systemd routes scheduled-scan output to the shared user journal,
+        # not to files rotbyte manages. Vacuuming the journal here would be
+        # both surprising and overreaching, so point at journalctl instead.
+        print("  On Linux, scheduled-scan logs live in the systemd journal, "
+              "not in files rotbyte manages — nothing to clear.")
+        print("  Inspect:  journalctl --user -u 'rotbyte-*'")
+        print("  Vacuum:   journalctl --user --vacuum-time=7d")
+        return _UNTRACK_OK
+    elif _IS_WINDOWS:
+        # Task Scheduler captures each run's output to its own Task History,
+        # not to a rotbyte-owned file, so there is nothing on disk to clear.
+        print("  On Windows, scheduled-scan output lives in Task Scheduler's "
+              "history, not in files rotbyte manages — nothing to clear.")
+        print("  Inspect:  Task Scheduler → Task Scheduler Library → rotbyte "
+              "→ History")
+        return _UNTRACK_OK
+    else:
+        print(f"Error: --clear-logs is not supported on {sys.platform}.",
+              file=sys.stderr)
+        return _UNTRACK_INTERNAL
+
+    if not truncated and not deleted and not errors:
+        print("  No rotbyte logs found to clear.")
+        return _UNTRACK_OK
+
+    for path in truncated:
+        print(f"  ✓ Cleared (in place): {path}")
+    for path in deleted:
+        print(f"  ✓ Removed: {path}")
+    if errors:
+        for msg in errors:
+            print(f"  ! {msg}", file=sys.stderr)
+
+    n = len(truncated) + len(deleted)
+    plural = "s" if n != 1 else ""
+    print(f"\n  Cleared {n} log file{plural} (launchd)")
+
+    return _UNTRACK_IO_ERROR if errors else _UNTRACK_OK

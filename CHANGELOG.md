@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`--clear-logs` tidies up scheduler logs.** After a `brew upgrade` leaves stale exec-error spam behind, or an `--untrack` / `--repair` strands a directory's old log, the log directory accumulates confusing files that make a later `--status` harder to read. `--clear-logs` cleans them: on macOS it truncates the live log of each still-installed scan **in place** (launchd holds the `StandardOutPath` FD open between runs, so unlinking it would leak disk until the next reload) and deletes rotated generations (`.log.1`, `.log.2`) plus any orphaned log whose plist no longer exists. Only macOS keeps rotbyte-owned log files; on Linux the scheduled-scan output lives in the systemd journal and on Windows in Task Scheduler's history, so on those platforms `--clear-logs` reports where to look (`journalctl` / Task Scheduler) rather than deleting anything. Checksum databases are never touched; exits 0 even when there is nothing to clear. Standalone verb — refused in combination with any other mode flag
+
 ## 1.2.0 — 2026-07-08
 
 ### Added

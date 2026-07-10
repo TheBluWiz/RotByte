@@ -70,6 +70,76 @@ def _rotate_launchd_log(log_path: str) -> None:
         pass
 
 
+def _rotbyte_log_dir() -> str:
+    """Return ``~/Library/Logs/rotbyte``, resolved fresh on each call.
+
+    Mirrors ``_launch_agents_dir`` so it honors a later-patched ``$HOME``
+    (the test suite redirects HOME per-test).
+    """
+    return os.path.expanduser("~/Library/Logs/rotbyte")
+
+
+# Matches ``com.rotbyte.quick.<hash>.log`` and its rotated generations
+# ``…​.log.1`` / ``.log.2``. Group 1 is the job label; group 2 is the
+# rotation suffix (empty for the live log). ``<hash>`` never contains a
+# dot, so ``[^.]+`` bounds it cleanly.
+_LOG_NAME_RE = _re.compile(
+    r"^(com\.rotbyte\.(?:quick|full)\.[^.]+)\.log(\.\d+)?$"
+)
+
+
+def _clear_launchd_logs() -> Tuple[List[str], List[str], List[str]]:
+    """Clear rotbyte's launchd log files under ~/Library/Logs/rotbyte.
+
+    The *live* ``.log`` of a still-installed job is **truncated in place**
+    rather than unlinked: it's the conservative choice for a file launchd
+    may have open — it can't orphan launchd's descriptor or race an
+    in-flight write. (Verified empirically: launchd writes each run's
+    output from offset 0, so a truncated log refills cleanly with no
+    sparse-hole regrowth.) Rotated generations (``.log.1``…) and any
+    orphan log whose plist is gone are **deleted**.
+
+    A job is "installed" when a matching ``com.rotbyte.*.plist`` still
+    exists in ~/Library/LaunchAgents. Returns
+    ``(truncated, deleted, errors)`` — the first two are file paths, the
+    last is human-readable error strings.
+    """
+    log_dir = _rotbyte_log_dir()
+    agents_dir = _launch_agents_dir()
+
+    installed = {
+        os.path.basename(p)[: -len(".plist")]
+        for p in _glob.glob(os.path.join(agents_dir, "com.rotbyte.*.plist"))
+    }
+
+    truncated: List[str] = []
+    deleted: List[str] = []
+    errors: List[str] = []
+
+    for path in sorted(_glob.glob(os.path.join(log_dir, "com.rotbyte.*.log*"))):
+        m = _LOG_NAME_RE.match(os.path.basename(path))
+        if not m:
+            continue
+        label, rotated = m.group(1), m.group(2)
+        if label in installed and not rotated:
+            # Live log of an installed job → truncate, preserve the inode.
+            try:
+                with open(path, "w"):
+                    pass
+                truncated.append(path)
+            except OSError as e:
+                errors.append(f"could not truncate {path}: {e}")
+        else:
+            # Rotated generation, or orphan whose plist is gone → delete.
+            try:
+                os.unlink(path)
+                deleted.append(path)
+            except OSError as e:
+                errors.append(f"could not delete {path}: {e}")
+
+    return truncated, deleted, errors
+
+
 def _generate_launchd_plist(label: str, command: List[str],
                             interval_seconds: Optional[int] = None,
                             calendar_times: Optional[List[Tuple[int, int]]] = None) -> str:
