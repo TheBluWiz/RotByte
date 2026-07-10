@@ -60,7 +60,8 @@ def hash_file(file_path: str) -> Tuple[str, Optional[str], Optional[int], Option
 
 def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
                exclude_dirs: Optional[Set[str]] = None,
-               case_insensitive: bool = False) -> List[str]:
+               case_insensitive: bool = False,
+               stat_out: Optional[Dict[str, os.stat_result]] = None) -> List[str]:
     """Walk the directory tree and return a sorted list of file paths.
 
     Skips by default:
@@ -95,6 +96,11 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
         _resolve(db_path + "-wal"),
         _resolve(db_path + "-shm"),
     }
+    # Cheap gate for the skip check below: a regular file keeps its basename
+    # through realpath, so only an entry whose basename matches one of the DB
+    # sidecars can possibly resolve into skip_files. Lets us skip the per-file
+    # _resolve() (a realpath syscall chain) on the whole tree.
+    skip_basenames = {os.path.basename(p) for p in skip_files}
     exclude = exclude_dirs or set()
     files = []
     seen_casefold: Set[str] = set()  # dedup keys for --case-insensitive
@@ -138,7 +144,12 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue  # skip FIFOs, devices, sockets, dangling symlinks
-            if _resolve(full) in skip_files:
+            # Skip the DB and its sidecars. Only pay the realpath when the
+            # basename matches (see skip_basenames). A symlink named unlike the
+            # DB but pointing at it would slip past the basename gate and get
+            # hashed once — harmless, and vanishingly rare in the media/archive
+            # trees rotbyte targets.
+            if name in skip_basenames and _resolve(full) in skip_files:
                 continue
             if case_insensitive:
                 # De-dup by a case-folded comparison key, but keep the
@@ -149,6 +160,10 @@ def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
                     continue
                 seen_casefold.add(key)
             files.append(full)
+            # Hand the stat we just took to the caller so prescan_files can
+            # reuse it instead of stat()-ing every file a second time.
+            if stat_out is not None:
+                stat_out[full] = st
     files.sort()
     return files
 
@@ -200,6 +215,7 @@ def prescan_files(
     all_files: List[str],
     existing: Dict[str, Tuple[str, int, str, str]],
     force: bool,
+    stat_cache: Optional[Dict[str, os.stat_result]] = None,
 ) -> Tuple[List[FileEntry], int]:
     """Compare files on disk against the database to decide what to hash.
 
@@ -208,15 +224,23 @@ def prescan_files(
       - Not running with --check (force=False)
       - File is not marked MISSING or FAILED in the database
       - File's size and mtime match the stored values
+
+    ``stat_cache`` is the ``{path: os.stat_result}`` dict scan_files fills
+    via its ``stat_out`` parameter. When a path is present, its stat is
+    reused instead of a fresh ``os.stat`` — the two phases run back to back,
+    so this halves the stat syscalls over the tree. A path absent from the
+    cache (or ``stat_cache is None``) falls back to a live stat.
     """
     to_hash: List[FileEntry] = []
     skip_count = 0
 
     for fpath in all_files:
-        try:
-            st = os.stat(fpath)
-        except OSError:
-            continue
+        st = stat_cache.get(fpath) if stat_cache is not None else None
+        if st is None:
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
 
         name = os.path.basename(fpath)
         size = st.st_size
@@ -245,7 +269,7 @@ def prescan_files(
 class HashResult:
     """Counters accumulated during the hashing phase."""
     __slots__ = ("new", "ok", "updated", "failed", "errors", "bytes_hashed",
-                 "budget_exceeded")
+                 "budget_exceeded", "vanished_missing")
 
     def __init__(self):
         self.new = 0
@@ -255,6 +279,11 @@ class HashResult:
         self.errors = 0
         self.bytes_hashed = 0
         self.budget_exceeded = False
+        # Files that vanished between prescan and hashing and were marked
+        # MISSING here. Surfaced so the caller can fold them into the run's
+        # missing total — detect_missing() can't see them (they were on disk
+        # at walk time, so they're still in its on_disk set).
+        self.vanished_missing = 0
 
 
 def run_hashing(
@@ -265,6 +294,7 @@ def run_hashing(
     interrupted: List[bool],
     quiet: bool = False,
     budget_seconds: Optional[int] = None,
+    skip_missing: bool = False,
 ) -> HashResult:
     """Hash files in parallel and write results to the database.
 
@@ -273,10 +303,18 @@ def run_hashing(
     transaction is either committed or rolled back — even on interrupt
     or worker crash.
 
-    If budget_seconds is set, the elapsed time is checked after every
-    completed file. When the budget is exceeded the current batch's
-    already-completed results are committed and no further batches are
-    started.
+    On interrupt, or when an elapsed ``budget_seconds`` is reached (checked
+    after every completed file), the files already being hashed are allowed
+    to finish and their results are committed, the queued-but-unstarted
+    files in the current batch are cancelled so leaving the pool doesn't
+    drain them past the cutoff, and no further batches are started.
+
+    ``skip_missing`` mirrors the top-level ``--skip-missing`` flag: when
+    set, files that vanish between prescan and hashing are left untouched
+    rather than marked MISSING, so the flag's "don't check for removed
+    files" contract holds for the race case too. Files that this function
+    does mark MISSING are counted in ``HashResult.vanished_missing`` for the
+    caller to fold into the run's missing total.
     """
     result = HashResult()
     total = len(entries)
@@ -406,6 +444,18 @@ def run_hashing(
                         )
 
                         bar.update(hash_size)
+
+                # Option A: if we broke out early (interrupt or budget), cancel
+                # the queued-but-unstarted hashes in this batch. Otherwise
+                # leaving the executor's `with` block would call
+                # shutdown(wait=True) and drain the whole batch — up to
+                # BATCH_SIZE large files — well past the cutoff. Futures already
+                # executing in a worker can't be cancelled and are allowed to
+                # finish; any that completed before the break were already
+                # committed above.
+                if interrupted[0] or budget_exceeded:
+                    for f in futures:
+                        f.cancel()
             except BrokenProcessPool as e:
                 # A worker process died and took the pool with it. The
                 # transaction for this batch has already rolled back (its
@@ -426,14 +476,20 @@ def run_hashing(
     # transaction. They were *known* files in the database (otherwise
     # they wouldn't have been queued for hashing) so this is the same
     # "previously tracked, no longer on disk" semantic that
-    # detect_missing() handles for the prescan-discovered case.
-    if deferred_missing:
+    # detect_missing() handles for the prescan-discovered case. Skipped
+    # entirely under --skip-missing so the flag's "don't check for removed
+    # files" contract holds for this race too.
+    if deferred_missing and not skip_missing:
         with db.transaction():
             for mpath in deferred_missing:
                 # Brand-new files (no row yet) just disappear silently —
                 # there's nothing to mark MISSING.
                 if mpath in entry_map and entry_map[mpath].old_checksum is not None:
                     db.mark_missing(mpath, now)
+                    result.vanished_missing += 1
+                    # detect_missing() won't report these (they were on disk
+                    # at walk time), so surface them here.
+                    print(f"  ? MISSING (vanished during scan): {mpath}")
 
     extra_errors = len(error_messages) - ERROR_PRINT_LIMIT
     if extra_errors > 0:

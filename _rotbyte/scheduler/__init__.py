@@ -302,9 +302,8 @@ def _run_track(target_dir: str, every_seconds: int,
               file=sys.stderr)
         sys.exit(1)
 
-    if run_on_battery and not is_windows:
-        # Silent on non-Windows — flag is platform-specific but permissive.
-        pass
+    # --run-on-battery only affects the Windows Task Scheduler backend; on
+    # macOS/Linux it is silently ignored (launchd/systemd have no battery gate).
 
     dhash = _dir_hash(target_dir)
 

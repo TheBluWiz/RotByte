@@ -486,6 +486,32 @@ def _problem_detail(failed: int, count_missing: int) -> List[str]:
     return detail
 
 
+# ── Shared progress/freshness/duration line formatters ──────────────────────────
+# These three lines appear in both the plain-text and HTML email bodies. Building
+# them here (rather than inline in each body) is the single source of truth that
+# keeps the two renderings from drifting — the HTML wraps each in a <p>, while the
+# plain-text body may append extra "still due" elaboration under the due line.
+
+def _fmt_due_progress(due_progress: Tuple[int, int]) -> str:
+    """'Due-file progress' line shared by both email bodies."""
+    done, start = due_progress
+    pct = (done / start * 100) if start > 0 else 100.0
+    return f"Due-file progress: {done:,} / {start:,} verified this run ({pct:.1f}%)"
+
+
+def _fmt_freshness(freshness: tuple) -> str:
+    """'Verification freshness' line shared by both email bodies."""
+    f_total, f_verified, f_due = freshness
+    f_pct = (f_verified / f_total * 100) if f_total else 0.0
+    return (f"Verification freshness: {f_verified:,} / {f_total:,} files verified "
+            f"({f_pct:.1f}%); {f_due:,} due for re-verification")
+
+
+def _fmt_duration(elapsed_seconds: float) -> str:
+    """'Scan duration' line shared by both email bodies."""
+    return f"Scan duration: {_format_duration(elapsed_seconds)}"
+
+
 def _send_email_notification(target_dir: str, failed: int, count_missing: int,
                              failed_files: List[Dict],
                              freshness: Optional[tuple] = None,
@@ -620,8 +646,7 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
     if due_progress is not None:
         done, start = due_progress
         remaining = start - done
-        pct = (done / start * 100) if start > 0 else 100.0
-        lines.append(f"Due-file progress: {done:,} / {start:,} verified this run ({pct:.1f}%)")
+        lines.append(_fmt_due_progress(due_progress))
         if remaining > 0:
             # Distinguish budget cap from per-file errors so the operator
             # knows whether to extend --budget or investigate I/O issues.
@@ -640,13 +665,11 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         lines.append("")
 
     if freshness is not None:
-        f_total, f_verified, f_due = freshness
-        f_pct = (f_verified / f_total * 100) if f_total else 0.0
-        lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} files verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
+        lines.append(_fmt_freshness(freshness))
         lines.append("")
 
     if elapsed_seconds is not None:
-        lines.append(f"Scan duration: {_format_duration(elapsed_seconds)}")
+        lines.append(_fmt_duration(elapsed_seconds))
         lines.append("")
 
     if has_problems:
@@ -783,16 +806,11 @@ def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
     # Progress / freshness / duration
     detail_lines: List[str] = []
     if due_progress is not None:
-        done, start = due_progress
-        pct = (done / start * 100) if start > 0 else 100.0
-        detail_lines.append(f"Due-file progress: {done:,} / {start:,} verified this run ({pct:.1f}%)")
+        detail_lines.append(_fmt_due_progress(due_progress))
     if freshness is not None:
-        f_total, f_verified, f_due = freshness
-        f_pct = (f_verified / f_total * 100) if f_total else 0.0
-        detail_lines.append(f"Verification freshness: {f_verified:,} / {f_total:,} "
-                            f"verified ({f_pct:.1f}%); {f_due:,} due for re-verification")
+        detail_lines.append(_fmt_freshness(freshness))
     if elapsed_seconds is not None:
-        detail_lines.append(f"Scan duration: {_format_duration(elapsed_seconds)}")
+        detail_lines.append(_fmt_duration(elapsed_seconds))
     for dl in detail_lines:
         parts.append(f'<p style="font-size:13px;color:#555;margin:2px 0;">{esc(dl)}</p>')
 

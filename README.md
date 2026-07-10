@@ -107,7 +107,7 @@ rotbyte --track-setup /Volumes/Media
 ## Features
 
 - **Fast** — parallel hashing across all cores with a live progress bar and throughput stats.
-- **Interrupt-safe** — hit Ctrl-C and it finishes the current batch, saves progress, and picks up where it left off next time. Hit Ctrl-C a second time to abort immediately.
+- **Interrupt-safe** — hit Ctrl-C and it finishes the files it's currently hashing, saves progress, and picks up where it left off next time. Hit Ctrl-C a second time to abort immediately.
 - **Edit-aware** — a changed hash with changed metadata is an edit, not an alarm. Only silent mismatches trigger a failure.
 - **Move detection** — when new files match the checksum of missing files, rotbyte tells you they were probably renamed rather than deleted and re-added.
 - **Import-friendly** — already have `.b2sum` sidecar files? `rotbyte --import` pulls them in and cleans up the originals.

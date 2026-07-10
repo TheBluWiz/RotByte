@@ -733,6 +733,26 @@ class TestScanFiles:
         basenames = {os.path.basename(f) for f in files}
         assert os.path.basename(db_path) not in basenames
 
+    def test_stat_out_captured_and_prescan_reuses_it(self, tmp, db_path):
+        """scan_files fills stat_out for exactly the returned files, and
+        prescan_files(stat_cache=...) produces the same result as a cold stat —
+        the double-stat avoidance must not change what gets hashed, and the DB
+        file must stay excluded through the basename-gated realpath.
+        """
+        Path(db_path).touch()  # DB file present; must stay excluded
+        stats = {}
+        files = rotbyte.scan_files(str(tmp), db_path, stat_out=stats)
+        # A captured stat for every returned file and nothing extra.
+        assert set(stats) == set(files)
+        assert all(isinstance(s, os.stat_result) for s in stats.values())
+        assert os.path.basename(db_path) not in {os.path.basename(f) for f in files}
+        # Reusing the cache yields an identical prescan to a fresh stat.
+        cold, cold_skip = rotbyte.prescan_files(files, {}, force=False)
+        warm, warm_skip = rotbyte.prescan_files(files, {}, force=False,
+                                                stat_cache=stats)
+        assert [e.path for e in cold] == [e.path for e in warm]
+        assert cold_skip == warm_skip
+
     def test_sorted_output(self, tmp, db_path):
         files = rotbyte.scan_files(str(tmp), db_path)
         assert files == sorted(files)
@@ -1511,6 +1531,38 @@ class TestRunHashing:
                                      interrupted=[False], quiet=True)
         assert result.errors == 0
         assert db.get_file_status(gone) == "MISSING"
+
+    def test_vanished_mid_scan_counted_in_result(self, tmp, db):
+        """A tracked file that vanishes mid-scan is tallied in
+        result.vanished_missing so the caller can fold it into the run's
+        missing total — detect_missing() can't see it (the file was on disk
+        at walk time, so it stays in the on_disk set).
+        """
+        now = rotbyte._now()
+        gone = str(tmp / "ghost.txt")
+        db.upsert_file(gone, "ghost.txt", 5, now, "x" * 128, None, "OK", now)
+        entries = [rotbyte.FileEntry(gone, "ghost.txt", 5, now, "x" * 128, False)]
+        result = rotbyte.run_hashing(db, entries, workers=1, now=now,
+                                     interrupted=[False], quiet=True)
+        assert result.vanished_missing == 1
+        assert db.get_file_status(gone) == "MISSING"
+
+    def test_vanished_mid_scan_left_alone_under_skip_missing(self, tmp, db):
+        """--skip-missing (skip_missing=True) must NOT mark a mid-scan-
+        vanished file MISSING — 'don't check for removed files' has to hold
+        for the prescan->hash race too, not just the prescan-discovered case.
+        """
+        now = rotbyte._now()
+        gone = str(tmp / "ghost.txt")
+        db.upsert_file(gone, "ghost.txt", 5, now, "x" * 128, None, "OK", now)
+        entries = [rotbyte.FileEntry(gone, "ghost.txt", 5, now, "x" * 128, False)]
+        result = rotbyte.run_hashing(db, entries, workers=1, now=now,
+                                     interrupted=[False], quiet=True,
+                                     skip_missing=True)
+        assert result.vanished_missing == 0
+        assert result.errors == 0
+        # Untouched: still OK, not flipped to MISSING.
+        assert db.get_file_status(gone) == "OK"
 
     def test_unreadable_file_aggregated_not_spammed(self, tmp, db, capsys):
         """Per-file read failures are aggregated; only the first ten

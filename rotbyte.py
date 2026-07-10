@@ -26,7 +26,7 @@ With --check:
 
 The database (.{dirname}_rotbyte.db) is created automatically inside
 the target directory on first run. Databases from rotbyte 1.0 and earlier
-(.{dirname}_rotbyte.db) are auto-migrated on the first run of any newer
+(.{dirname}_checksums.db) are auto-migrated on the first run of any newer
 version — the DB plus its .lock / WAL / SHM / .manifest sidecars are
 atomically renamed, with history preserved.
 
@@ -272,8 +272,8 @@ def print_report(db: ChecksumDB, stale_days: int = 90):
             print(f"      Size: {_format_size(f['file_size'])}  |  "
                   f"Tracked since: {_fmt_ts(f.get('first_seen'))}  |  "
                   f"Last verified: {_fmt_ts(f['last_verified'])}")
-            print(f"      Expected: {f['baseline_checksum'][:32]}...")
-            print(f"      Got:      {f['checksum'][:32]}...")
+            print(f"      Expected: {(f['baseline_checksum'] or '')[:32]}...")
+            print(f"      Got:      {(f['checksum'] or '')[:32]}...")
         print()
 
     stale = db.stale_files(stale_days)
@@ -680,6 +680,22 @@ Exit codes:
         lock.release()
 
 
+def _print_db_corrupt_help(db_path: str, reason: str) -> None:
+    """Print the shared DB-corruption diagnosis + recovery steps to stderr.
+
+    ``reason`` is the one-line explanation that differs between the two call
+    sites ("The database file appears corrupt." at open time vs "The database
+    is internally inconsistent." after a failed integrity check); the path
+    echo and the three recovery options are identical, so they live here.
+    """
+    print(f"  Path: {db_path}", file=sys.stderr)
+    print(f"  {reason}", file=sys.stderr)
+    print("  Recovery options:", file=sys.stderr)
+    print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
+    print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
+    print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
+
+
 def _run(args: argparse.Namespace, target_dir: str, db_path: str):
     """Core logic, called with the file lock held."""
 
@@ -698,24 +714,14 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         sys.exit(EXIT_DB_CORRUPT)
     except sqlite3.DatabaseError as e:
         print(f"Error: Could not open database — {e}", file=sys.stderr)
-        print(f"  Path: {db_path}", file=sys.stderr)
-        print("  The database file appears corrupt.", file=sys.stderr)
-        print("  Recovery options:", file=sys.stderr)
-        print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
-        print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
-        print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
+        _print_db_corrupt_help(db_path, "The database file appears corrupt.")
         sys.exit(EXIT_DB_CORRUPT)
 
     # Catch subtler corruption that doesn't prevent opening. Runs on every
     # invocation — PRAGMA quick_check is milliseconds even on large DBs.
     if not db.verify_integrity():
         print("Error: Database failed integrity check.", file=sys.stderr)
-        print(f"  Path: {db_path}", file=sys.stderr)
-        print("  The database is internally inconsistent.", file=sys.stderr)
-        print("  Recovery options:", file=sys.stderr)
-        print(f"    1. Restore {os.path.basename(db_path)} from your backup", file=sys.stderr)
-        print("    2. Re-run rotbyte --import against an exported manifest", file=sys.stderr)
-        print("    3. Delete the database file to start fresh (loses history)", file=sys.stderr)
+        _print_db_corrupt_help(db_path, "The database is internally inconsistent.")
         db.close()
         sys.exit(EXIT_DB_CORRUPT)
 
@@ -778,7 +784,7 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
             print("\n  Aborting immediately.\n", file=sys.stderr)
             sys.exit(EXIT_INTERRUPTED)
         interrupted[0] = True
-        print("\n\n  Interrupt received — finishing current batch and saving progress...",
+        print("\n\n  Interrupt received — finishing the files being hashed and saving progress...",
               file=sys.stderr)
         print("  Press Ctrl-C again to abort immediately.\n", file=sys.stderr)
 
@@ -1422,6 +1428,22 @@ def _run_status():
 
         try:
             db = ChecksumDB(db_path)
+        except SchemaTooNewError:
+            # A healthy DB from a newer rotbyte — not corruption.
+            print("    Last  : created by a newer rotbyte — upgrade to read it")
+            continue
+        except sqlite3.OperationalError as e:
+            # "database is locked" / "busy" means a scan currently holds the
+            # write lock (--status opens each DB without taking the app lock),
+            # NOT corruption — don't cry wolf on a healthy DB that's just in
+            # use. Any other operational error is reported verbatim so it, too,
+            # isn't misfiled as corruption.
+            msg = str(e).lower()
+            if "lock" in msg or "busy" in msg:
+                print("    Last  : database busy (a scan is running) — check again shortly")
+            else:
+                print(f"    Last  : database error ({e})")
+            continue
         except sqlite3.DatabaseError:
             print("    Last  : database error (may be corrupt)")
             continue
@@ -1524,10 +1546,14 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         print()
 
     # ── Phase 1: Scan filesystem and compare against database ──────────
+    # scan_files stats every file to classify it; capture those stats so the
+    # prescan phase can reuse them instead of stat()-ing the whole tree twice.
+    scan_stats: dict = {}
     with Spinner("Scanning filesystem", quiet=quiet) as sp:
         all_files = scan_files(target_dir, db.db_path, args.include_hidden,
                                args.exclude_dirs,
-                               case_insensitive=case_insensitive)
+                               case_insensitive=case_insensitive,
+                               stat_out=scan_stats)
         sp.set_suffix(f"  {len(all_files):,} files")
 
     with Spinner("Loading database", quiet=quiet) as sp:
@@ -1535,7 +1561,8 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         sp.set_suffix(f"  {len(existing):,} tracked")
 
     with Spinner("Comparing", quiet=quiet) as sp:
-        to_hash, skip_count = prescan_files(all_files, existing, args.check)
+        to_hash, skip_count = prescan_files(all_files, existing, args.check,
+                                            stat_cache=scan_stats)
         sp.set_suffix(f"  {len(to_hash):,} to hash, {skip_count:,} unchanged")
 
     # When --due is set, filter to only files that haven't been verified
@@ -1574,7 +1601,8 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     start_time = time.monotonic()
     try:
         result = run_hashing(db, to_hash, workers, now, interrupted, quiet,
-                             budget_seconds=budget_seconds)
+                             budget_seconds=budget_seconds,
+                             skip_missing=args.skip_missing)
     except Exception as e:
         # Unexpected worker-pool or orchestration failure — exit with the
         # dedicated internal-error code so automation can distinguish it
@@ -1588,6 +1616,12 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     if not interrupted[0] and not args.skip_missing:
         with Spinner("Checking for missing files", quiet=quiet):
             count_missing = detect_missing(db, target_dir, set(all_files), existing, now)
+    # Files that vanished between the filesystem walk and hashing were marked
+    # MISSING by run_hashing but fall outside detect_missing()'s set math (they
+    # were still in the on_disk set), so fold their count in here — otherwise
+    # this run would report Missing: 0 and exit 0 despite a tracked file going
+    # missing. Zero under --skip-missing (run_hashing leaves them untouched).
+    count_missing += result.vanished_missing
 
     # Capture the previous run's problem counts before finish_run overwrites
     # them, so the notification can report the change ("bit rot 1 → 3").
