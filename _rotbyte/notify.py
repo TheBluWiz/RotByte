@@ -57,11 +57,21 @@ def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
             # password never appears in the process argv (visible via `ps`).
             # `security` prompts for the password and a retype, so feed it
             # twice.
+            #
+            # start_new_session=True is load-bearing, not cosmetic: `security`
+            # reads the password via readpassphrase(3), which reads from the
+            # *controlling terminal* (/dev/tty), not our stdin pipe, whenever a
+            # tty is present. During interactive `--notify-setup` a tty always
+            # is, so without this `security` would block on a hidden prompt
+            # until our 10s timeout fires and we'd fall back to plaintext for
+            # no reason. setsid() detaches the child from the terminal so
+            # readpassphrase can't open /dev/tty and reads the piped stdin.
             _subprocess.run(
                 ["security", "add-generic-password",
                  "-U", "-a", account, "-s", _KEYCHAIN_SERVICE, "-w"],
                 input=f"{password}\n{password}\n",
                 check=True, capture_output=True, text=True, timeout=10,
+                start_new_session=True,
             )
             return True, "keychain"
         except (FileNotFoundError, _subprocess.CalledProcessError,
