@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotbyte"
-version = "1.2.0"
+version = "1.2.1"
 description = "Detect silent data corruption (bit rot) via BLAKE2b checksums in a local SQLite database."
 readme = "README.md"
 license = { file = "LICENSE.md" }

@@ -5,6 +5,11 @@
 ### Added
 - **`--clear-logs` tidies up scheduler logs.** After a `brew upgrade` leaves stale exec-error spam behind, or an `--untrack` / `--repair` strands a directory's old log, the log directory accumulates confusing files that make a later `--status` harder to read. `--clear-logs` cleans them: on macOS it truncates the live log of each still-installed scan **in place** (launchd holds the `StandardOutPath` FD open between runs, so unlinking it would leak disk until the next reload) and deletes rotated generations (`.log.1`, `.log.2`) plus any orphaned log whose plist no longer exists. Only macOS keeps rotbyte-owned log files; on Linux the scheduled-scan output lives in the systemd journal and on Windows in Task Scheduler's history, so on those platforms `--clear-logs` reports where to look (`journalctl` / Task Scheduler) rather than deleting anything. Checksum databases are never touched; exits 0 even when there is nothing to clear. Standalone verb — refused in combination with any other mode flag
 
+## 1.2.1 — 2026-07-10
+
+### Fixed
+- **`--notify-setup email` now stores the SMTP password in the macOS Keychain instead of falling back to plaintext.** `_keychain_set` runs `security add-generic-password -w` and feeds the password over stdin, but `security` reads it via `readpassphrase(3)`, which reads from the controlling terminal (`/dev/tty`) — not our pipe — whenever a terminal is present. During interactive setup one always is, so `security` blocked on a prompt the user never sees, hit the 10-second timeout, and the password silently degraded to plaintext in `notify.conf` (`chmod 0600`) with a misleading "no platform credential store available" warning. The bug was invisible to every non-interactive test (no controlling terminal → `readpassphrase` falls back to stdin and it works), which is why it only surfaced in real use. Fixed by passing `start_new_session=True` to the subprocess so `setsid()` detaches `security` from the terminal; `readpassphrase` can no longer open `/dev/tty` and reads the piped stdin. Preserves the existing guarantee that the password never appears in `argv` (visible via `ps`)
+
 ## 1.2.0 — 2026-07-08
 
 ### Added

@@ -2455,6 +2455,76 @@ class TestClearLogsArgValidation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 31b. Keychain credential storage
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestKeychainStore:
+    """_keychain_set stores the SMTP password in the OS credential store.
+
+    Regression coverage for the macOS bug where `security add-generic-password
+    -w` read the password from the controlling terminal (/dev/tty) via
+    readpassphrase(3) instead of our stdin pipe: during interactive
+    --notify-setup a terminal is always present, so `security` blocked on a
+    hidden prompt until the 10s timeout and the password silently fell back to
+    plaintext. The fix passes start_new_session=True so setsid() detaches the
+    child from the terminal and readpassphrase reads the piped stdin.
+    """
+
+    def _fake_ok_run(self, calls):
+        def fake_run(cmd, **kwargs):
+            calls["cmd"] = cmd
+            calls["kwargs"] = kwargs
+            return unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_macos_detaches_from_controlling_terminal(self, monkeypatch):
+        """The security call MUST pass start_new_session=True. Without it the
+        bug is invisible to any test lacking a controlling tty, so we assert
+        on the call itself rather than on behavior.
+        """
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_IS_MACOS", True)
+        calls: dict = {}
+        monkeypatch.setattr(_rotbyte_pkg.notify._subprocess, "run",
+                            self._fake_ok_run(calls))
+
+        stored, backend = _rotbyte_pkg.notify._keychain_set("me@host", "pw-1234")
+
+        assert (stored, backend) == (True, "keychain")
+        assert calls["cmd"][:2] == ["security", "add-generic-password"]
+        assert calls["kwargs"].get("start_new_session") is True
+        # The password must never appear in argv (visible via `ps`); it is
+        # fed over stdin instead.
+        assert "pw-1234" not in calls["cmd"]
+
+    def test_macos_timeout_falls_back_to_plaintext(self, monkeypatch):
+        """A `security` hang (TimeoutExpired) degrades to plaintext instead of
+        crashing — the exact pre-fix real-world symptom.
+        """
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_IS_MACOS", True)
+        def fake_run(cmd, **kwargs):
+            raise _rotbyte_pkg.notify._subprocess.TimeoutExpired(cmd, 10)
+        monkeypatch.setattr(_rotbyte_pkg.notify._subprocess, "run", fake_run)
+
+        assert _rotbyte_pkg.notify._keychain_set("me@host", "pw") == (False, "plaintext")
+
+    def test_macos_nonzero_exit_falls_back_to_plaintext(self, monkeypatch):
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_IS_MACOS", True)
+        def fake_run(cmd, **kwargs):
+            raise _rotbyte_pkg.notify._subprocess.CalledProcessError(1, cmd)
+        monkeypatch.setattr(_rotbyte_pkg.notify._subprocess, "run", fake_run)
+
+        assert _rotbyte_pkg.notify._keychain_set("me@host", "pw") == (False, "plaintext")
+
+    def test_macos_missing_security_binary_falls_back(self, monkeypatch):
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_IS_MACOS", True)
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("security")
+        monkeypatch.setattr(_rotbyte_pkg.notify._subprocess, "run", fake_run)
+
+        assert _rotbyte_pkg.notify._keychain_set("me@host", "pw") == (False, "plaintext")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 32. Notify config path
 # ══════════════════════════════════════════════════════════════════════════════
 

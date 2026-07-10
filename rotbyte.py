@@ -162,7 +162,7 @@ import smtplib  # noqa: F401
 
 # ── Version and process exit codes ────────────────────────────────────────────
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # Documented process exit codes. Callers (cron, monitoring, CI) rely on
 # these — keep them stable and add new codes rather than reusing existing
