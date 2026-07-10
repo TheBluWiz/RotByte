@@ -159,9 +159,9 @@ On macOS this truncates the live log of each still-installed scan in place (laun
 
 On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
-> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [docs/macOS Permissions.md](docs/macOS%20Permissions.md).
+> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [macOS Permissions](docs/macos-permissions.md) (or run `rotbyte --docs permissions`).
 >
-> **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [docs/Windows Task Scheduler.md](docs/Windows%20Task%20Scheduler.md) for uninstall and inspection commands.
+> **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [Windows Task Scheduler](docs/windows-task-scheduler.md) (or run `rotbyte --docs scheduler`) for uninstall and inspection commands.
 
 You can still use cron if you prefer:
 
@@ -190,7 +190,7 @@ rotbyte --track --every 1h --full-at 2h --notify email /Volumes/Media
 
 Full scans (`--check`) always send a health report — whether everything checks out or something needs attention. Quick scans only notify when there's a problem, so your inbox stays clean.
 
-For provider-specific setup (Gmail, iCloud, Outlook) see [docs/Email Notification Setup.md](docs/Email%20Notification%20Setup.md).
+For provider-specific setup (Gmail, iCloud, Outlook) see [Email Notification Setup](docs/email-notification-setup.md) (or run `rotbyte --docs notify`).
 
 ## Incremental verification
 

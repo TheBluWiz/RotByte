@@ -2525,6 +2525,90 @@ class TestKeychainStore:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 31c. In-tool documentation (--docs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDocsCommand:
+    """`rotbyte --docs [TOPIC]` prints a bundled setup guide (or lists
+    topics). The guides ship inside the package so this works across install
+    methods; these tests also guard the docs move by requiring each topic's
+    file to exist and be readable.
+    """
+
+    def test_every_topic_has_a_readable_bundled_file(self):
+        for topic in _rotbyte_pkg.guides._TOPICS:
+            body = _rotbyte_pkg.guides._read_topic(topic)
+            assert body.strip(), f"{topic}.md is empty or missing"
+
+    def test_bundled_copies_match_source_of_truth(self):
+        """docs/*.md is the human-edited source of truth; _rotbyte/docs/*.md are
+        byte-identical copies produced by generate-man.sh and bundled into the
+        package. Guard against drift when someone edits one and forgets to run
+        the generator (there is intentionally no in-file "generated" banner).
+        """
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parent
+        for topic, (stem, _desc) in _rotbyte_pkg.guides._TOPICS.items():
+            source = (repo / "docs" / f"{stem}.md").read_bytes()
+            bundled = (repo / "_rotbyte" / "docs" / f"{stem}.md").read_bytes()
+            assert source == bundled, (
+                f"{stem}.md differs between docs/ (source) and _rotbyte/docs/ "
+                f"(bundled) — run ./generate-man.sh")
+
+    def test_list_topics(self, capsys):
+        rc = _rotbyte_pkg.guides.run_docs("")
+        out = capsys.readouterr().out
+        assert rc == 0
+        for topic in ("notify", "permissions", "scheduler"):
+            assert topic in out
+
+    def test_show_known_topic(self, capsys):
+        rc = _rotbyte_pkg.guides.run_docs("notify")
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Email Notification Setup" in out
+
+    def test_alias_resolves(self, capsys):
+        # "macos" is an alias for the permissions guide.
+        rc = _rotbyte_pkg.guides.run_docs("macos")
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Permissions" in out
+
+    def test_unknown_topic_errors_and_lists(self, capsys):
+        rc = _rotbyte_pkg.guides.run_docs("nonsense")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "unknown help topic 'nonsense'" in err
+        assert "notify" in err  # the listing is offered on the error path
+
+    def test_cli_docs_lists_and_exits_zero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv", ["rotbyte", "--docs"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        assert "notify" in capsys.readouterr().out
+
+    def test_cli_docs_topic_ignores_trailing_path(self, capsys):
+        # The nargs='?' optional next to the nargs='?' positional must not
+        # misassign: `--docs notify /some/path` shows notify and does not scan.
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--docs", "notify", "/some/path"]):
+                rotbyte.main()
+        assert exc.value.code == 0
+        assert "Email Notification Setup" in capsys.readouterr().out
+
+    def test_cli_docs_conflicts_with_untrack(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--untrack", "--docs"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--docs" in capsys.readouterr().err
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 32. Notify config path
 # ══════════════════════════════════════════════════════════════════════════════
 

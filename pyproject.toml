@@ -46,11 +46,17 @@ rotbyte = "rotbyte:main"
 py-modules = ["rotbyte"]
 packages = ["_rotbyte", "_rotbyte.scheduler"]
 
-# Auxiliary files (man page, shell completions) are installed for system-wide
+# Setup guides are bundled inside the package so `rotbyte --docs <topic>` can
+# print them regardless of install method (Homebrew, pipx, pip).
+[tool.setuptools.package-data]
+"_rotbyte" = ["docs/*.md"]
+
+# Auxiliary files (man pages, shell completions) are installed for system-wide
 # installs (pip with --prefix) but are not placed in pipx's isolated venv.
 # Packagers should install these manually for the best user experience.
 [tool.setuptools.data-files]
-"share/man/man1" = ["rotbyte.1"]
+"share/man/man1" = ["man/rotbyte.1"]
+"share/man/man7" = ["man/rotbyte-notify.7", "man/rotbyte-permissions.7"]
 "share/bash-completion/completions" = ["completions/rotbyte_completions.bash"]
 "share/zsh/site-functions" = ["completions/_rotbyte"]
 "share/fish/vendor_completions.d" = ["completions/rotbyte_completions.fish"]

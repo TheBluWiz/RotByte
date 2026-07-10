@@ -255,6 +255,22 @@ prints where to look
 instead of deleting anything. The checksum databases are never touched. Exits 0
 even when there is nothing to clear.
 .TP
+.BI \-\-docs " [TOPIC]"
+Print a bundled setup guide in the terminal and exit. Available topics are
+.IR notify " (email notifications), " permissions " (macOS Full Disk Access),"
+and
+.I scheduler
+(Windows Task Scheduler). Run
+.B \-\-docs
+with no
+.I TOPIC
+to list them. Output is paged when stdout is a terminal. The
+.IR notify " and " permissions
+guides are also installed as
+.BR rotbyte-notify (7)
+and
+.BR rotbyte-permissions (7).
+.TP
 .BI \-\-every " INTERVAL"
 Quick scan frequency when using
 .BR \-\-track .
@@ -493,6 +509,12 @@ Jamey Wicklund
 .UR https://github.com/TheBluWiz
 .UE
 .SH SEE ALSO
+.BR rotbyte-notify (7),
+.BR rotbyte-permissions (7),
 .BR b2sum (1),
 .BR sha256sum (1),
 .BR sqlite3 (1)
+.PP
+The same guides are available in the terminal via
+.B rotbyte \-\-docs
+.RB ( notify ", " permissions ", " scheduler ).

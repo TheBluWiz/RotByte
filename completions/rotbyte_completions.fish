@@ -20,6 +20,7 @@ complete -c rotbyte -l repair -d 'Re-point broken scheduled scans after an upgra
 complete -c rotbyte -l untrack -d 'Remove scheduled scans for a directory'
 complete -c rotbyte -l untrack-all -d 'Remove all scheduled scans'
 complete -c rotbyte -l clear-logs -d 'Clear rotbyte scheduler logs'
+complete -c rotbyte -l docs -d 'Show a setup guide in the terminal' -xa 'notify permissions scheduler'
 complete -c rotbyte -l every -r -x -a '30m 1h 2h 4h' -d 'Quick scan frequency for --track'
 complete -c rotbyte -l full-at -r -x -a '0h 1h 2h 3h 4h 6h 12h 14h 18h 22h' -d 'Daily clock times for full scans'
 complete -c rotbyte -l notify -r -x -a 'email' -d 'Send notification on problems'

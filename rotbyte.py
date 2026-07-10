@@ -108,6 +108,7 @@ from _rotbyte.platform import (
     _try_lock,
     _unlock,
 )
+from _rotbyte.guides import run_docs
 from _rotbyte.power import PreventSleep
 from _rotbyte.progress import ProgressBar, Spinner
 from _rotbyte.scheduler import (
@@ -192,6 +193,7 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
     if args.status:              flags.append("--status")
     if args.repair:              flags.append("--repair")
     if args.clear_logs:          flags.append("--clear-logs")
+    if args.docs is not None:    flags.append("--docs")
     if args.report:              flags.append("--report")
     if args.check:               flags.append("--check")
     if args.accept:              flags.append("--accept")
@@ -424,6 +426,9 @@ Exit codes:
                              "orphaned logs left behind by past --untrack / --repair. "
                              "macOS only writes such files; on Linux/Windows it reports "
                              "where the logs live (journald / Task Scheduler history).")
+    parser.add_argument("--docs", nargs="?", const="", default=None, metavar="TOPIC",
+                        help="Show a setup guide in the terminal (topics: notify, "
+                             "permissions, scheduler). Run with no TOPIC to list them.")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
@@ -475,6 +480,13 @@ Exit codes:
             print(f"Error: --clear-logs cannot be combined with "
                   f"{', '.join(conflicts)}.", file=sys.stderr)
             sys.exit(1)
+
+    # --docs prints a bundled setup guide (or lists topics) and exits. Purely
+    # informational: needs no target directory, database, or lock, so dispatch
+    # it before any of that. args.docs is "" for a bare --docs (list), the
+    # topic string otherwise, and None when the flag was not given.
+    if args.docs is not None:
+        sys.exit(run_docs(args.docs))
 
     # --notify-setup is a standalone command
     if args.notify_setup:
