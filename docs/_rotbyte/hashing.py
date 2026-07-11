@@ -1,0 +1,532 @@
+"""File hashing pipeline.
+
+:func:`hash_file` runs in a worker process and does the actual I/O;
+:func:`run_hashing` drives a :class:`ProcessPoolExecutor` over a prescan
+list and writes results to the database in batched transactions.
+:func:`detect_missing` reconciles the on-disk file set with the database
+after the hash phase completes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from typing import Dict, List, Optional, Set, Tuple
+
+from .database import ChecksumDB
+from .helpers import _format_duration, _mtime_iso, _resolve
+from .progress import ProgressBar
+
+HASH_BUFFER_SIZE = 1024 * 1024  # 1 MiB — balances syscall overhead vs memory
+BATCH_SIZE = 200                # DB writes per transaction before committing
+
+
+def hash_file(file_path: str) -> Tuple[str, Optional[str], Optional[int], Optional[str], Optional[str]]:
+    """Compute BLAKE2b-512 hash of a file.
+
+    Returns ``(path, hex_digest, size, mtime_iso, error)``. On success the
+    error slot is None and the others are populated. On read failure the
+    digest/size/mtime are None and ``error`` carries the OSError message
+    so the parent process can aggregate per-file failures rather than
+    spamming stderr from inside each worker.
+
+    Metadata is captured via fstat() on the open file descriptor so that
+    the recorded size and mtime correspond to the exact bytes that were
+    hashed — no TOCTOU gap between stat() and read().
+
+    This function runs in a worker process via ProcessPoolExecutor and
+    must not access the database or any shared mutable state.
+    """
+    try:
+        h = hashlib.blake2b()
+        with open(file_path, "rb") as f:
+            st = os.fstat(f.fileno())
+            while True:
+                chunk = f.read(HASH_BUFFER_SIZE)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return file_path, h.hexdigest(), st.st_size, _mtime_iso(st), None
+    except OSError as e:
+        return file_path, None, None, None, str(e)
+
+
+# ── Filesystem scanning ───────────────────────────────────────────────────────
+
+def scan_files(target_dir: str, db_path: str, include_hidden: bool = False,
+               exclude_dirs: Optional[Set[str]] = None,
+               case_insensitive: bool = False,
+               stat_out: Optional[Dict[str, os.stat_result]] = None) -> List[str]:
+    """Walk the directory tree and return a sorted list of file paths.
+
+    Skips by default:
+      - Hidden files and directories (names starting with '.'; on
+        Windows, also entries with the FILE_ATTRIBUTE_HIDDEN bit set)
+      - Anything that is not a regular file (symlinks, FIFOs, devices,
+        sockets) — hashing these would follow a symlink out of scope,
+        or block forever on a FIFO / device that never yields EOF
+      - .b2sum and .b2 hash files (handled separately by --import)
+      - The database file and its SQLite companion files (-wal, -shm, .lock)
+      - Any directories in exclude_dirs
+
+    If ``case_insensitive`` is true (on macOS APFS / NTFS users who pass
+    ``--case-insensitive``), files whose paths differ only by case are
+    de-duplicated (the first-seen real path is kept) so a rename-by-case
+    doesn't queue the same file twice. The real on-disk path is always
+    returned unchanged — it must survive verbatim for stat()/open().
+
+    Directory symlinks are not followed (walked with followlinks=False),
+    which keeps the walk inside the target tree and prevents cyclic loops.
+    File symlinks that resolve to a regular file ARE hashed; anything that
+    resolves to a non-regular file (FIFO, device, socket) or dangles is
+    skipped, so an accidental named pipe or a link to /dev/zero can't make
+    a worker block or loop forever.
+    On OSError during walk (e.g. a network drive that vanished mid-scan),
+    emits a warning and returns what was collected so far rather than
+    aborting the scan.
+    """
+    skip_files = {
+        _resolve(db_path),
+        _resolve(db_path + ".lock"),
+        _resolve(db_path + "-wal"),
+        _resolve(db_path + "-shm"),
+    }
+    # Cheap gate for the skip check below: a regular file keeps its basename
+    # through realpath, so only an entry whose basename matches one of the DB
+    # sidecars can possibly resolve into skip_files. Lets us skip the per-file
+    # _resolve() (a realpath syscall chain) on the whole tree.
+    skip_basenames = {os.path.basename(p) for p in skip_files}
+    exclude = exclude_dirs or set()
+    files = []
+    seen_casefold: Set[str] = set()  # dedup keys for --case-insensitive
+
+    def _walk_err(exc: OSError) -> None:
+        # A typical cause is a network drive disappearing mid-scan. Warn
+        # the user and keep going with what we have.
+        print(f"\n  ! Walk error at {getattr(exc, 'filename', '?')}: {exc}",
+              file=sys.stderr)
+
+    for root, dirs, filenames in os.walk(target_dir, followlinks=False,
+                                         onerror=_walk_err):
+        if not include_hidden:
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".")
+                       and not _is_windows_hidden(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if _resolve(os.path.join(root, d)) not in exclude]
+
+        for name in filenames:
+            if not include_hidden:
+                if name.startswith("."):
+                    continue
+                full = os.path.join(root, name)
+                if _is_windows_hidden(full):
+                    continue
+            if name.endswith(".b2sum") or name.endswith(".b2"):
+                continue
+            full = os.path.join(root, name)
+            # Only hash regular files. stat() follows symlinks, so a file
+            # symlink that resolves to a regular file is still hashed (the
+            # tool's documented behaviour), while anything resolving to a
+            # non-regular file is skipped: a FIFO or a symlink to a device
+            # (e.g. /dev/zero) would otherwise make the worker's open()/read
+            # block or loop forever. stat() itself never blocks on a FIFO
+            # (only open() does), and it must happen at scan time — an fstat
+            # inside hash_file is too late because open() blocks first. A
+            # broken/dangling symlink raises OSError here and is skipped.
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # skip FIFOs, devices, sockets, dangling symlinks
+            # Skip the DB and its sidecars. Only pay the realpath when the
+            # basename matches (see skip_basenames). A symlink named unlike the
+            # DB but pointing at it would slip past the basename gate and get
+            # hashed once — harmless, and vanishingly rare in the media/archive
+            # trees rotbyte targets.
+            if name in skip_basenames and _resolve(full) in skip_files:
+                continue
+            if case_insensitive:
+                # De-dup by a case-folded comparison key, but keep the
+                # real path for the filesystem. casefold() (not lower())
+                # for correct Unicode folding.
+                key = full.casefold()
+                if key in seen_casefold:
+                    continue
+                seen_casefold.add(key)
+            files.append(full)
+            # Hand the stat we just took to the caller so prescan_files can
+            # reuse it instead of stat()-ing every file a second time.
+            if stat_out is not None:
+                stat_out[full] = st
+    files.sort()
+    return files
+
+
+def _is_windows_hidden(path: str) -> bool:
+    """Return True when ``path`` has the Windows HIDDEN attribute set.
+
+    No-op on POSIX. Windows users running without ``--include-hidden``
+    expect hidden files to be skipped even when they don't have a dot
+    prefix — the POSIX "dotfile" convention doesn't apply there.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import stat
+        attrs = os.stat(path, follow_symlinks=False).st_file_attributes  # type: ignore[attr-defined]
+        return bool(attrs & stat.FILE_ATTRIBUTE_HIDDEN)
+    except (OSError, AttributeError):
+        return False
+
+
+# ── Pre-scan: decide what needs hashing ────────────────────────────────────────
+
+class FileEntry:
+    """Snapshot of a file's metadata at prescan time.
+
+    Used to decide whether a file needs re-hashing (based on size/mtime
+    changes). The actual metadata stored in the database comes from
+    fstat() during hashing to avoid TOCTOU gaps.
+
+    The 'modified' flag records whether size or mtime changed since the
+    last check. This is how rotbyte distinguishes intentional edits
+    (modified=True, hash change is expected) from silent bit rot
+    (modified=False, hash should not have changed).
+    """
+    __slots__ = ("path", "name", "size", "mtime", "old_checksum", "modified")
+
+    def __init__(self, path: str, name: str, size: int, mtime: str,
+                 old_checksum: Optional[str], modified: bool):
+        self.path = path
+        self.name = name
+        self.size = size
+        self.mtime = mtime
+        self.old_checksum = old_checksum
+        self.modified = modified
+
+
+def prescan_files(
+    all_files: List[str],
+    existing: Dict[str, Tuple[str, int, str, str]],
+    force: bool,
+    stat_cache: Optional[Dict[str, os.stat_result]] = None,
+) -> Tuple[List[FileEntry], int]:
+    """Compare files on disk against the database to decide what to hash.
+
+    Returns (files_to_hash, skip_count). Files are skipped (not hashed)
+    only when all of these are true:
+      - Not running with --check (force=False)
+      - File is not marked MISSING or FAILED in the database
+      - File's size and mtime match the stored values
+
+    ``stat_cache`` is the ``{path: os.stat_result}`` dict scan_files fills
+    via its ``stat_out`` parameter. When a path is present, its stat is
+    reused instead of a fresh ``os.stat`` — the two phases run back to back,
+    so this halves the stat syscalls over the tree. A path absent from the
+    cache (or ``stat_cache is None``) falls back to a live stat.
+    """
+    to_hash: List[FileEntry] = []
+    skip_count = 0
+
+    for fpath in all_files:
+        st = stat_cache.get(fpath) if stat_cache is not None else None
+        if st is None:
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+
+        name = os.path.basename(fpath)
+        size = st.st_size
+        mtime = _mtime_iso(st)
+
+        record = existing.get(fpath)
+        if record:
+            old_checksum, old_size, old_mtime, old_status = record
+            metadata_changed = (old_size != size or old_mtime != mtime)
+
+            # Always re-hash MISSING files (they reappeared — verify against
+            # old checksum) and FAILED files (may have been restored from
+            # backup). Also re-hash if metadata changed or --check is set.
+            if not force and old_status not in ("MISSING", "FAILED") and not metadata_changed:
+                skip_count += 1
+                continue
+            to_hash.append(FileEntry(fpath, name, size, mtime, old_checksum, metadata_changed))
+        else:
+            to_hash.append(FileEntry(fpath, name, size, mtime, None, True))
+
+    return to_hash, skip_count
+
+
+# ── Hashing phase ─────────────────────────────────────────────────────────────
+
+class HashResult:
+    """Counters accumulated during the hashing phase."""
+    __slots__ = ("new", "ok", "updated", "failed", "errors", "bytes_hashed",
+                 "budget_exceeded", "vanished_missing")
+
+    def __init__(self):
+        self.new = 0
+        self.ok = 0
+        self.updated = 0
+        self.failed = 0
+        self.errors = 0
+        self.bytes_hashed = 0
+        self.budget_exceeded = False
+        # Files that vanished between prescan and hashing and were marked
+        # MISSING here. Surfaced so the caller can fold them into the run's
+        # missing total — detect_missing() can't see them (they were on disk
+        # at walk time, so they're still in its on_disk set).
+        self.vanished_missing = 0
+
+
+def run_hashing(
+    db: ChecksumDB,
+    entries: List[FileEntry],
+    workers: int,
+    now: str,
+    interrupted: List[bool],
+    quiet: bool = False,
+    budget_seconds: Optional[int] = None,
+    skip_missing: bool = False,
+) -> HashResult:
+    """Hash files in parallel and write results to the database.
+
+    Files are submitted in batches of BATCH_SIZE. Each batch is wrapped
+    in a database transaction with try/finally to guarantee every opened
+    transaction is either committed or rolled back — even on interrupt
+    or worker crash.
+
+    On interrupt, or when an elapsed ``budget_seconds`` is reached (checked
+    after every completed file), the files already being hashed are allowed
+    to finish and their results are committed, the queued-but-unstarted
+    files in the current batch are cancelled so leaving the pool doesn't
+    drain them past the cutoff, and no further batches are started.
+
+    ``skip_missing`` mirrors the top-level ``--skip-missing`` flag: when
+    set, files that vanish between prescan and hashing are left untouched
+    rather than marked MISSING, so the flag's "don't check for removed
+    files" contract holds for the race case too. Files that this function
+    does mark MISSING are counted in ``HashResult.vanished_missing`` for the
+    caller to fold into the run's missing total.
+    """
+    result = HashResult()
+    total = len(entries)
+    if total == 0:
+        return result
+
+    processed = 0
+    entry_map = {e.path: e for e in entries}
+    bar = ProgressBar(total, quiet=quiet)
+    budget_start = time.monotonic()
+    budget_exceeded = False
+
+    # Aggregate per-file read errors so a permission-denied subtree
+    # doesn't spew thousands of lines to stderr. We print the first
+    # ERROR_PRINT_LIMIT inline and a summary line for the rest at the
+    # end of the phase. Files that vanished between prescan and hash
+    # (FileNotFoundError) are routed to MISSING instead of "errors"
+    # because that's what they actually are.
+    ERROR_PRINT_LIMIT = 10
+    deferred_missing: List[str] = []
+    error_messages: List[str] = []
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for batch_start in range(0, total, BATCH_SIZE):
+            if interrupted[0] or budget_exceeded:
+                break
+
+            batch = entries[batch_start : batch_start + BATCH_SIZE]
+
+            # A worker dying (OOM/segfault) poisons the whole pool: the
+            # per-file `except Exception` below swallows the resulting
+            # BrokenProcessPool during future.result(), but the *next*
+            # batch's executor.submit() then raises it uncaught. Catch it
+            # here so we stop cleanly, keeping every result committed so
+            # far, instead of aborting with a raw traceback.
+            try:
+                futures = {executor.submit(hash_file, e.path): e.path for e in batch}
+
+                with db.transaction():
+                    for future in as_completed(futures):
+                        if interrupted[0]:
+                            break
+
+                        # Check time budget after each completed file
+                        if budget_seconds is not None and not budget_exceeded:
+                            elapsed = time.monotonic() - budget_start
+                            if elapsed >= budget_seconds:
+                                budget_exceeded = True
+                                result.budget_exceeded = True
+                                remaining = total - processed
+                                if not quiet:
+                                    print(f"\n  Time budget reached ({_format_duration(elapsed)})."
+                                          f" Stopping with {remaining:,} files remaining.")
+                                break
+
+                        # Catch worker crashes (OOM, segfault, BrokenExecutor
+                        # when the pool dies) so one bad file doesn't abort
+                        # the entire run. BrokenExecutor is a subclass of
+                        # Exception, so this catches both — left untyped to
+                        # signal the intent to catch anything the worker
+                        # subprocess layer can raise.
+                        try:
+                            fpath, digest, hash_size, hash_mtime, hash_err = future.result()
+                        except Exception as e:  # noqa: BLE001
+                            fpath = futures[future]
+                            # Worker crashes are rare and indicate something
+                            # serious (OOM, segfault). Print these inline.
+                            print(f"\n  ! Worker error for {fpath}: {e}", file=sys.stderr)
+                            result.errors += 1
+                            processed += 1
+                            bar.update(0)
+                            continue
+
+                        processed += 1
+
+                        if digest is None:
+                            # The worker couldn't read the file. Distinguish a
+                            # file that vanished between prescan and hash (route
+                            # to MISSING — that's the truth) from a real read
+                            # error (permission, I/O failure). Best-effort lstat:
+                            # if it raises, the file is gone.
+                            try:
+                                os.lstat(fpath)
+                                existed = True
+                            except OSError:
+                                existed = False
+                            if not existed:
+                                deferred_missing.append(fpath)
+                            else:
+                                result.errors += 1
+                                error_messages.append(
+                                    f"  ! Error reading {fpath}: {hash_err}"
+                                    if hash_err else
+                                    f"  ! Error reading {fpath}"
+                                )
+                                if len(error_messages) <= ERROR_PRINT_LIMIT:
+                                    print(f"\n{error_messages[-1]}", file=sys.stderr)
+                            bar.update(0)
+                            continue
+
+                        entry = entry_map[fpath]
+
+                        # Determine file status based on hash comparison and
+                        # whether the file's metadata changed.
+                        if entry.old_checksum is None:
+                            status = "NEW"
+                            result.new += 1
+                        elif digest == entry.old_checksum:
+                            status = "OK"
+                            result.ok += 1
+                        elif entry.modified:
+                            # Hash changed but so did mtime/size — this is an
+                            # intentional edit, not corruption. Accept it.
+                            status = "OK"
+                            result.updated += 1
+                        else:
+                            # Hash changed with no metadata change — bit rot.
+                            status = "FAILED"
+                            result.failed += 1
+                            print(f"\n  ✗ FAILED: {fpath}")
+
+                        result.bytes_hashed += hash_size
+
+                        db.upsert_file(
+                            fpath, entry.name, hash_size, hash_mtime,
+                            digest, entry.old_checksum, status, now,
+                        )
+
+                        bar.update(hash_size)
+
+                # Option A: if we broke out early (interrupt or budget), cancel
+                # the queued-but-unstarted hashes in this batch. Otherwise
+                # leaving the executor's `with` block would call
+                # shutdown(wait=True) and drain the whole batch — up to
+                # BATCH_SIZE large files — well past the cutoff. Futures already
+                # executing in a worker can't be cancelled and are allowed to
+                # finish; any that completed before the break were already
+                # committed above.
+                if interrupted[0] or budget_exceeded:
+                    for f in futures:
+                        f.cancel()
+            except BrokenProcessPool as e:
+                # A worker process died and took the pool with it. The
+                # transaction for this batch has already rolled back (its
+                # context manager unwound as the exception propagated).
+                # Report via the existing error channel, stop starting new
+                # batches, and fall through to return the results committed
+                # by earlier batches rather than crashing the whole run.
+                msg = (f"  ! Worker pool crashed ({e}); stopping with "
+                       f"partial results.")
+                error_messages.append(msg)
+                print(f"\n{msg}", file=sys.stderr)
+                result.errors += 1
+                break
+
+    bar.finish()
+
+    # Mark files that vanished mid-scan as MISSING in their own
+    # transaction. They were *known* files in the database (otherwise
+    # they wouldn't have been queued for hashing) so this is the same
+    # "previously tracked, no longer on disk" semantic that
+    # detect_missing() handles for the prescan-discovered case. Skipped
+    # entirely under --skip-missing so the flag's "don't check for removed
+    # files" contract holds for this race too.
+    if deferred_missing and not skip_missing:
+        with db.transaction():
+            for mpath in deferred_missing:
+                # Brand-new files (no row yet) just disappear silently —
+                # there's nothing to mark MISSING.
+                if mpath in entry_map and entry_map[mpath].old_checksum is not None:
+                    db.mark_missing(mpath, now)
+                    result.vanished_missing += 1
+                    # detect_missing() won't report these (they were on disk
+                    # at walk time), so surface them here.
+                    print(f"  ? MISSING (vanished during scan): {mpath}")
+
+    extra_errors = len(error_messages) - ERROR_PRINT_LIMIT
+    if extra_errors > 0:
+        print(f"\n  ... and {extra_errors:,} more read errors suppressed.",
+              file=sys.stderr)
+
+    return result
+
+
+# ── Missing file detection ─────────────────────────────────────────────────────
+
+def detect_missing(
+    db: ChecksumDB,
+    target_dir: str,
+    on_disk: Set[str],
+    existing: Dict[str, Tuple[str, int, str, str]],
+    now: str,
+) -> int:
+    """Detect and report all files missing from disk.
+
+    Uses the already-loaded records dict from the prescan phase to avoid
+    a redundant database query. Newly missing files are marked MISSING
+    in the database. Previously known missing files are also reported so
+    every run shows the full picture. Returns total count of all currently
+    missing files.
+    """
+    missing_paths = set(existing.keys()) - on_disk
+    already_missing = db.get_missing_paths(target_dir) - on_disk
+    newly_missing = missing_paths - already_missing
+
+    if newly_missing:
+        with db.transaction():
+            for mpath in sorted(newly_missing):
+                db.mark_missing(mpath, now)
+
+    all_missing = newly_missing | already_missing
+    for mpath in sorted(all_missing):
+        print(f"  ? MISSING: {mpath}")
+
+    return len(all_missing)

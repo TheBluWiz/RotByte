@@ -1,0 +1,520 @@
+.TH ROTBYTE 1 "2026-07-11" "rotbyte 1.3.0" "User Commands"
+.SH NAME
+rotbyte \- detect bit rot by tracking BLAKE2b checksums
+.SH SYNOPSIS
+.B rotbyte
+.RI [ OPTIONS ]
+.RI [ PATH ]
+.SH DESCRIPTION
+.B rotbyte
+computes BLAKE2b-512 checksums for every file in a directory tree and
+stores them in a local SQLite database. On subsequent runs it detects
+silent data corruption (bit rot) by comparing stored checksums against
+freshly computed ones.
+.PP
+By default, only files whose size or modification time have changed are
+re-hashed. Use
+.B \-\-check
+to force a full re-verify of every file, which is the only way to catch
+true bit rot (corruption without metadata change).
+.PP
+The database is created automatically as
+.BI . dirname _rotbyte.db
+inside the target directory on first run.
+.PP
+Sending SIGINT (Ctrl\-C) once lets the files currently being hashed finish,
+saves progress, and exits with code 3. Sending SIGINT a second time while a
+graceful shutdown is in progress aborts immediately.
+.SH OPTIONS
+.TP
+.B \-\-check
+Force re-hash of every file regardless of modification time.
+.TP
+.B \-\-report
+Print an integrity status report and exit. The report includes: a count
+of tracked files grouped by status (OK, NEW, FAILED, MISSING); full
+details for any FAILED files including expected and actual checksums; and
+a list of files not verified in 90 or more days.
+.TP
+.BI \-\-accept " FILE"
+Accept a single file's current state as correct. If the file is MISSING,
+its record is removed. If FAILED, it is re-hashed and the new checksum
+becomes the known-good baseline.
+.TP
+.B \-\-accept\-all
+Accept all current state as the new baseline. Clears all MISSING records
+and re-hashes all FAILED files.
+.TP
+.B \-\-import
+Import existing
+.I .b2sum
+and
+.I .b2
+hash files into the database. Verifies each hash matches the file on disk
+before importing, then deletes the hash file.
+Files already tracked in the database with a status other than MISSING or
+FAILED are skipped and reported; they are not re-imported.
+MISSING or FAILED records are accepted and updated if the hash matches.
+.TP
+.BI \-\-workers " N"
+Number of parallel hashing workers. Defaults to the CPU count.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress normal output; only print problems. Suitable for cron jobs.
+.TP
+.B \-\-skip\-missing
+Do not check for files that have been removed from disk.
+.TP
+.B \-\-include\-hidden
+Include hidden files and directories (names starting with \fB.\fR),
+which are excluded by default.
+.TP
+.BI \-\-exclude " PATH" \fR...
+Exclude one or more directories. Paths may be relative to the target
+directory or absolute.
+.TP
+.BI \-\-db " PATH"
+Use a custom database path instead of the default location inside the
+target directory.
+.TP
+.BI \-\-export " FILE"
+Export a plain-text manifest of all tracked file checksums to FILE.
+Format is b2sum-compatible: one line per file with the BLAKE2b-512
+baseline checksum followed by the file path. Missing files are excluded.
+.TP
+.B \-\-json
+Output results as a JSON object instead of human-readable text. Suppresses
+progress bars and spinners. Suitable for scripts and monitoring pipelines.
+.PP
+The JSON object contains the following keys:
+.RS
+.TP
+.B status
+\fIcomplete\fR or \fIinterrupted\fR.
+.TP
+.B directory
+Absolute path of the scanned directory.
+.TP
+.B duration_seconds
+Elapsed wall time as a floating-point number.
+.TP
+.B bytes_hashed
+Total bytes read during hashing.
+.TP
+.BR new ", " updated ", " verified_ok ", " failed ", " missing ", " skipped ", " errors ", " likely_moves
+Integer counters for each outcome category.
+.TP
+.B failed_files
+Array of file paths for all FAILED files.
+Present only when
+.B failed
+is greater than zero.
+.RE
+.TP
+.BI \-\-budget " DURATION"
+Time budget for
+.B \-\-check
+scans (e.g.
+.IR 2h ", " 30m ", " 1h30m ).
+Files are verified stalest-first so each run covers a different portion
+of the database. Over successive runs, everything gets checked.
+Without
+.BR \-\-track ,
+requires
+.B \-\-check
+or
+.BR \-\-due .
+When used with
+.BR \-\-track ,
+also requires
+.BR \-\-full\-at .
+.TP
+.BI \-\-due " DURATION"
+Only re-verify files whose last verification is older than the given
+duration. Accepts values in the form
+.I Nd
+where N is a number of days (e.g.
+.IR 30d ", " 7d ", " 90d ).
+Implies
+.BR \-\-check .
+Combines naturally with
+.B \-\-budget
+to create time-limited incremental scans.
+.TP
+.B \-\-track
+Install platform-native scheduled scans. On macOS, writes launchd plists
+to
+.IR ~/Library/LaunchAgents/ .
+On Linux, writes systemd user timer and service units to
+.IR ~/.config/systemd/user/ .
+Combine with
+.BR \-\-every ", " \-\-full\-at ", and " \-\-budget
+to configure the schedule.
+.TP
+.B \-\-track\-setup
+Interactive setup wizard for
+.BR \-\-track .
+Prompts in order for: target directory, quick scan frequency
+.RB ( \-\-every ),
+full scan clock times
+.RB ( \-\-full\-at ),
+time budget per full scan
+.RB ( \-\-budget ),
+due threshold
+.RB ( \-\-due ),
+and whether to enable email notifications
+.RB ( \-\-notify " " email ).
+Each value is validated with the same parser used by the corresponding flag
+and the user is re-prompted on invalid input. Before installing, prints the
+equivalent
+.B \-\-track
+command line so the user can learn the flag form for future use.
+Email notifications require prior configuration via
+.BR \-\-notify\-setup ;
+if the config is absent, the wizard continues without email rather than
+installing a broken schedule.
+.TP
+.B \-\-status
+Show the status of all installed scheduled scans. For each tracked
+directory, displays: the quick and full scan schedule and whether each
+timer is active; the next scheduled full-scan time with a countdown (for
+active calendar schedules); any extra flags baked into the schedule (such as
+.BR \-\-budget ", " \-\-due ", " \-\-notify );
+the finish time of the most recent run converted to local time (a run that
+started but never completed is shown as in progress or interrupted); and a
+count of files by health status (OK, NEW, FAILED, MISSING) with the paths of
+up to five FAILED files. If no scheduled scans are found, suggests the
+.B \-\-track
+command.
+.TP
+.B \-\-repair
+Re-point every installed scheduled scan at the interpreter and script path
+that this rotbyte resolves to today, then reload it. Fixes schedules broken
+by a package upgrade that deleted the old paths (which otherwise fail
+silently at launch and show as
+.B BROKEN
+in
+.BR \-\-status ).
+The rewrite happens in place and preserves every flag and the target
+directory; schedules already on the current path are left untouched. Safe to
+run at any time — in particular after every
+.B brew upgrade
+of rotbyte or Python.
+.TP
+.BI \-\-untrack " [PATH]"
+Remove the scheduled rotbyte runs that were installed for the given
+directory. The path is canonicalised the same way
+.B \-\-track
+canonicalises it at install time (via
+.BR realpath (3)),
+so the same directory always maps to the same scheduled units. If
+.I PATH
+is omitted the current working directory is used.
+.IP
+On macOS the launchd agent is bootout-ed (or unloaded on older releases)
+and the plist file under
+.I ~/Library/LaunchAgents/
+is deleted. On Linux the systemd user timer and service are disabled,
+their unit files removed from
+.IR ~/.config/systemd/user/ ,
+and
+.B systemctl --user daemon-reload
+is run. On Windows the corresponding Task Scheduler tasks under
+.I \\rotbyte\\
+are deleted with
+.BR schtasks.exe .
+.IP
+The checksum database itself is not touched. If no scheduled run is
+installed for the target directory, a friendly notice is printed and
+rotbyte exits 0 \(em this is not an error.
+.TP
+.B \-\-untrack\-all
+Remove every scheduled rotbyte run on this machine across all tracked
+directories. Discovers installed units the same way
+.B \-\-status
+does and removes each one. Prints the list of removed units and a count.
+Exits 0 even when nothing was found.
+.IP
+Mutually exclusive with
+.BR \-\-untrack .
+.TP
+.B \-\-clear\-logs
+Clear rotbyte's scheduler logs. On macOS the live log of each still-installed
+scan is truncated in place (launchd holds the log file open between runs, so
+deleting it would leak disk until the next reload), while rotated generations
+(\fI.log.1\fR, \fI.log.2\fR) and orphaned logs left behind by a past
+.B \-\-untrack
+or
+.B \-\-repair
+are deleted. Only macOS keeps rotbyte-owned log files; on Linux the
+scheduled-scan output lives in the systemd journal and on Windows in Task
+Scheduler's history, so on those platforms
+.B \-\-clear\-logs
+prints where to look
+.RB ( journalctl " / Task Scheduler)"
+instead of deleting anything. The checksum databases are never touched. Exits 0
+even when there is nothing to clear.
+.TP
+.BI \-\-docs " [TOPIC]"
+Print a bundled setup guide in the terminal and exit. Available topics are
+.IR notify " (email notifications), " permissions " (macOS Full Disk Access),"
+and
+.I scheduler
+(Windows Task Scheduler). Run
+.B \-\-docs
+with no
+.I TOPIC
+to list them. Output is paged when stdout is a terminal. The
+.IR notify " and " permissions
+guides are also installed as
+.BR rotbyte-notify (7)
+and
+.BR rotbyte-permissions (7).
+.TP
+.BI \-\-every " INTERVAL"
+Quick scan frequency when using
+.BR \-\-track .
+Accepts durations like
+.IR 30m ", " 2h ", " 2h30m .
+Default:
+.IR 60m .
+Requires
+.BR \-\-track .
+.TP
+.BI \-\-full\-at " TIME" \fR...
+One or more daily clock times for full
+.B \-\-check
+scans when using
+.BR \-\-track .
+Accepts clock times like
+.IR 2h " (2:00 AM), " 14h30m " (2:30 PM)."
+Requires
+.BR \-\-track .
+.TP
+.BI \-\-notify " BACKEND"
+Send a notification on scan completion.
+Currently supported backends:
+.IR email .
+Requires prior configuration via
+.BR \-\-notify\-setup .
+.PP
+When used with
+.BR \-\-check ,
+a notification is always sent. The subject line reflects one of four states:
+.RS
+.TP
+.B pass
+Full re-verify completed with no problems and no read errors.
+Subject:
+.RI \(lq "rotbyte \(u2713 /path \(em all files OK" \(rq.
+.TP
+.B warning
+Full re-verify completed, checksums clean, but one or more files could not
+be read (hardware error, permissions, or file in use).
+Subject:
+.RI \(lq "rotbyte \(u26a0 /path \(em N read errors" \(rq.
+.TP
+.B fail
+Bit rot or missing files detected.
+Subject:
+.RI \(lq "rotbyte \(u2717 /path \(em N failed, N missing" \(rq.
+.TP
+.B interrupted
+Scan was cut short by SIGINT or SIGTERM before all files were verified.
+Subject:
+.RI \(lq "rotbyte \(u26a0 /path \(em scan interrupted" \(rq.
+.RE
+.PP
+Without
+.BR \-\-check
+(quick scan), a notification is only sent in the fail state.
+.PP
+Can be used standalone or with
+.BR \-\-track ,
+which persists the flag into the scheduled commands.
+.TP
+.BI \-\-notify\-setup " BACKEND"
+Interactive setup for notifications. Prompts in order: username,
+password, SMTP host, SMTP port, recipient address (Send alerts to),
+and sender address (Send alerts from). All fields default to the username
+except Send alerts from, which also defaults to the username but can be
+set to an alias (useful for iCloud alias addresses). Stores credentials in
+.IR ~/.config/rotbyte/notify.conf
+(Linux) or
+.IR "~/Library/Application Support/rotbyte/notify.conf"
+(macOS) with 0600 permissions, and sends a test email to confirm
+the configuration works.
+.TP
+.B \-\-version
+Print the version number and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+All files verified OK.
+.TP
+.B 1
+Missing files detected.
+.TP
+.B 2
+Bit rot detected (checksum mismatch).
+.TP
+.B 3
+Run was interrupted (safe to re-run).
+.TP
+.B 4
+Database integrity check failed (restore from backup).
+.TP
+.B 5
+Database locked by another rotbyte process (retry later).
+.TP
+.B 6
+I/O error (target directory unreachable, permission denied).
+.TP
+.B 7
+Internal error (worker pool died, unexpected exception).
+.SH FILE STATUSES
+.TP
+.B OK
+Checksum verified; file is intact.
+.TP
+.B NEW
+File seen for the first time.
+.TP
+.B FAILED
+Bit rot detected \(em hash changed without any metadata change.
+.TP
+.B MISSING
+File was previously tracked but no longer exists on disk.
+.SH EXAMPLES
+Index all files in the current directory:
+.PP
+.RS
+.B rotbyte
+.RE
+.PP
+Full re-verify of an external drive:
+.PP
+.RS
+.B rotbyte \-\-check /Volumes/Media
+.RE
+.PP
+Weekly cron job (quiet mode, log errors):
+.PP
+.RS
+.B 0 2 * * 0 rotbyte \-\-check \-q /data >> /var/log/rotbyte.log 2>&1
+.RE
+.PP
+Accept a restored file:
+.PP
+.RS
+.B rotbyte \-\-accept restored_file.mkv
+.RE
+.PP
+Full re-verify with a two-hour time budget:
+.PP
+.RS
+.B rotbyte \-\-check \-\-budget 2h /Volumes/Media
+.RE
+.PP
+Install scheduled scans (quick every 30 min, full re-verify daily at 2 AM with budget):
+.PP
+.RS
+.B rotbyte \-\-track \-\-every 30m \-\-full\-at 2h \-\-budget 2h /Volumes/Media
+.RE
+.PP
+Interactive setup wizard for scheduled scans:
+.PP
+.RS
+.B rotbyte \-\-track\-setup /Volumes/Media
+.RE
+.PP
+Set up email notifications:
+.PP
+.RS
+.B rotbyte \-\-notify\-setup email
+.RE
+.PP
+Full re-verify with email health report:
+.PP
+.RS
+.B rotbyte \-\-check \-\-notify email /Volumes/Media
+.RE
+.PP
+Scheduled scans with email alerts:
+.PP
+.RS
+.B rotbyte \-\-track \-\-every 1h \-\-full\-at 2h \-\-notify email /Volumes/Media
+.RE
+.PP
+Remove scheduled scans for a directory:
+.PP
+.RS
+.B rotbyte \-\-untrack /Volumes/Media
+.RE
+.PP
+Remove all scheduled scans:
+.PP
+.RS
+.B rotbyte \-\-untrack\-all
+.RE
+.SH FILES
+.TP
+.BI . dirname _rotbyte.db
+SQLite database storing checksums and metadata, created inside the
+target directory.
+.TP
+.BI . dirname _rotbyte.db.lock
+Lock file preventing concurrent runs.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+On Linux, overrides the base directory used to locate the notification
+config. Default:
+.IR ~/.config .
+The config is read from
+.IB $XDG_CONFIG_HOME /rotbyte/notify.conf .
+.SH NOTES
+.B rotbyte
+uses BLAKE2b-512 for hashing, which is faster than SHA-256 while
+providing equivalent collision resistance. Hashing is parallelized
+across multiple processes for maximum throughput on multi-core systems.
+.PP
+Symlinks are not followed to prevent infinite loops.
+.SH CAVEATS
+.PP
+.B rotbyte
+is POSIX-only and requires
+.BR fcntl (2)
+for file locking. It does not run on Windows.
+.PP
+On macOS, scheduled scans installed with
+.B \-\-track
+require Full Disk Access to be granted to the Python interpreter when
+scanning TCC-protected directories (Desktop, Documents, Downloads,
+external volumes). See
+.I docs/macOS\ Permissions.md
+in the source distribution for the setup procedure.
+.PP
+If a
+.B rotbyte
+process is killed with SIGKILL (or otherwise hard-killed), the lock file
+.BI ( .dirname _rotbyte.db.lock )
+will not be removed automatically. Delete it manually before re-running.
+.SH REQUIREMENTS
+Python 3.9 or later. macOS or Linux (uses
+.BR fcntl (2)
+for file locking).
+.SH AUTHORS
+Jamey Wicklund
+.UR https://github.com/TheBluWiz
+.UE
+.SH SEE ALSO
+.BR rotbyte-notify (7),
+.BR rotbyte-permissions (7),
+.BR b2sum (1),
+.BR sha256sum (1),
+.BR sqlite3 (1)
+.PP
+The same guides are available in the terminal via
+.B rotbyte \-\-docs
+.RB ( notify ", " permissions ", " scheduler ).
