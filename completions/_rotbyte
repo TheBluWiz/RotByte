@@ -30,7 +30,8 @@ _rotbyte() {
         '--notify[Send notification on problems]:backend:(email)' \
         '--notify-setup[Interactive notification setup]:backend:(email)' \
         '--version[Show version]' \
-        '--help[Show help]' \
+        '--help[Show quick-reference help]' \
+        '--help-all[Show full option list]' \
         '1:directory:_directories'
 }
 

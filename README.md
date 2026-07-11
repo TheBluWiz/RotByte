@@ -309,9 +309,9 @@ rotbyte --export checksums.txt
 
 ## All options
 
-Run `rotbyte --help` for the full reference, or `man rotbyte` after installing via Homebrew.
+`rotbyte --help` shows a quick reference. Run `rotbyte --help-all` for the full option list, or `man rotbyte` after installing via Homebrew.
 
-Additional tuning flags available via `--help`: `--workers` (parallel hashing workers), `--db` (custom database path), `--skip-missing` (skip missing-file detection), `--include-hidden` (include dotfiles and hidden directories), `--case-insensitive` (normalise file paths to lowercase for macOS APFS / Windows NTFS users who rename by case).
+Additional tuning flags available via `--help-all`: `--workers` (parallel hashing workers), `--db` (custom database path), `--skip-missing` (skip missing-file detection), `--include-hidden` (include dotfiles and hidden directories), `--case-insensitive` (normalise file paths to lowercase for macOS APFS / Windows NTFS users who rename by case).
 
 Shell completions for bash, zsh, and fish are in the `completions/` directory.
 

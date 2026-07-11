@@ -105,10 +105,10 @@ def db(db_path):
     d.close()
 
 
-def _run_cli(*args, cwd=None):
+def _run_cli(*args, cwd=None, env=None):
     """Run rotbyte as a subprocess and return (returncode, stdout, stderr)."""
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "rotbyte.py")] + list(args)
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=60)
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=60, env=env)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -2852,6 +2852,60 @@ class TestEdgeCases:
         assert rc == 0
         assert "rotbyte" in out
 
+    def test_help_flag_is_short_quick_reference(self):
+        """--help is the curated quick reference, not the full option list."""
+        rc, out, _ = _run_cli("--help")
+        assert rc == 0
+        assert "--help-all" in out
+        assert "--track-setup" in out
+        # Full-only flags shouldn't clutter the short help.
+        assert "--workers" not in out
+        assert "--case-insensitive" not in out
+
+    def test_help_all_flag_is_full_reference(self):
+        rc, out, _ = _run_cli("--help-all")
+        assert rc == 0
+        assert "--workers" in out
+        assert "--case-insensitive" in out
+        assert "Exit codes:" in out
+
+    def test_short_help_via_dash_h(self):
+        rc, out, _ = _run_cli("-h")
+        assert rc == 0
+        assert "--help-all" in out
+
+    def test_help_color_matches_help_all_when_forced(self):
+        """--help must use the same ANSI palette as --help-all (both driven
+        by argparse's own color theme), not its own hardcoded scheme.
+
+        Whether FORCE_COLOR actually colorizes at all is Python-version
+        dependent (argparse's coloring needs the 3.13+ _colorize module),
+        so this asserts the two stay consistent with each other rather than
+        assuming colorization is on -- that holds on every supported
+        Python (>=3.9)."""
+        env = {**os.environ, "FORCE_COLOR": "1", "TERM": "xterm-256color"}
+        env.pop("NO_COLOR", None)
+        rc_short, out_short, _ = _run_cli("--help", env=env)
+        rc_full, out_full, _ = _run_cli("--help-all", env=env)
+        assert rc_short == 0 and rc_full == 0
+        short_colored = "\x1b[" in out_short
+        full_colored = "\x1b[" in out_full
+        assert short_colored == full_colored
+        if full_colored:
+            # Same heading color (bold blue) used by both "usage:"/"Common
+            # commands:" in --help and "usage:"/"options:" in --help-all.
+            assert "\x1b[1;34m" in out_short
+            assert "\x1b[1;34m" in out_full
+
+    def test_help_no_color_env_disables_color_everywhere(self):
+        env = {**os.environ, "NO_COLOR": "1"}
+        env.pop("FORCE_COLOR", None)
+        rc_short, out_short, _ = _run_cli("--help", env=env)
+        rc_full, out_full, _ = _run_cli("--help-all", env=env)
+        assert rc_short == 0 and rc_full == 0
+        assert "\x1b[" not in out_short
+        assert "\x1b[" not in out_full
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 35. Database corruption detection
@@ -4366,8 +4420,8 @@ class TestAutoExport:
         assert len(second_text.splitlines()) == 2
 
     def test_flags_registered_in_argparse(self):
-        """Regression: both new flags must appear in --help output."""
-        rc, out, _ = _run_cli("--help")
+        """Regression: both new flags must appear in --help-all output."""
+        rc, out, _ = _run_cli("--help-all")
         assert rc == 0
         assert "--auto-export" in out
         assert "--run-on-battery" in out
