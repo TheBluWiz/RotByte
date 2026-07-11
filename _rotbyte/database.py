@@ -546,6 +546,19 @@ class ChecksumDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def missing_files(self) -> List[Dict]:
+        """Return details for all MISSING files (tracked, now gone from disk).
+
+        Ordered by path for a stable, browsable listing. Mirrors
+        :meth:`failed_files` so a report can enumerate every "not good" file,
+        not just the corrupted ones.
+        """
+        rows = self.conn.execute(
+            "SELECT file_path, file_size, first_seen, last_verified "
+            "FROM checksums WHERE status = 'MISSING' ORDER BY file_path"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def stale_files(self, days: int) -> List[Dict]:
         """Return files not verified in the given number of days."""
         rows = self.conn.execute(

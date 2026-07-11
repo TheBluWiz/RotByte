@@ -1202,22 +1202,37 @@ class TestCLIReport:
         # Localized timestamps render AM/PM (raw UTC would not).
         assert "AM" in out or "PM" in out
 
-    def test_report_stale_window_follows_due(self, tmp):
+    def test_report_lists_missing_files(self, tmp):
+        """--report enumerates MISSING files (a "not good" state), with paths."""
         _run_cli_ok(str(tmp))
-        # Backdate everything so it's stale under any reasonable window.
+        (tmp / "a.txt").unlink()
+        _run_cli(str(tmp))  # marks a.txt MISSING
+        rc, out, err = _run_cli("--report", str(tmp))
+        assert "Missing files" in out
+        assert "a.txt" in out
+
+    def test_report_overdue_requires_due_window(self, tmp):
+        """The overdue section is driven by the DUE window, not a fixed 90 days.
+
+        With no --due and no scheduled scan for this dir, nothing is "beyond
+        DUE", so the section is omitted; passing --due sets the window.
+        """
+        _run_cli_ok(str(tmp))
+        # Backdate everything so it's overdue under any reasonable window.
         db_path = next(Path(str(tmp)).glob(".*_rotbyte.db"))
         conn = sqlite3.connect(str(db_path))
         conn.execute("UPDATE checksums SET last_verified = datetime('now', '-100 days')")
         conn.commit()
         conn.close()
-        # Default window is 90 days.
+        # No --due, no schedule → no overdue section (old 90-day default gone).
         rc, out, err = _run_cli("--report", str(tmp))
-        assert "not verified in 90+ days" in out
-        # --due narrows the window the report uses.
+        assert "Overdue for re-verification" not in out
+        # --due sets the window the report uses.
         rc, out, err = _run_cli("--report", "--due", "30d", str(tmp))
-        assert "not verified in 30+ days" in out
+        assert "Overdue for re-verification" in out
+        assert "30+ days" in out
 
-    def test_report_stale_listing_caps_at_20(self, tmp):
+    def test_report_overdue_listing_caps_at_20(self, tmp):
         _run_cli_ok(str(tmp))
         db_path = next(Path(str(tmp)).glob(".*_rotbyte.db"))
         conn = sqlite3.connect(str(db_path))
@@ -1232,7 +1247,8 @@ class TestCLIReport:
             )
         conn.commit()
         conn.close()
-        rc, out, err = _run_cli("--report", str(tmp))
+        # Needs an explicit --due to render the (now due-driven) overdue section.
+        rc, out, err = _run_cli("--report", "--due", "30d", str(tmp))
         assert "showing first 20 of 25" in out
 
 

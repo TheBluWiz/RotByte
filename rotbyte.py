@@ -224,13 +224,55 @@ def _budget_cutoff_note(budget_exceeded: bool) -> List[str]:
     ]
 
 
-def print_report(db: ChecksumDB, stale_days: int = 90):
-    """Print a human-readable status report from the database.
+def _discover_due_days_for_report(target_dir: str) -> Optional[int]:
+    """Return the directory's scheduled full-scan ``--due`` window, in days.
 
-    ``stale_days`` bounds the "not verified recently" section. It defaults
-    to 90 but the caller passes the schedule's ``--due`` window when one is
-    configured, so the report's notion of "stale" matches the freshness
-    target rather than an unrelated constant.
+    Lets ``--report`` define "overdue" by the same freshness policy the
+    scheduled scan already enforces — without the user re-passing ``--due`` —
+    instead of a fixed constant. Best-effort and deliberately quiet: an
+    unsupported platform, any discovery hiccup, or no schedule for this
+    directory yields None, in which case ``--report`` omits the overdue
+    section. An explicit ``--due`` on the report command takes precedence.
+    """
+    import contextlib
+    import io
+
+    # Discovery shells out (launchctl/systemctl/schtasks) and can print a
+    # diagnostic on backend failure; swallow that so --report stays clean.
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            if _IS_WINDOWS:
+                tracked = _discover_schtasks()
+            elif _IS_MACOS or _IS_LINUX:
+                tracked = _discover_tracked(_IS_MACOS)
+            else:
+                return None
+    except Exception:  # noqa: BLE001 — best-effort; never break the report
+        return None
+
+    info = tracked.get(target_dir) or {}
+    due_str = (info.get("full") or {}).get("due")
+    if not due_str:
+        return None
+    try:
+        return parse_days(due_str)
+    except ValueError:
+        return None
+
+
+def print_report(db: ChecksumDB, due_days: Optional[int] = None):
+    """Print a human-readable integrity report from the database.
+
+    Lists every file in a "not good" state — FAILED (bit rot) and MISSING
+    (tracked but now gone from disk) — with paths, alongside the status-count
+    summary. OK and NEW files are considered fine and are not enumerated.
+
+    ``due_days`` bounds the "overdue for re-verification" section and is the
+    directory's freshness policy: the ``--due`` window passed on the command,
+    or the scheduled scan's ``--due`` discovered for this directory. When no
+    due window is known, nothing can be "beyond" it, so that section is
+    omitted entirely rather than falling back to a fixed constant.
     """
     def _fmt_ts(value):
         # Localize like --status; fall back to the raw stored string on any
@@ -276,18 +318,35 @@ def print_report(db: ChecksumDB, stale_days: int = 90):
             print(f"      Got:      {(f['checksum'] or '')[:32]}...")
         print()
 
-    stale = db.stale_files(stale_days)
-    if stale:
-        # Cap the listing but be honest about it — the previous code
-        # announced the full count then silently printed only the first 10.
-        stale_cap = 20
-        print(f"  ⏰ Files not verified in {stale_days}+ days: {len(stale):,}")
-        shown = stale if len(stale) <= stale_cap else stale[:stale_cap]
-        if len(stale) > stale_cap:
-            print(f"    (showing first {stale_cap} of {len(stale):,})")
-        for s in shown:
-            print(f"    {s['file_path']}  (last: {_fmt_ts(s['last_verified'])})")
+    # Every MISSING file (tracked, now gone from disk). Uncapped, like the
+    # FAILED list above — these are the "not good" files meant to be seen in
+    # full, not an informational sample.
+    missing = db.missing_files()
+    if missing:
+        print(f"  ? Missing files ({len(missing):,}):")
+        print(f"  {'─' * 56}")
+        for m in missing:
+            print(f"    {m['file_path']}  ({_format_size(m['file_size'])}, "
+                  f"last verified {_fmt_ts(m['last_verified'])})")
         print()
+
+    # "Overdue" is defined by the due window (see ``due_days``), never a fixed
+    # constant. With no due window known, nothing can be "beyond" it, so the
+    # section is skipped rather than invented against an arbitrary 90 days.
+    if due_days is not None:
+        overdue = db.stale_files(due_days)
+        if overdue:
+            # Cap the listing but be honest about it — this section is
+            # informational (unlike the exhaustive FAILED/MISSING lists).
+            overdue_cap = 20
+            print(f"  ⏰ Overdue for re-verification (not verified in "
+                  f"{due_days}+ days): {len(overdue):,}")
+            shown = overdue if len(overdue) <= overdue_cap else overdue[:overdue_cap]
+            if len(overdue) > overdue_cap:
+                print(f"    (showing first {overdue_cap} of {len(overdue):,})")
+            for s in shown:
+                print(f"    {s['file_path']}  (last: {_fmt_ts(s['last_verified'])})")
+            print()
 
 
 # ── Main orchestration ─────────────────────────────────────────────────────────
@@ -742,7 +801,12 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
 
     # ── Dispatch to the requested mode ─────────────────────────────────
     if args.report:
-        print_report(db, stale_days=getattr(args, "due_days", None) or 90)
+        # Prefer an explicit --due; otherwise adopt this directory's scheduled
+        # --due so "overdue" reflects the freshness policy actually in force.
+        report_due = getattr(args, "due_days", None)
+        if report_due is None:
+            report_due = _discover_due_days_for_report(target_dir)
+        print_report(db, due_days=report_due)
         db.close()
         return
 
