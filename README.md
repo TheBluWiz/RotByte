@@ -1,4 +1,5 @@
-<!-- IMAGE (optional): docs/img/logo.png — wordmark/logo; see NEEDED_IMAGES.md -->
+<!-- IMAGE: docs/img/logo.png — wordmark/logo -->
+![rotbyte](docs/img/logo.png)
 
 # rotbyte
 
