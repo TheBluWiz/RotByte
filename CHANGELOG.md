@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-07-10
 
 ### Added
 - **`--docs [TOPIC]` shows the setup guides in the terminal.** The email-notification, macOS-permissions, and Windows-Task-Scheduler guides now ship *inside* the package (`_rotbyte/docs/`) instead of only living on GitHub, so they travel with every install (Homebrew, pipx, pip) and stay version-matched to the binary. `rotbyte --docs` lists the topics; `rotbyte --docs notify` (also `permissions`, `scheduler`, plus aliases like `email`/`macos`/`windows`) prints a guide, paged when stdout is a terminal. This mirrors `git help <topic>` and, unlike man pages, works on Windows too. Standalone verb — refused in combination with any other mode flag

@@ -15,7 +15,7 @@ Bit rot flips bits without touching timestamps or file sizes. By the time you no
 Hashes are BLAKE2b-512 — cryptographically strong and faster than SHA-256 on modern CPUs, so full re-verifies stay I/O-bound rather than CPU-bound.
 
 <!-- IMAGE: docs/img/demo-scan.gif — hero live-scan demo; see NEEDED_IMAGES.md -->
-![PLACEHOLDER — rotbyte live-scan demo (GIF): the progress bar, throughput, and completion summary. See NEEDED_IMAGES.md](docs/img/demo-scan.gif)
+![rotbyte live-scan demo: the progress bar filling with live throughput, then the completion summary reporting detected bit rot](docs/img/demo-scan.gif)
 
 ## Contents
 
@@ -152,7 +152,7 @@ Default scans detect changed files but won't catch bit rot — silent corruption
 After a scan, `--report` prints an integrity report for that directory's database — counts by state, every file in a not-good state (**failed** *and* **missing**), and, when a `--due` window is set (or discovered from the directory's scheduled scan), which files are overdue for re-verification.
 
 <!-- IMAGE: docs/img/report.png — `rotbyte --report` output; see NEEDED_IMAGES.md -->
-![PLACEHOLDER — `rotbyte --report` showing the status bar chart, a FAILED bit-rot entry, and the Missing files list. See NEEDED_IMAGES.md](docs/img/report.png)
+![`rotbyte --report` showing the status bar chart, a FAILED bit-rot entry with Expected/Got hashes, and the Missing files list](docs/img/report.png)
 
 <!-- IMAGE (optional): docs/img/how-it-works.svg — scan → hash → compare → edit-vs-rot → DB; see NEEDED_IMAGES.md -->
 
@@ -172,7 +172,7 @@ rotbyte --status
 ```
 
 <!-- IMAGE: docs/img/status.png — `rotbyte --status` output; see NEEDED_IMAGES.md -->
-![PLACEHOLDER — `rotbyte --status`: tracked directories, schedules, health (active ✓ / BROKEN ✗), and file counts. See NEEDED_IMAGES.md](docs/img/status.png)
+![`rotbyte --status`: tracked directories, quick/full schedules, health (active ✓), next fire time, and file counts](docs/img/status.png)
 
 On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`. On Windows it registers Task Scheduler tasks under `\rotbyte\` (user-level, no admin prompt). Running `--track` without `--full-at` installs only the quick scan; add `--full-at` to also schedule a nightly full re-verify. For a guided setup, use `rotbyte --track-setup` — it mirrors `--notify-setup` and walks you through every option.
 
