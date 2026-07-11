@@ -34,8 +34,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/rotbyte/rotbyte"
-Changelog = "https://github.com/rotbyte/rotbyte/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/TheBluWiz/RotByte"
+Changelog = "https://github.com/TheBluWiz/RotByte/blob/main/CHANGELOG.md"
 
 [project.scripts]
 rotbyte = "rotbyte:main"

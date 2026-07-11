@@ -2675,6 +2675,41 @@ class TestDocsCommand:
         assert exc.value.code == 1
         assert "--docs" in capsys.readouterr().err
 
+    def test_cli_docs_conflicts_with_status(self, capsys):
+        # --docs is a standalone verb: combining it with another mode flag is
+        # refused, not silently ignored. (It previously ran docs and dropped
+        # the co-flag, so `--track DIR --docs` installed nothing and exited 0.)
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--docs", "--status"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--docs cannot be combined with --status" in capsys.readouterr().err
+
+    def test_cli_docs_with_topic_conflicts_with_track(self, capsys):
+        # A topic argument does not turn the trailing mode flag into a path:
+        # the --track here is still a conflict and must be refused.
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--docs", "notify", "--track"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--docs cannot be combined with --track" in capsys.readouterr().err
+
+    def test_no_orphan_bundled_docs(self):
+        """generate-man.sh prunes stale copies before syncing, so the bundled
+        _rotbyte/docs/*.md set must mirror the source docs/*.md set exactly — a
+        renamed or removed source guide must not leave an orphan copy that
+        still ships inside the package.
+        """
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parent
+        source = {p.name for p in (repo / "docs").glob("*.md")} - {"README.md"}
+        bundled = {p.name for p in (repo / "_rotbyte" / "docs").glob("*.md")}
+        assert bundled == source, (
+            f"bundled docs drift: orphan={bundled - source}, "
+            f"missing={source - bundled} — run ./generate-man.sh")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 32. Notify config path

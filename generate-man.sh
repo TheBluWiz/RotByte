@@ -22,6 +22,11 @@ cd "$(dirname "$0")"
 
 # ── 1. Sync the bundled package copies (every guide, no pandoc needed) ───────
 mkdir -p _rotbyte/docs
+# Prune first so a renamed or removed source guide can't leave an orphan copy
+# behind: the bundled dir must mirror docs/ exactly (these copies ship inside
+# the package, and a stale one would be distributed unnoticed — the copy loop
+# alone only adds/overwrites, never deletes).
+rm -f _rotbyte/docs/*.md
 for src in docs/*.md; do
   base="$(basename "$src")"
   [ "$base" = "README.md" ] && continue   # docs/README.md is the index, not a guide

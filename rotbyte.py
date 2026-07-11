@@ -545,6 +545,23 @@ Exit codes:
     # it before any of that. args.docs is "" for a bare --docs (list), the
     # topic string otherwise, and None when the flag was not given.
     if args.docs is not None:
+        # Standalone verb like --clear-logs: refuse it in combination with any
+        # other mode flag rather than silently ignoring the co-flag (e.g.
+        # `--track DIR --docs` must not run docs and exit 0 having installed
+        # nothing). Unlike --clear-logs, --docs tolerates a trailing PATH —
+        # `--docs notify DIR` shows the guide and ignores DIR — so only mode
+        # flags are checked here, not args.path. (_conflicting_mode_flags
+        # omits the untrack family, so add it explicitly, mirroring the
+        # --clear-logs check above.)
+        conflicts = [f for f in _conflicting_mode_flags(args) if f != "--docs"]
+        if args.untrack:
+            conflicts.append("--untrack")
+        if args.untrack_all:
+            conflicts.append("--untrack-all")
+        if conflicts:
+            print(f"Error: --docs cannot be combined with "
+                  f"{', '.join(conflicts)}.", file=sys.stderr)
+            sys.exit(1)
         sys.exit(run_docs(args.docs))
 
     # --notify-setup is a standalone command

@@ -37,7 +37,7 @@ def _launchd_log_path(label: str) -> str:
 # Rotate launchd log at install time to bound on-disk growth: launchd
 # holds the log FD open between runs, so rotating from inside the
 # rotbyte process at install/reinstall time is the safe moment. Keeps
-# ``.1``..``.MAX-1`` generations.
+# up to _LAUNCHD_LOG_KEEP rotated generations (``.1``..``.3``).
 _LAUNCHD_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 _LAUNCHD_LOG_KEEP = 3
 
