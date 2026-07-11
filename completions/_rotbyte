@@ -5,12 +5,14 @@ _rotbyte() {
         '--check[Force re-hash of every file]' \
         '--report[Print status report and exit]' \
         '--accept[Accept a file as correct]:file:_files' \
+        '--verify-file[Verify a single file against the database]:file:_files' \
         '--accept-all[Accept all current state as baseline]' \
         '--import[Import .b2sum/.b2 hash files]' \
         '--workers[Parallel hashing workers]:count:(1 2 4 8 16)' \
         '(-q --quiet)'{-q,--quiet}'[Only output problems]' \
         '--skip-missing[Do not check for removed files]' \
         '--include-hidden[Include hidden files and directories]' \
+        '--case-insensitive[Treat file paths as case-insensitive]' \
         '*--exclude[Exclude directories]:directory:_directories' \
         '--db[Custom database path]:file:_files' \
         '--export[Export checksums manifest]:file:_files' \
@@ -18,6 +20,8 @@ _rotbyte() {
         '--budget[Time budget for full scans]:duration:(30m 1h 2h 4h 1h30m 2h30m)' \
         '--due[Re-verify files not checked within N days]:days:(7d 14d 30d 60d 90d)' \
         '--track[Install scheduled scans (launchd/systemd)]' \
+        '--auto-export[Write a b2sum-compatible manifest after --check]' \
+        '--run-on-battery[Windows: allow scheduled scans on battery power]' \
         '--track-setup[Interactive setup wizard for --track]' \
         '--status[Show status of all scheduled scans]' \
         '--repair[Re-point broken scheduled scans after an upgrade]' \
