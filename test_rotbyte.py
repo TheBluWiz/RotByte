@@ -2522,6 +2522,182 @@ class TestClearLogsArgValidation:
         assert "does not take a PATH" in capsys.readouterr().err
 
 
+class TestFdaTargetBinary:
+    """_fda_target_binary walks a framework Python layout to the binary TCC
+    actually checks; falls back to the interpreter itself otherwise.
+    """
+
+    def test_resolves_framework_binary(self, tmp_path, monkeypatch):
+        # tmp_path is already realpath-resolved (pytest resolves it up
+        # front), so pointing sys.executable straight at these files
+        # exercises the real os.path.realpath call, not a mocked one.
+        versions_dir = tmp_path / "Python.framework" / "Versions" / "3.14"
+        bin_dir = versions_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        interpreter = bin_dir / "python3.14"
+        interpreter.write_text("#!fake\n")
+        framework_binary = versions_dir / "Python"
+        framework_binary.write_bytes(b"\xcf\xfa\xed\xfe")  # fake Mach-O magic
+
+        monkeypatch.setattr(sys, "executable", str(interpreter))
+        result = _rotbyte_pkg.scheduler._fda_target_binary()
+        assert result == str(framework_binary)
+
+    def test_falls_back_when_no_framework_layout(self, tmp_path, monkeypatch):
+        interpreter = tmp_path / "bin" / "python3"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("#!fake\n")
+
+        monkeypatch.setattr(sys, "executable", str(interpreter))
+        result = _rotbyte_pkg.scheduler._fda_target_binary()
+        assert result == str(interpreter)
+
+    def test_falls_back_when_framework_binary_missing(self, tmp_path, monkeypatch):
+        # Versions/3.14/bin/python3.14 present, but no sibling Versions/3.14/Python
+        versions_dir = tmp_path / "Python.framework" / "Versions" / "3.14"
+        bin_dir = versions_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        interpreter = bin_dir / "python3.14"
+        interpreter.write_text("#!fake\n")
+
+        monkeypatch.setattr(sys, "executable", str(interpreter))
+        result = _rotbyte_pkg.scheduler._fda_target_binary()
+        assert result == str(interpreter)
+
+
+class TestFdaGranted:
+    """_fda_granted probes ~/Library/Application Support/com.apple.TCC —
+    a directory that is itself FDA-gated regardless of what else is.
+    """
+
+    def test_true_when_listable(self, monkeypatch):
+        monkeypatch.setattr(os, "listdir", lambda p: ["TCC.db"])
+        assert _rotbyte_pkg.scheduler._fda_granted() is True
+
+    def test_false_on_permission_error(self, monkeypatch):
+        def raise_perm(p):
+            raise PermissionError(f"denied: {p}")
+        monkeypatch.setattr(os, "listdir", raise_perm)
+        assert _rotbyte_pkg.scheduler._fda_granted() is False
+
+    def test_false_on_missing_directory(self, monkeypatch):
+        def raise_notfound(p):
+            raise FileNotFoundError(p)
+        monkeypatch.setattr(os, "listdir", raise_notfound)
+        assert _rotbyte_pkg.scheduler._fda_granted() is False
+
+
+class TestRunGrantFda:
+    """_run_grant_fda and its main() wiring. All subprocess/filesystem
+    probes are mocked — this never touches the real System Settings,
+    Finder, or TCC state.
+    """
+
+    def test_unsupported_platform_exits_7(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "linux")
+        rc = _rotbyte_pkg.scheduler._run_grant_fda()
+        assert rc == 7
+        assert "not supported" in capsys.readouterr().err
+
+    def test_already_granted_reports_and_skips_ui(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "macos")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_granted", lambda: True)
+        called = {"settings": False, "reveal": False}
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_open_fda_settings",
+                            lambda: called.__setitem__("settings", True) or True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_reveal_in_finder",
+                            lambda p: called.__setitem__("reveal", True) or True)
+
+        rc = _rotbyte_pkg.scheduler._run_grant_fda()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "already" in out.lower()
+        assert "inherit" in out.lower()  # caveat about terminal-inherited access
+        assert called == {"settings": False, "reveal": False}
+
+    def test_not_granted_opens_settings_and_reveals(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "macos")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_granted", lambda: False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_target_binary",
+                            lambda: "/opt/homebrew/.../Python")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_open_fda_settings", lambda: True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_reveal_in_finder", lambda p: True)
+
+        rc = _rotbyte_pkg.scheduler._run_grant_fda()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "/opt/homebrew/.../Python" in out
+        assert "not granted" in out.lower()
+
+    def test_settings_open_failure_exits_6(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "macos")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_granted", lambda: False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_target_binary",
+                            lambda: "/opt/homebrew/.../Python")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_open_fda_settings", lambda: False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_reveal_in_finder", lambda p: True)
+
+        rc = _rotbyte_pkg.scheduler._run_grant_fda()
+        assert rc == 6
+        assert "Could not open System Settings" in capsys.readouterr().err
+
+    def test_reveal_failure_exits_6(self, monkeypatch, capsys):
+        _force_scheduler_platform(monkeypatch, "macos")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_granted", lambda: False)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_fda_target_binary",
+                            lambda: "/opt/homebrew/.../Python")
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_open_fda_settings", lambda: True)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler, "_reveal_in_finder", lambda p: False)
+
+        rc = _rotbyte_pkg.scheduler._run_grant_fda()
+        assert rc == 6
+        assert "Could not reveal" in capsys.readouterr().err
+
+    def test_cli_grant_fda_dispatches(self, monkeypatch):
+        called = {}
+
+        def fake_grant_fda():
+            called["ran"] = True
+            return 0
+
+        monkeypatch.setattr(rotbyte, "_run_grant_fda", fake_grant_fda)
+        monkeypatch.setattr(sys, "argv", ["rotbyte", "--grant-fda"])
+        with pytest.raises(SystemExit) as ei:
+            rotbyte.main()
+        assert called.get("ran") is True
+        assert ei.value.code == 0
+
+
+class TestGrantFdaArgValidation:
+    """--grant-fda is a standalone verb; combining it with any other mode
+    flag or a PATH is rejected before the scheduler is touched.
+    """
+
+    def test_grant_fda_with_track_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--grant-fda", "--track"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--grant-fda cannot be combined with --track" in capsys.readouterr().err
+
+    def test_grant_fda_with_status_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--grant-fda", "--status"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "--grant-fda cannot be combined with --status" in capsys.readouterr().err
+
+    def test_grant_fda_with_path_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            with unittest.mock.patch("sys.argv",
+                                     ["rotbyte", "--grant-fda", "/Volumes/Media"]):
+                rotbyte.main()
+        assert exc.value.code == 1
+        assert "does not take a PATH" in capsys.readouterr().err
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 31b. Keychain credential storage
 # ══════════════════════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@ _rotbyte() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="--check --report --accept --verify-file --accept-all --import --workers --quiet --skip-missing --include-hidden --case-insensitive --exclude --db --export --json --budget --due --track --auto-export --run-on-battery --track-setup --status --repair --untrack --untrack-all --clear-logs --docs --every --full-at --notify --notify-setup --version --help --help-all"
+    opts="--check --report --accept --verify-file --accept-all --import --workers --quiet --skip-missing --include-hidden --case-insensitive --exclude --db --export --json --budget --due --track --auto-export --run-on-battery --track-setup --status --repair --grant-fda --untrack --untrack-all --clear-logs --docs --every --full-at --notify --notify-setup --version --help --help-all"
 
     case "$prev" in
         --accept|--verify-file|--db|--export)

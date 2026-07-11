@@ -25,6 +25,7 @@ _rotbyte() {
         '--track-setup[Interactive setup wizard for --track]' \
         '--status[Show status of all scheduled scans]' \
         '--repair[Re-point broken scheduled scans after an upgrade]' \
+        '--grant-fda[macOS: open Full Disk Access setup]' \
         '--untrack[Remove scheduled scans for a directory]' \
         '--untrack-all[Remove all scheduled scans]' \
         '--clear-logs[Clear rotbyte scheduler logs]' \

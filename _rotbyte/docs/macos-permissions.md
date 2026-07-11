@@ -37,11 +37,30 @@ file I/O has Full Disk Access. Since v0.1.1, rotbyte's launchd plists invoke
 Python directly (skipping the Homebrew bash wrapper), so **Python is the only
 binary that needs FDA**.
 
+### Shortcut: `rotbyte --grant-fda`
+
+Run this first — it checks whether Full Disk Access already looks available
+and, if not, opens System Settings to the Full Disk Access pane **and**
+reveals the correct Python binary in Finder, so you only have to drag it in,
+toggle it on, and restart:
+
+```bash
+rotbyte --grant-fda
+```
+
+There's no macOS API to grant FDA or query its state directly, so the check
+is a best-effort probe — a "not granted" result is reliable, but a "granted"
+result can reflect access inherited from an already-authorized terminal
+rather than a grant on the Python binary itself, which won't help a
+launchd-scheduled scan. If scheduled scans still fail after `--grant-fda`
+reports success, follow the manual steps below and confirm with "Verify it
+works".
+
 ### Finding the right binary
 
 The FDA file picker only accepts Mach-O executables and `.app` bundles — not
 scripts or symlinks. Homebrew's `python3` is a chain of symlinks, so you need
-the real binary.
+the real binary. (`--grant-fda` above finds this for you automatically.)
 
 **Step 1: Find your Python version**
 

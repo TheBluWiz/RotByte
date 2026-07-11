@@ -201,7 +201,7 @@ On macOS this truncates the live log of each still-installed scan in place (laun
 
 On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
-> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. See [macOS Permissions](docs/macos-permissions.md) (or run `rotbyte --docs permissions`).
+> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. Run `rotbyte --grant-fda` to jump straight to the right System Settings pane with the correct binary revealed in Finder, or see [macOS Permissions](docs/macos-permissions.md) (or run `rotbyte --docs permissions`) for the full manual walkthrough.
 >
 > **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [Windows Task Scheduler](docs/windows-task-scheduler.md) (or run `rotbyte --docs scheduler`) for uninstall and inspection commands.
 

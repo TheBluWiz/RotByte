@@ -21,6 +21,7 @@ complete -c rotbyte -l run-on-battery -d 'Windows: allow scheduled scans on batt
 complete -c rotbyte -l track-setup -d 'Interactive setup wizard for --track'
 complete -c rotbyte -l status -d 'Show status of all scheduled scans'
 complete -c rotbyte -l repair -d 'Re-point broken scheduled scans after an upgrade'
+complete -c rotbyte -l grant-fda -d 'macOS: open Full Disk Access setup'
 complete -c rotbyte -l untrack -d 'Remove scheduled scans for a directory'
 complete -c rotbyte -l untrack-all -d 'Remove all scheduled scans'
 complete -c rotbyte -l clear-logs -d 'Clear rotbyte scheduler logs'

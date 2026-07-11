@@ -12,6 +12,7 @@ import hashlib as _hashlib
 import os
 import re as _re
 import shutil
+import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -112,6 +113,145 @@ def _find_rotbyte_executable() -> List[str]:
         return [_stable_homebrew_path(os.path.realpath(candidate))]
 
     return [interpreter, _stable_homebrew_path(os.path.realpath(sys.argv[0]))]
+
+
+def _fda_target_binary() -> str:
+    """Resolve the Mach-O binary macOS's TCC checks for Full Disk Access.
+
+    On a Python.framework build (Homebrew or python.org), TCC attributes
+    file I/O to the framework's ``Python`` binary at
+    ``Versions/X.Y/Python`` — not the thin ``Versions/X.Y/bin/pythonX.Y``
+    launcher ``sys.executable`` resolves to (see docs/macos-permissions.md,
+    "Finding the right binary"). Walks up from the resolved interpreter
+    path to that sibling file when the framework layout is present; falls
+    back to the resolved interpreter itself for non-framework builds
+    (system Python, most pyenv/venv installs).
+    """
+    interpreter = os.path.realpath(sys.executable)
+    versions_dir = os.path.dirname(os.path.dirname(interpreter))
+    framework_binary = os.path.join(versions_dir, "Python")
+    if (os.path.basename(os.path.dirname(versions_dir)) == "Versions"
+            and os.path.isfile(framework_binary)):
+        return framework_binary
+    return interpreter
+
+
+def _fda_granted() -> bool:
+    """Best-effort check for whether this process can read Full-Disk-Access-gated paths.
+
+    There's no public API to query TCC grant state, so this uses the same
+    probe several menu-bar utilities rely on: ``~/Library/Application
+    Support/com.apple.TCC`` is itself FDA-gated regardless of what else is,
+    so listing it raises ``PermissionError`` without FDA and succeeds once
+    it's granted.
+
+    This is trustworthy as a negative (a ``PermissionError`` means this
+    process genuinely lacks FDA) but only a hint as a positive: a process
+    spawned from a terminal that itself has FDA inherits that grant, so a
+    True here doesn't prove the *target* binary (see
+    :func:`_fda_target_binary`) has been individually added — only that
+    something in this process's ancestry has access. Callers should treat
+    True as "probably fine, unconfirmed" rather than a guarantee, which
+    matters most for schedules run by launchd (no terminal in the chain).
+    """
+    tcc_dir = os.path.expanduser("~/Library/Application Support/com.apple.TCC")
+    try:
+        os.listdir(tcc_dir)
+        return True
+    except OSError:
+        return False
+
+
+def _open_fda_settings() -> bool:
+    """Open System Settings directly to the Full Disk Access pane.
+
+    Returns False (rather than raising) on any failure — no GUI session
+    (headless/SSH), no ``open`` binary, or a rejected URL scheme — so the
+    caller can fall back to printing manual instructions.
+    """
+    try:
+        subprocess.run(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+            check=True, capture_output=True,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _reveal_in_finder(path: str) -> bool:
+    """Reveal ``path`` in Finder so it's ready to drag into the FDA list.
+
+    Returns False (rather than raising) when the path doesn't exist or
+    Finder can't be reached (headless/SSH session), so the caller can fall
+    back to printing the path for manual entry via Cmd+Shift+G.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        subprocess.run(["open", "-R", path], check=True, capture_output=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _run_grant_fda() -> int:
+    """Check Full Disk Access and, if missing, open the settings pane for it.
+
+    macOS only. If :func:`_fda_granted` already reads True, reports that —
+    with the inheritance caveat, since the check can't distinguish a real
+    per-binary grant from one inherited off an already-authorized terminal.
+    Otherwise resolves the binary that actually needs the grant (the one
+    :func:`_find_rotbyte_executable` would schedule under launchd), opens
+    System Settings to Privacy & Security → Full Disk Access, and reveals
+    that binary in Finder so it's one drag-and-drop away from being added.
+    Idempotent and side-effect-free beyond opening those two UI surfaces —
+    safe to run anytime.
+    """
+    if not _IS_MACOS:
+        print(f"Error: --grant-fda is not supported on {sys.platform}.", file=sys.stderr)
+        return _UNTRACK_INTERNAL
+
+    print("═" * 60)
+    print("  rotbyte — Full Disk Access")
+    print("═" * 60)
+
+    if _fda_granted():
+        print("  ✓ Full Disk Access appears available to this process.")
+        print(f"      {os.path.realpath(sys.executable)}")
+        print()
+        print("  Note: this reflects the process running this command, which")
+        print("  may be inheriting access from an already-authorized terminal")
+        print("  or IDE. It does not confirm the launchd-scheduled Python")
+        print("  binary has its own grant — verify scheduled scans with:")
+        print("    rotbyte --track ...  then  launchctl start com.rotbyte.full.HASH")
+        print("  (see docs/macos-permissions.md, 'Verify it works').")
+        print("═" * 60)
+        return _UNTRACK_OK
+
+    target = _fda_target_binary()
+    print("  ✗ Full Disk Access is not granted.")
+    print(f"      {target}")
+    print()
+    print("  Opening System Settings and revealing the binary in Finder —")
+    print("  drag it into the Full Disk Access list, toggle it on, then")
+    print("  restart your Mac for the change to take effect.")
+    print()
+
+    opened_settings = _open_fda_settings()
+    if not opened_settings:
+        print("  ! Could not open System Settings automatically.", file=sys.stderr)
+        print("    Open it manually: System Settings → Privacy & Security → "
+              "Full Disk Access", file=sys.stderr)
+
+    revealed = _reveal_in_finder(target)
+    if not revealed:
+        print(f"  ! Could not reveal {target} in Finder.", file=sys.stderr)
+        print("    Locate it manually with Cmd+Shift+G in the file picker.",
+              file=sys.stderr)
+
+    print("═" * 60)
+    return _UNTRACK_OK if (opened_settings and revealed) else _UNTRACK_IO_ERROR
 
 
 def _parse_cmd_flags(args: List[str]) -> Dict[str, Optional[str]]:

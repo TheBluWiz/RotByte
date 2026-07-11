@@ -118,6 +118,7 @@ from _rotbyte.scheduler import (
     _missing_command_path,
     _parse_cmd_flags,
     _run_clear_logs,
+    _run_grant_fda,
     _run_repair,
     _run_track,
     _run_untrack,
@@ -192,6 +193,7 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
     if args.track_setup:         flags.append("--track-setup")
     if args.status:              flags.append("--status")
     if args.repair:              flags.append("--repair")
+    if args.grant_fda:           flags.append("--grant-fda")
     if args.clear_logs:          flags.append("--clear-logs")
     if args.docs is not None:    flags.append("--docs")
     if args.report:              flags.append("--report")
@@ -480,6 +482,7 @@ Examples:
   rotbyte --untrack-all                  Remove every scheduled rotbyte run
   rotbyte --status                       Show all scheduled scans and health
   rotbyte --repair                       Fix scheduled scans after an upgrade
+  rotbyte --grant-fda                    Open Full Disk Access setup (macOS)
 
 Exit codes:
   0  All files verified OK
@@ -569,6 +572,11 @@ Exit codes:
                              "rotbyte/Python path and reload it. Fixes schedules broken "
                              "by a Homebrew upgrade (interpreter/script path deleted). "
                              "Safe to run anytime; schedules already current are left as-is.")
+    parser.add_argument("--grant-fda", dest="grant_fda", action="store_true",
+                        help="macOS only: check Full Disk Access and, if missing, open "
+                             "System Settings to the Full Disk Access pane and reveal the "
+                             "Python binary in Finder so it's ready to drag in. If access "
+                             "already appears available, reports that instead.")
     parser.add_argument("--clear-logs", dest="clear_logs", action="store_true",
                         help="Clear rotbyte's scheduler logs. Truncates the live log of "
                              "each installed scan and deletes rotated generations and "
@@ -627,6 +635,23 @@ Exit codes:
             conflicts.append("--untrack-all")
         if conflicts:
             print(f"Error: --clear-logs cannot be combined with "
+                  f"{', '.join(conflicts)}.", file=sys.stderr)
+            sys.exit(1)
+
+    # --grant-fda is a standalone verb like --repair/--clear-logs; refuse to
+    # combine it with any other mode flag, and it takes no PATH (it operates
+    # on the Python binary, not a scan target).
+    if args.grant_fda:
+        if args.path != ".":
+            print("Error: --grant-fda does not take a PATH argument.", file=sys.stderr)
+            sys.exit(1)
+        conflicts = [f for f in _conflicting_mode_flags(args) if f != "--grant-fda"]
+        if args.untrack:
+            conflicts.append("--untrack")
+        if args.untrack_all:
+            conflicts.append("--untrack-all")
+        if conflicts:
+            print(f"Error: --grant-fda cannot be combined with "
                   f"{', '.join(conflicts)}.", file=sys.stderr)
             sys.exit(1)
 
@@ -702,6 +727,11 @@ Exit codes:
     # it needs no target directory, database, or lock.
     if args.repair:
         sys.exit(_run_repair())
+
+    # --grant-fda checks/opens Full Disk Access setup; like --status/--repair
+    # it needs no target directory, database, or lock.
+    if args.grant_fda:
+        sys.exit(_run_grant_fda())
 
     # --clear-logs wipes rotbyte's scheduler logs; like --status/--repair it
     # needs no target directory, database, or lock.

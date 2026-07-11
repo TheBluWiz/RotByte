@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`--grant-fda` (macOS) opens Full Disk Access setup instead of making you hunt for it by hand.** There's no macOS API to grant Full Disk Access or reliably query its state — it checks whether `~/Library/Application Support/com.apple.TCC` is listable (itself FDA-gated regardless of what else is) and, if not, opens System Settings straight to the Full Disk Access pane and reveals the correct Mach-O binary in Finder (walking from `sys.executable` up to `Versions/X.Y/Python` on a framework build, since TCC checks that binary, not the `bin/pythonX.Y` launcher `sys.executable` resolves to) — one drag-and-drop away from being added. If the probe already reads access as available it reports that instead of opening anything, but says so with a caveat: a process run from an already-authorized terminal inherits that access, so a positive result doesn't confirm the launchd-scheduled Python binary has its own grant — only a genuine `PermissionError` is conclusive. `docs/macos-permissions.md` now leads with this as the fast path, keeping the full manual walkthrough for when it isn't enough. Standalone verb — refused in combination with any other mode flag or a PATH
+
 ## 1.3.0 — 2026-07-11
 
 ### Added
