@@ -6516,5 +6516,67 @@ class TestCompletionsInSync:
         assert self._values(shell, "--docs") == list(_rotbyte_pkg.guides._TOPICS)
 
 
+
+class TestReleaseConsistency:
+    """Release hygiene that used to rely on memory: the version lives in three
+    places, man/rotbyte.1 is hand-written, pip's man7 list is explicit, and
+    PyPI renders the README without resolving repo-relative paths."""
+
+    ROOT = Path(__file__).parent
+
+    def _read(self, rel):
+        return (self.ROOT / rel).read_text(encoding="utf-8")
+
+    def test_version_in_sync(self):
+        import re
+        pyproject = re.search(r'^version = "([^"]+)"', self._read("pyproject.toml"), re.M)
+        assert pyproject and pyproject.group(1) == rotbyte.VERSION
+        th = re.search(r'^\.TH ROTBYTE 1 "[^"]*" "rotbyte ([^"]+)"', self._read("man/rotbyte.1"), re.M)
+        assert th and th.group(1) == rotbyte.VERSION
+
+    def test_generated_man_pages_stamped_with_current_version(self):
+        import re
+        for page in sorted((self.ROOT / "man").glob("rotbyte-*.7")):
+            m = re.search(r'^\.TH .*?"rotbyte (\d[^"]*)"', page.read_text(encoding="utf-8"), re.M)
+            assert m and m.group(1) == rotbyte.VERSION, (
+                f"{page.name} is stamped {m and m.group(1)}; run ./generate-man.sh")
+
+    def test_changelog_has_entry_for_current_version(self):
+        assert f"\n## {rotbyte.VERSION} — " in self._read("CHANGELOG.md")
+
+    def test_man_page_documents_every_option(self, capsys):
+        import re
+        with unittest.mock.patch.object(sys, "argv", ["rotbyte", "--help-all"]):
+            with pytest.raises(SystemExit):
+                rotbyte.main()
+        cli = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", capsys.readouterr().out))
+        cli.discard("--scheduled")  # internal: set by --track, never typed
+        # Count only real entries — the tag line after each .TP — so an option
+        # that is merely mentioned in prose elsewhere doesn't pass.
+        lines = self._read("man/rotbyte.1").replace("\\-", "-").splitlines()
+        tags = [nxt for cur, nxt in zip(lines, lines[1:]) if cur.strip() == ".TP"]
+        documented = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", "\n".join(tags)))
+        assert cli - documented == set(), f"man/rotbyte.1 has no entry for {sorted(cli - documented)}"
+
+    def test_pip_installs_every_man_page(self):
+        import re
+        block = re.search(r'"share/man/man7" = \[([^\]]*)\]', self._read("pyproject.toml"))
+        assert block, "pyproject.toml has no share/man/man7 data-files entry"
+        listed = set(re.findall(r'"(man/[^"]+)"', block.group(1)))
+        on_disk = {f"man/{p.name}" for p in (self.ROOT / "man").glob("*.7")}
+        assert listed == on_disk
+
+    def test_readme_has_no_repo_relative_links(self):
+        """PyPI shows README.md as the project page and can't resolve
+        repo-relative paths: images and file links must be absolute
+        (in-page #anchors are fine)."""
+        import re
+        relative = re.findall(r"\]\((?!https?://|#|mailto:)([^)\s]+)\)",
+                              self._read("README.md"))
+        relative += re.findall(r'(?:src|href)="(?!https?://|#|mailto:)([^"]+)"',
+                               self._read("README.md"))
+        assert relative == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

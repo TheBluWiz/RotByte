@@ -1,4 +1,4 @@
-.TH ROTBYTE 1 "2026-07-11" "rotbyte 1.3.0" "User Commands"
+.TH ROTBYTE 1 "2026-11-08" "rotbyte 1.4.0" "User Commands"
 .SH NAME
 rotbyte \- detect bit rot by tracking BLAKE2b checksums
 .SH SYNOPSIS
@@ -33,8 +33,14 @@ Force re-hash of every file regardless of modification time.
 .B \-\-report
 Print an integrity status report and exit. The report includes: a count
 of tracked files grouped by status (OK, NEW, FAILED, MISSING); full
-details for any FAILED files including expected and actual checksums; and
-a list of files not verified in 90 or more days.
+details for every FAILED file, including expected and actual checksums;
+every MISSING file; and, when a due window is known, the files overdue for
+re-verification (the first 20 are listed). The due window is the
+.B \-\-due
+value given on the command line or, failing that, the
+.B \-\-due
+of the directory's scheduled full scan; with neither, that section is
+omitted. Timestamps are shown in local time.
 .TP
 .BI \-\-accept " FILE"
 Accept a single file's current state as correct. If the file is MISSING,
@@ -44,6 +50,15 @@ becomes the known-good baseline.
 .B \-\-accept\-all
 Accept all current state as the new baseline. Clears all MISSING records
 and re-hashes all FAILED files.
+.TP
+.BI \-\-verify\-file " FILE"
+Re-hash a single file and compare it with its recorded baseline, without
+scanning the rest of the tree. The database is located automatically: the
+current directory is checked first, then each directory above
+.IR FILE .
+Exits 0 if the file matches, 1 if it is not tracked, no longer exists, or
+no database is found, 2 if its checksum has changed (bit rot), and 6 if it
+cannot be read.
 .TP
 .B \-\-import
 Import existing
@@ -69,6 +84,13 @@ Do not check for files that have been removed from disk.
 Include hidden files and directories (names starting with \fB.\fR),
 which are excluded by default.
 .TP
+.B \-\-case\-insensitive
+Treat file paths as case-insensitive. Useful on case-insensitive file
+systems (macOS APFS by default, Windows NTFS), where renaming a file only
+by case would otherwise show up as a MISSING file plus a NEW one. Off by
+default. Turning it on for an existing database rewrites its stored paths
+to lower case on the next scan.
+.TP
 .BI \-\-exclude " PATH" \fR...
 Exclude one or more directories. Paths may be relative to the target
 directory or absolute.
@@ -81,6 +103,18 @@ target directory.
 Export a plain-text manifest of all tracked file checksums to FILE.
 Format is b2sum-compatible: one line per file with the BLAKE2b-512
 baseline checksum followed by the file path. Missing files are excluded.
+.TP
+.B \-\-auto\-export
+After each completed
+.B \-\-check
+scan, write the same b2sum-compatible manifest to
+.IB <database> .manifest
+next to the database, as an independent backup of the checksums. The file
+is replaced atomically, and is not written after a quick scan or an
+interrupted one. Off by default; combined with
+.BR \-\-track ,
+it is kept in the scheduled commands so every scheduled full scan refreshes
+the manifest.
 .TP
 .B \-\-json
 Output results as a JSON object instead of human-readable text. Suppresses
@@ -156,9 +190,19 @@ to
 .IR ~/Library/LaunchAgents/ .
 On Linux, writes systemd user timer and service units to
 .IR ~/.config/systemd/user/ .
+On Windows, registers user-level Task Scheduler tasks under
+.I \(rsrotbyte\(rs
+(no administrator prompt).
 Combine with
 .BR \-\-every ", " \-\-full\-at ", and " \-\-budget
 to configure the schedule.
+.TP
+.B \-\-run\-on\-battery
+Windows only, with
+.BR \-\-track :
+let scheduled scans start and keep running on battery power. By default
+the tasks skip runs on battery, as is usual for I/O-heavy background work
+on a laptop. Ignored on macOS and Linux.
 .TP
 .B \-\-track\-setup
 Interactive setup wizard for
@@ -211,6 +255,19 @@ run at any time — in particular after every
 .B brew upgrade
 of rotbyte or Python.
 .TP
+.B \-\-grant\-fda
+macOS only. Check whether this process has Full Disk Access and, if not,
+open System Settings at the Full Disk Access pane and reveal the Python
+binary that scheduled scans run under in Finder, ready to drag into the
+list. macOS offers no way to grant access programmatically. A positive
+result reflects only the process running the command, which may inherit
+access from an already-authorized terminal; it does not prove the scheduled
+interpreter has its own grant. Takes no
+.IR PATH .
+Exits 0 on success, 6 if System Settings or Finder could not be opened,
+and 7 on other platforms. See
+.BR rotbyte-permissions (7).
+.TP
 .BI \-\-untrack " [PATH]"
 Remove the scheduled rotbyte runs that were installed for the given
 directory. The path is canonicalised the same way
@@ -230,7 +287,7 @@ their unit files removed from
 and
 .B systemctl --user daemon-reload
 is run. On Windows the corresponding Task Scheduler tasks under
-.I \\rotbyte\\
+.I \(rsrotbyte\(rs
 are deleted with
 .BR schtasks.exe .
 .IP
@@ -400,6 +457,12 @@ stores the key in the platform credential store (Keychain, Credential
 Manager, or libsecret), falling back to the config file with 0600
 permissions.
 .TP
+.BR \-h ", " \-\-help
+Print a short quick reference of common commands and exit.
+.TP
+.B \-\-help\-all
+Print the full option list, usage examples, and exit codes, and exit.
+.TP
 .B \-\-version
 Print the version number and exit.
 .SH EXIT STATUS
@@ -545,11 +608,17 @@ target directory.
 .TP
 .BI . dirname _rotbyte.db.lock
 Lock file preventing concurrent runs.
+.TP
+.BI . dirname _rotbyte.db.manifest
+b2sum-compatible checksum manifest written by
+.BR \-\-auto\-export .
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME
-On Linux, overrides the base directory used to locate the notification
-config. Default:
+On Linux and Windows, overrides the base directory used to locate the
+notification config (macOS always uses
+.IR "~/Library/Application Support/rotbyte" ).
+Default:
 .IR ~/.config .
 The config is read from
 .IB $XDG_CONFIG_HOME /rotbyte/notify.conf .
@@ -561,29 +630,30 @@ across multiple processes for maximum throughput on multi-core systems.
 .PP
 Symlinks are not followed to prevent infinite loops.
 .SH CAVEATS
-.PP
-.B rotbyte
-is POSIX-only and requires
-.BR fcntl (2)
-for file locking. It does not run on Windows.
-.PP
 On macOS, scheduled scans installed with
 .B \-\-track
 require Full Disk Access to be granted to the Python interpreter when
 scanning TCC-protected directories (Desktop, Documents, Downloads,
-external volumes). See
-.I docs/macOS\ Permissions.md
-in the source distribution for the setup procedure.
+external volumes). Run
+.B rotbyte \-\-grant\-fda
+to open the right System Settings pane, or see
+.BR rotbyte-permissions (7)
+.RB ( "rotbyte \-\-docs permissions" ).
 .PP
-If a
-.B rotbyte
-process is killed with SIGKILL (or otherwise hard-killed), the lock file
+Installed schedules record the absolute path of the interpreter. After a
+Homebrew upgrade of rotbyte or Python, run
+.B rotbyte \-\-repair
+so they keep working.
+.PP
+The lock file
 .BI ( .dirname _rotbyte.db.lock )
-will not be removed automatically. Delete it manually before re-running.
+holds an advisory lock that the operating system releases when the process
+exits, even if it is killed with SIGKILL. A lock file left behind by a
+killed run does not block the next run and can be ignored.
 .SH REQUIREMENTS
-Python 3.9 or later. macOS or Linux (uses
-.BR fcntl (2)
-for file locking).
+Python 3.9 or later on macOS, Linux, or Windows.
+.B rotbyte
+uses only the Python standard library.
 .SH AUTHORS
 Jamey Wicklund
 .UR https://github.com/TheBluWiz

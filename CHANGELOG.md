@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-11-08
 
 ### Added
 - **`--notify healthchecks` monitors scans with [healthchecks.io](https://healthchecks.io), including self-hosted Healthchecks instances.** Email can only speak up when a scan runs. healthchecks.io is a dead-man's switch, so it also catches scans that **stop running**: a sleeping Mac, an unmounted volume, or a schedule broken by an upgrade (as happened before 1.1.2). Details:
@@ -27,6 +27,12 @@
 - **`notify.conf` is now shared by every notification backend.** `--notify-setup email` rewrites only the file's `[email]` section (it used to rewrite the whole file), so it never erases healthchecks.io settings, and vice versa. `--track-setup` decides whether a backend is configured by checking for its section, not for the file's existence
 
 ### Fixed
+- **`rotbyte(1)` documents every option and no longer contradicts the tool.** Changes:
+  - **New entries.** It gains entries for `--grant-fda`, `--verify-file` (with its exit codes), `--case-insensitive`, `--auto-export`, `--run-on-battery`, `--help`, and `--help-all`.
+  - **Wrong statements removed.** It no longer claims rotbyte is POSIX-only and doesn't run on Windows. It no longer says a leftover lock file must be deleted after a crash; the OS releases the advisory lock, so the next run proceeds. It no longer says `--report` lists files unverified for 90+ days; it uses the `--due` window.
+  - **Corrections.** `--track` now mentions Windows Task Scheduler. `XDG_CONFIG_HOME` now applies on Windows too. The broken `docs/macOS Permissions.md` pointer is replaced with `--grant-fda` / `rotbyte-permissions(7)`. A `\rotbyte\` escape that rendered as garbage is fixed.
+  - **New test.** A test now fails if a CLI option has no man-page entry.
+- **The README renders correctly on PyPI.** Images and links to the guides, CHANGELOG and LICENSE used repo-relative paths, which PyPI can't resolve, so the project page showed broken images. One image's alt text also still read "PLACEHOLDER". They now use absolute GitHub URLs, and a test keeps them that way
 - **`--json` stdout is now exactly one JSON document, even when problems are found.** Bit rot and missing files, the cases a monitoring script most needs to see, broke the output. Per-file `✗ FAILED` / `? MISSING` lines came before the JSON, and a `⚠ BIT ROT DETECTED` banner came after it. The interrupted-run note and the legacy-database rename notice could also land on stdout. So the README's own `rotbyte --check --json … | jq` example failed exactly when there was bit rot. Details:
   - **stderr redirect.** For `--json` scans, all human-readable output now goes to stderr. The exit status is unchanged, and scheduled-scan logs already capture both streams.
   - **New `missing_files` key.** Since the `? MISSING` lines moved to stderr, the JSON gains a `missing_files` list alongside `failed_files`.

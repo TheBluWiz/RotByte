@@ -1,14 +1,14 @@
 # Publishing rotbyte to PyPI
 
 A first-time, start-to-finish walkthrough for getting `rotbyte` onto the Python
-Package Index — checked against the current `pyproject.toml` (version **1.3.0**,
+Package Index — checked against the current `pyproject.toml` (version **1.4.0**,
 zero runtime dependencies, `setuptools` backend). The name `rotbyte` is confirmed
 unclaimed on PyPI, so there's no naming collision to work around.
 
 | | |
 |---|---|
 | **Package** | rotbyte |
-| **Current version** | 1.3.0 |
+| **Current version** | 1.4.0 |
 | **Build backend** | setuptools |
 
 ## Before you start — a quick glossary
@@ -101,8 +101,8 @@ python3 -m build
 This reads your existing `pyproject.toml` — no `setup.py` needed — and produces:
 
 ```
-dist/rotbyte-1.3.0.tar.gz           # sdist
-dist/rotbyte-1.3.0-py3-none-any.whl # wheel
+dist/rotbyte-1.4.0.tar.gz           # sdist
+dist/rotbyte-1.4.0-py3-none-any.whl # wheel
 ```
 
 ### 5. Sanity-check the build
@@ -116,11 +116,11 @@ the one thing easy to get wrong, since `_rotbyte/docs/*.md` is wired through
 `[tool.setuptools.package-data]` rather than being ordinary source:
 
 ```bash
-unzip -l dist/rotbyte-1.3.0-py3-none-any.whl | grep docs/
+unzip -l dist/rotbyte-1.4.0-py3-none-any.whl | grep docs/
 ```
 
-You should see `email-notification-setup.md`, `macos-permissions.md`, and
-`windows-task-scheduler.md` listed.
+You should see `email-notification-setup.md`, `healthchecks-setup.md`,
+`macos-permissions.md`, and `windows-task-scheduler.md` listed.
 
 ### 6. Rehearse on TestPyPI
 
@@ -138,14 +138,14 @@ data both work end to end:
 python3 -m venv /tmp/rotbyte-smoketest
 /tmp/rotbyte-smoketest/bin/pip install --index-url https://test.pypi.org/simple/ rotbyte
 /tmp/rotbyte-smoketest/bin/rotbyte --version
-# rotbyte 1.3.0
+# rotbyte 1.4.0
 /tmp/rotbyte-smoketest/bin/rotbyte --docs notify | head
 ```
 
 ### 7. Publish to the real PyPI
 
 > **One-way door:** PyPI never lets a given version number be re-uploaded, even
-> if you delete the release — `1.3.0` is burned forever once it's up. If
+> if you delete the release — `1.4.0` is burned forever once it's up. If
 > anything looked off in Step 6, fix it and re-run `python3 -m build` before
 > this step, not after.
 
@@ -210,14 +210,16 @@ classifiers it doesn't yet recognize server-side rather than failing the
 upload. This isn't fixable by rebuilding or re-uploading (1.3.0's metadata is
 immutable) and doesn't break anything (`requires-python = ">=3.9"` has no
 upper bound, so `pip install` still works fine on 3.13/3.14) — it's purely
-cosmetic on the badge, and will reflect correctly on your next version bump.
+cosmetic on the badge. 1.4.0 is the next upload, so re-run the `curl` above
+after publishing it to confirm the 3.13/3.14 classifiers came through this
+time.
 
 ### 10. Close the loop with the rest of your release process
 
 PyPI is only one of rotbyte's three distribution channels. Two things from your
 own conventions still apply on every release, PyPI or not:
 
-- Tag the commit (e.g. `v1.3.0`) and cut a GitHub release, since that tarball is
+- Tag the commit (e.g. `v1.4.0`) and cut a GitHub release, since that tarball is
   what the Homebrew formula points at.
 - Update the **separate Homebrew tap repo**'s formula — new `url` and `sha256`
   for the tag — independently of this PyPI upload; publishing here doesn't touch
@@ -236,6 +238,7 @@ manual release, not before — you want the manual mechanics to click first.
 
 - [ ] Bump `VERSION` in all three places: `pyproject.toml`, `rotbyte.py`,
       `man/rotbyte.1`'s `.TH` line
+- [ ] Rename `## Unreleased` in `CHANGELOG.md` to `## X.Y.Z — YYYY-MM-DD`
 - [ ] Run `./generate-man.sh` to re-stamp the man pages and re-sync bundled docs
 - [ ] Run the test suite: `python3 -m pytest test_rotbyte.py`
 - [ ] `rm -rf dist/ build/ *.egg-info && python3 -m build`

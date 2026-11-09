@@ -1,5 +1,5 @@
 <!-- IMAGE: docs/img/logo.png — wordmark/logo -->
-![rotbyte](docs/img/logo.png)
+![rotbyte](https://raw.githubusercontent.com/TheBluWiz/RotByte/main/docs/img/logo.png)
 
 # rotbyte
 
@@ -9,14 +9,14 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/rotbyte.svg)](https://pypi.org/project/rotbyte/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#requirements)
 [![Dependencies](https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg)](#requirements)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/TheBluWiz/RotByte/blob/main/LICENSE.md)
 
 Bit rot flips bits without touching timestamps or file sizes. By the time you notice, your backups may have already rotated out the good copy. **rotbyte** keeps a database of checksums and tells you the moment something doesn't match.
 
 Hashes are BLAKE2b-512 — cryptographically strong and faster than SHA-256 on modern CPUs, so full re-verifies stay I/O-bound rather than CPU-bound.
 
-<!-- IMAGE: docs/img/demo-scan.gif — hero live-scan demo; see NEEDED_IMAGES.md -->
-![rotbyte live-scan demo: the progress bar filling with live throughput, then the completion summary reporting detected bit rot](docs/img/demo-scan.gif)
+<!-- IMAGE: docs/img/demo-scan.gif — hero live-scan demo -->
+![rotbyte live-scan demo: the progress bar filling with live throughput, then the completion summary reporting detected bit rot](https://raw.githubusercontent.com/TheBluWiz/RotByte/main/docs/img/demo-scan.gif)
 
 ## Contents
 
@@ -71,7 +71,7 @@ pipx install rotbyte
 brew install rotbyte
 ```
 
-`pipx` gives you an isolated, self-updating install on any platform. The Homebrew formula is a thin wrapper that additionally places `rotbyte.1` and shell completions where your shell will find them; pipx users who want completions can copy them out of the [`completions/`](completions/) directory manually.
+`pipx` gives you an isolated, self-updating install on any platform. The Homebrew formula is a thin wrapper that additionally places `rotbyte.1` and shell completions where your shell will find them; pipx users who want completions can copy them out of the [`completions/`](https://github.com/TheBluWiz/RotByte/tree/main/completions) directory manually.
 
 > **Dependencies:** rotbyte's own code adds no packages — `pip`/`pipx` install nothing beyond rotbyte itself. It does need a Python runtime, though: `pipx` uses the Python you already have, while `brew install` pulls in Homebrew's Python (and its stack — openssl, sqlite, and friends) if you don't already have it.
 
@@ -153,10 +153,10 @@ Default scans detect changed files but won't catch bit rot — silent corruption
 
 After a scan, `--report` prints an integrity report for that directory's database — counts by state, every file in a not-good state (**failed** *and* **missing**), and, when a `--due` window is set (or discovered from the directory's scheduled scan), which files are overdue for re-verification.
 
-<!-- IMAGE: docs/img/report.png — `rotbyte --report` output; see NEEDED_IMAGES.md -->
-![`rotbyte --report` showing the status bar chart, a FAILED bit-rot entry with Expected/Got hashes, and the Missing files list](docs/img/report.png)
+<!-- IMAGE: docs/img/report.png — `rotbyte --report` output -->
+![`rotbyte --report` showing the status bar chart, a FAILED bit-rot entry with Expected/Got hashes, and the Missing files list](https://raw.githubusercontent.com/TheBluWiz/RotByte/main/docs/img/report.png)
 
-<!-- IMAGE (optional): docs/img/how-it-works.svg — scan → hash → compare → edit-vs-rot → DB; see NEEDED_IMAGES.md -->
+<!-- IMAGE (optional): docs/img/how-it-works.svg — scan → hash → compare → edit-vs-rot → DB -->
 
 ## Scheduling
 
@@ -173,8 +173,8 @@ rotbyte --track --every 30m --full-at 2h 14h /Volumes/Media
 rotbyte --status
 ```
 
-<!-- IMAGE: docs/img/status.png — `rotbyte --status` output; see NEEDED_IMAGES.md -->
-![`rotbyte --status`: tracked directories, quick/full schedules, health (active ✓), next fire time, and file counts](docs/img/status.png)
+<!-- IMAGE: docs/img/status.png — `rotbyte --status` output -->
+![`rotbyte --status`: tracked directories, quick/full schedules, health (active ✓), next fire time, and file counts](https://raw.githubusercontent.com/TheBluWiz/RotByte/main/docs/img/status.png)
 
 On macOS this writes launchd plists to `~/Library/LaunchAgents/`. On Linux it writes systemd user timers to `~/.config/systemd/user/`. On Windows it registers Task Scheduler tasks under `\rotbyte\` (user-level, no admin prompt). Running `--track` without `--full-at` installs only the quick scan; add `--full-at` to also schedule a nightly full re-verify. For a guided setup, use `rotbyte --track-setup` — it mirrors `--notify-setup` and walks you through every option.
 
@@ -202,9 +202,9 @@ On macOS this truncates the live log of each still-installed scan in place (laun
 
 On Windows, scheduled scans skip runs while on battery by default (matching typical Task Scheduler behavior). Pass `--run-on-battery` with `--track` if you want them to run regardless of power state.
 
-> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. Run `rotbyte --grant-fda` to jump straight to the right System Settings pane with the correct binary revealed in Finder, or see [macOS Permissions](docs/macos-permissions.md) (or run `rotbyte --docs permissions`) for the full manual walkthrough.
+> **macOS users:** Scanning TCC-protected directories (Desktop, Documents, Downloads, external drives) with `--track` requires a one-time Full Disk Access grant for Python. Run `rotbyte --grant-fda` to jump straight to the right System Settings pane with the correct binary revealed in Finder, or see [macOS Permissions](https://github.com/TheBluWiz/RotByte/blob/main/docs/macos-permissions.md) (or run `rotbyte --docs permissions`) for the full manual walkthrough.
 >
-> **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [Windows Task Scheduler](docs/windows-task-scheduler.md) (or run `rotbyte --docs scheduler`) for uninstall and inspection commands.
+> **Windows users:** If you use Controlled Folder Access, you may need to allow `python.exe` (or whichever interpreter pipx installed rotbyte under) to read your protected directories. See [Windows Task Scheduler](https://github.com/TheBluWiz/RotByte/blob/main/docs/windows-task-scheduler.md) (or run `rotbyte --docs scheduler`) for uninstall and inspection commands.
 
 You can still use cron if you prefer:
 
@@ -231,14 +231,14 @@ rotbyte --check --notify email /Volumes/Media
 rotbyte --track --every 1h --full-at 2h --notify email /Volumes/Media
 ```
 
-<!-- IMAGE: docs/img/email.png — the HTML email health report; see NEEDED_IMAGES.md -->
-![PLACEHOLDER — the rotbyte email health report (PASS/DETECTED banner + counts table) in a mail client. See NEEDED_IMAGES.md](docs/img/email.png)
+<!-- IMAGE: docs/img/email.png — the HTML email health report -->
+![The rotbyte email health report in a mail client: a red “Problems detected” banner, host and scan details, the change since the last run, and the per-outcome counts table](https://raw.githubusercontent.com/TheBluWiz/RotByte/main/docs/img/email.png)
 
 Full scans (`--check`) always send a health report — whether everything checks out or something needs attention. Scheduled quick scans only email when there's a problem, so your inbox stays clean.
 
 Your SMTP password is stored in the OS credential store — macOS Keychain, Windows Credential Manager, or libsecret on Linux — never in the config file or on a command line. If no credential store is available it falls back to a `chmod 600` config file with a warning (use an app-specific password there, never your primary one).
 
-For provider-specific setup (Gmail, iCloud, Outlook) see [Email Notification Setup](docs/email-notification-setup.md) (or run `rotbyte --docs notify`).
+For provider-specific setup (Gmail, iCloud, Outlook) see [Email Notification Setup](https://github.com/TheBluWiz/RotByte/blob/main/docs/email-notification-setup.md) (or run `rotbyte --docs notify`).
 
 ### healthchecks.io
 
@@ -251,7 +251,7 @@ rotbyte --notify-setup healthchecks     # asks for your project's ping key; stor
 rotbyte --track --every 1h --full-at 2h --notify email,healthchecks /Volumes/Media
 ```
 
-Each directory's quick and full scans report to their own check (e.g. `rotbyte-media-quick-1a2b3c4d`), created automatically on first ping. A scan sends a start signal, then its [exit code](#exit-codes): `0` marks the check up, anything else down — including a scan that can't start because its volume isn't mounted. The ping body carries the same path-free report as the email. `--track` prints a suggested period and grace time for each check; see [healthchecks.io Setup](docs/healthchecks-setup.md) (or run `rotbyte --docs healthchecks`).
+Each directory's quick and full scans report to their own check (e.g. `rotbyte-media-quick-1a2b3c4d`), created automatically on first ping. A scan sends a start signal, then its [exit code](#exit-codes): `0` marks the check up, anything else down — including a scan that can't start because its volume isn't mounted. The ping body carries the same path-free report as the email. `--track` prints a suggested period and grace time for each check; see [healthchecks.io Setup](https://github.com/TheBluWiz/RotByte/blob/main/docs/healthchecks-setup.md) (or run `rotbyte --docs healthchecks`).
 
 ## Monitoring and automation
 
@@ -400,8 +400,8 @@ Yes — that's a primary use case. On network filesystems that don't support SQL
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+See [CHANGELOG.md](https://github.com/TheBluWiz/RotByte/blob/main/CHANGELOG.md) for release history.
 
 ## License
 
-[MIT](LICENSE.md)
+[MIT](https://github.com/TheBluWiz/RotByte/blob/main/LICENSE.md)
