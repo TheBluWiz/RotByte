@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Optional
 
 _IS_WINDOWS = sys.platform == "win32"
 _IS_MACOS = sys.platform == "darwin"
@@ -58,6 +59,10 @@ class FileLock:
     def __init__(self, lock_path: str):
         self.lock_path = lock_path
         self.lock_file = None
+        # Set when acquire() fails because the lock file itself couldn't be
+        # opened (read-only volume, permissions) rather than because another
+        # rotbyte holds the lock — callers report the two differently.
+        self.error: Optional[OSError] = None
 
     def acquire(self) -> bool:
         # On POSIX, refuse to follow a symlink at the lock path: a malicious
@@ -73,7 +78,8 @@ class FileLock:
                 fd = os.open(self.lock_path, flags, 0o600)
             # "a+b" so Windows msvcrt.locking has a real byte to lock on.
             self.lock_file = os.fdopen(fd, "a+b")
-        except OSError:
+        except OSError as e:
+            self.error = e
             return False
         if not _try_lock(self.lock_file):
             try:

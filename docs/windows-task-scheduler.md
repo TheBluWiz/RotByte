@@ -58,6 +58,26 @@ run regardless of power state:
 rotbyte --track --every 1h --full-at 2h --run-on-battery D:\Media
 ```
 
+## Notifications
+
+`--notify email` and `--notify healthchecks` work on Windows the same way
+they do elsewhere. See `rotbyte --docs notify` and
+`rotbyte --docs healthchecks`. Windows specifics:
+
+- **Config file:** `%USERPROFILE%\.config\rotbyte\notify.conf`. If
+  `XDG_CONFIG_HOME` is set, the file is in `rotbyte\` under that directory
+  instead.
+- **Secrets:** the SMTP password and the healthchecks.io ping key are stored
+  in **Credential Manager** (Windows Credentials), under names starting
+  with `rotbyte-notify:`.
+- **Check names:** the `<hash>` in a task's name, e.g.
+  `\rotbyte\rotbyte-quick-<hash>`, is the same hash that ends the directory's
+  healthchecks.io check names (`rotbyte-<name>-quick-<hash>`). Use it to
+  match a check to its task.
+- **Battery:** a scan skipped because the laptop is on battery sends no
+  ping, so its healthchecks.io check can go down. Pass `--run-on-battery`, or
+  give the check enough grace time to cover the time you spend on battery.
+
 ## Controlled Folder Access
 
 If you use Windows Defender's Controlled Folder Access, the

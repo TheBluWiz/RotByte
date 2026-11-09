@@ -1,7 +1,9 @@
-"""Email notifications and SMTP credential storage.
+"""Scan notifications: email (SMTP) and healthchecks.io pings.
 
-Passwords are routed through the platform credential store at setup
-time: macOS Keychain (``security``), Windows Credential Manager
+Both backends share one config file (``notify.conf``, one ``[section]`` per
+backend) and one secret-storage path. Secrets — the SMTP password and the
+healthchecks.io ping key — are routed through the platform credential store
+at setup time: macOS Keychain (``security``), Windows Credential Manager
 (``CredWriteW`` + ``CredReadW`` via ctypes), Linux libsecret (``secret-tool``)
 when available. Falls back to plaintext ``notify.conf`` with chmod 0600
 and a stderr warning when no platform store is usable.
@@ -15,12 +17,18 @@ import email.mime.text
 import getpass
 import html as _html
 import os
+import re as _re
 import shutil
 import smtplib
 import socket
 import ssl
 import subprocess as _subprocess
 import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 from .helpers import _format_duration, _format_size
@@ -28,6 +36,34 @@ from .platform import _IS_MACOS, _IS_WINDOWS
 
 # Service identifier under which we register SMTP passwords with the OS keychain.
 _KEYCHAIN_SERVICE = "rotbyte-notify"
+
+# Every --notify / --notify-setup backend, in the order help text lists them.
+NOTIFY_BACKENDS = ("email", "healthchecks")
+
+
+def _parse_notify_backends(value: str) -> List[str]:
+    """Split a ``--notify`` value into an ordered, de-duplicated backend list.
+
+    ``"email"`` → ``["email"]``; ``"email,healthchecks"`` → both. A comma
+    list (rather than a repeatable flag) keeps the value a single argv token,
+    so scheduled commands, ``--status`` discovery, and ``--repair`` treat it
+    exactly like the historical ``--notify email``. Raises ValueError naming
+    the supported backends for an unknown or empty value.
+    """
+    backends: List[str] = []
+    for part in value.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in NOTIFY_BACKENDS:
+            raise ValueError(f"Unknown notification backend '{part.strip()}'. "
+                             f"Supported: {', '.join(NOTIFY_BACKENDS)}")
+        if name not in backends:
+            backends.append(name)
+    if not backends:
+        raise ValueError("--notify needs a backend. "
+                         f"Supported: {', '.join(NOTIFY_BACKENDS)}")
+    return backends
 
 
 def _keychain_account(username: str, smtp_host: str) -> str:
@@ -39,7 +75,8 @@ def _keychain_account(username: str, smtp_host: str) -> str:
     return f"{username}@{smtp_host}"
 
 
-def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
+def _keychain_set(account: str, password: str,
+                  label: str = "rotbyte SMTP") -> Tuple[bool, str]:
     """Store ``password`` under ``account`` in the platform credential store.
 
     Returns ``(stored, backend)`` where ``backend`` is one of ``"keychain"``
@@ -91,7 +128,7 @@ def _keychain_set(account: str, password: str) -> Tuple[bool, str]:
     if shutil.which("secret-tool"):
         try:
             _subprocess.run(
-                ["secret-tool", "store", "--label=rotbyte SMTP",
+                ["secret-tool", "store", f"--label={label}",
                  "service", _KEYCHAIN_SERVICE, "account", account],
                 input=password, check=True, capture_output=True,
                 text=True, timeout=10,
@@ -271,6 +308,65 @@ def _notify_config_path() -> str:
     return os.path.join(base, "notify.conf")
 
 
+def _read_notify_file() -> configparser.ConfigParser:
+    """Parse ``notify.conf`` if it exists; an empty parser otherwise.
+
+    ``interpolation=None``: values are opaque strings, and SMTP passwords may
+    legitimately contain '%' — with the default BasicInterpolation a lone '%'
+    raises InterpolationSyntaxError at *read* time, long after setup appeared
+    to succeed. A malformed file raises ``configparser.Error``.
+    """
+    config = configparser.ConfigParser(interpolation=None)
+    path = _notify_config_path()
+    if os.path.isfile(path):
+        config.read(path)
+    return config
+
+
+def _notify_backend_configured(backend: str) -> bool:
+    """True when ``notify.conf`` has a ``[backend]`` section.
+
+    The file is shared by every backend, so its mere existence no longer
+    means a particular backend was set up.
+    """
+    try:
+        return _read_notify_file().has_section(backend)
+    except configparser.Error:
+        return False
+
+
+def _write_notify_section(name: str, values: Dict[str, str]) -> str:
+    """Replace one ``[name]`` section of ``notify.conf``, keeping the others.
+
+    Setting up one backend must never erase another's config (re-running
+    ``--notify-setup email`` used to rewrite the whole file). The section is
+    replaced wholesale so stale keys — e.g. a plaintext secret left over from
+    before a keychain became available — don't linger. Returns the path.
+    """
+    path = _notify_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        config = _read_notify_file()
+    except configparser.Error as e:
+        print(f"  Warning: existing {path} could not be parsed ({e}) — "
+              "rewriting it with only this backend's settings.", file=sys.stderr)
+        config = configparser.ConfigParser(interpolation=None)
+    if config.has_section(name):
+        config.remove_section(name)
+    config[name] = values
+    # Create the file restricted from the start (0600) rather than writing
+    # under the umask and chmod'ing afterwards — otherwise a plaintext
+    # secret is briefly world-readable between write and chmod. On Windows
+    # the mode bits are best-effort, which is fine here.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        config.write(f)
+    # Belt-and-suspenders: tighten an already-existing file, whose perms
+    # O_CREAT would not have changed.
+    os.chmod(path, 0o600)
+    return path
+
+
 def _load_notify_config() -> configparser.ConfigParser:
     """Load and return the notification config, or exit with an error.
 
@@ -286,12 +382,7 @@ def _load_notify_config() -> configparser.ConfigParser:
         print(f"Error: No notification config found at {path}", file=sys.stderr)
         print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
         sys.exit(1)
-    # interpolation=None: values are opaque strings, and SMTP passwords may
-    # legitimately contain '%' — with the default BasicInterpolation a lone
-    # '%' raises InterpolationSyntaxError at *read* time, long after setup
-    # appeared to succeed.
-    config = configparser.ConfigParser(interpolation=None)
-    config.read(path)
+    config = _read_notify_file()
     if "email" not in config:
         print(f"Error: No [email] section in {path}", file=sys.stderr)
         print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
@@ -424,13 +515,9 @@ def _run_notify_setup():
     # password never lands in the config file. Fall back to plaintext +
     # 0600 if no usable store is available (e.g. Linux without
     # libsecret-tools installed).
-    config_path = _notify_config_path()
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-
     account = _keychain_account(username, smtp_host)
     stored, backend = _keychain_set(account, password)
 
-    config = configparser.ConfigParser(interpolation=None)
     email_section: Dict[str, str] = {
         "smtp_host": smtp_host,
         "smtp_port": str(smtp_port),
@@ -443,17 +530,8 @@ def _run_notify_setup():
     else:
         email_section["password"] = password
         email_section["password_backend"] = "plaintext"
-    config["email"] = email_section
-    # Create the file restricted from the start (0600) rather than writing
-    # under the umask and chmod'ing afterwards — otherwise a plaintext
-    # password is briefly world-readable between write and chmod. On Windows
-    # the mode bits are best-effort, which is fine here.
-    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        config.write(f)
-    # Belt-and-suspenders: tighten an already-existing file, whose perms
-    # O_CREAT would not have changed.
-    os.chmod(config_path, 0o600)
+    # Replaces only [email]; a [healthchecks] section set up earlier survives.
+    config_path = _write_notify_section("email", email_section)
 
     print(f"  Config saved to {config_path}")
     if stored:
@@ -512,20 +590,36 @@ def _fmt_duration(elapsed_seconds: float) -> str:
     return f"Scan duration: {_format_duration(elapsed_seconds)}"
 
 
-def _send_email_notification(target_dir: str, failed: int, count_missing: int,
-                             failed_files: List[Dict],
-                             freshness: Optional[tuple] = None,
-                             *,
-                             elapsed_seconds: Optional[float] = None,
-                             due_progress: Optional[Tuple[int, int]] = None,
-                             interrupted: bool = False,
-                             budget_exceeded: bool = False,
-                             errors: int = 0,
-                             stats: Optional[Dict] = None,
-                             host: Optional[str] = None,
-                             scan_time: Optional[str] = None,
-                             previous_counts: Optional[Tuple[int, int]] = None):
-    """Send an email notification summarizing a completed scan.
+def _hostname() -> str:
+    """This machine's name, for attributing a report on multi-machine setups.
+
+    gethostname() can raise on a misconfigured box — never let that sink a
+    notification.
+    """
+    try:
+        return socket.gethostname() or "unknown-host"
+    except OSError:
+        return "unknown-host"
+
+
+def _compose_report(target_dir: str, failed: int, count_missing: int,
+                    freshness: Optional[tuple] = None,
+                    *,
+                    elapsed_seconds: Optional[float] = None,
+                    due_progress: Optional[Tuple[int, int]] = None,
+                    interrupted: bool = False,
+                    budget_exceeded: bool = False,
+                    errors: int = 0,
+                    stats: Optional[Dict] = None,
+                    host: Optional[str] = None,
+                    scan_time: Optional[str] = None,
+                    previous_counts: Optional[Tuple[int, int]] = None
+                    ) -> Tuple[str, str, str]:
+    """Build ``(subject, plain_text_body, html_body)`` for a completed scan.
+
+    Single source of truth for the scan report, shared by the email backend
+    (all three parts) and the healthchecks.io backend (subject + plain text
+    as the ping body, shown in the check's event log).
 
     Subject distinguishes two outcomes:
       - PASS: no bit rot and no missing files
@@ -545,38 +639,16 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
 
     ``stats`` is an optional per-outcome counts dict (``ok``, ``new``,
     ``updated``, ``skipped``, ``bytes_hashed``); when present it is
-    rendered on every email — including clean PASS ones — so a healthy
+    rendered on every report — including clean PASS ones — so a healthy
     report carries the numbers that prove it, not just "completed cleanly".
 
-    File paths are deliberately never included: an integrity alert routed
-    through SMTP is not a private channel, and the affected paths would sit
-    in the mailbox unencrypted. The body instead names the exact terminal
-    command that lists them locally.
-
-    A message is always sent as ``multipart/alternative`` (plain text +
-    HTML) so terminal and rich mail clients each get an appropriate view.
-
-    Best-effort: prints a warning on failure but never prevents the scan
-    from completing with its normal exit code.
+    File paths are deliberately never included: neither SMTP nor a
+    third-party monitoring service is a private channel, and the affected
+    paths would sit there unencrypted. The body instead names the exact
+    terminal command that lists them locally.
     """
-    try:
-        config = _load_notify_config()
-    except SystemExit:
-        # _load_notify_config calls sys.exit on error; during notification
-        # we want to warn, not abort.
-        print("  Warning: could not load email config — skipping notification.",
-              file=sys.stderr)
-        return
-
-    section = config["email"]
-
     if host is None:
-        # Attribute the alert to a machine. gethostname() can raise on a
-        # misconfigured box — never let that sink the notification.
-        try:
-            host = socket.gethostname() or "unknown-host"
-        except OSError:
-            host = "unknown-host"
+        host = _hostname()
 
     has_problems = failed > 0 or count_missing > 0
     outcome = "DETECTED" if has_problems else "PASS"
@@ -686,6 +758,52 @@ def _send_email_notification(target_dir: str, failed: int, count_missing: int,
         count_missing=count_missing, interrupted=interrupted,
         counts=counts, due_progress=due_progress, freshness=freshness,
         elapsed_seconds=elapsed_seconds, change_line=change_line,
+    )
+    return subject, body, html_body
+
+
+def _send_email_notification(target_dir: str, failed: int, count_missing: int,
+                             failed_files: List[Dict],
+                             freshness: Optional[tuple] = None,
+                             *,
+                             elapsed_seconds: Optional[float] = None,
+                             due_progress: Optional[Tuple[int, int]] = None,
+                             interrupted: bool = False,
+                             budget_exceeded: bool = False,
+                             errors: int = 0,
+                             stats: Optional[Dict] = None,
+                             host: Optional[str] = None,
+                             scan_time: Optional[str] = None,
+                             previous_counts: Optional[Tuple[int, int]] = None):
+    """Send an email notification summarizing a completed scan.
+
+    The subject and bodies come from :func:`_compose_report` (see it for the
+    PASS/DETECTED subject format and why file paths are never included).
+    ``failed_files`` is accepted for call-site compatibility but is not
+    rendered, for that same privacy reason.
+
+    A message is always sent as ``multipart/alternative`` (plain text +
+    HTML) so terminal and rich mail clients each get an appropriate view.
+
+    Best-effort: prints a warning on failure but never prevents the scan
+    from completing with its normal exit code.
+    """
+    try:
+        config = _load_notify_config()
+    except SystemExit:
+        # _load_notify_config calls sys.exit on error; during notification
+        # we want to warn, not abort.
+        print("  Warning: could not load email config — skipping notification.",
+              file=sys.stderr)
+        return
+
+    section = config["email"]
+    subject, body, html_body = _compose_report(
+        target_dir, failed, count_missing, freshness,
+        elapsed_seconds=elapsed_seconds, due_progress=due_progress,
+        interrupted=interrupted, budget_exceeded=budget_exceeded,
+        errors=errors, stats=stats, host=host, scan_time=scan_time,
+        previous_counts=previous_counts,
     )
 
     try:
@@ -825,3 +943,359 @@ def _build_html_body(*, target_dir: str, host: str, scan_time: Optional[str],
 
     parts.append('</div></div>')
     return "".join(parts)
+
+
+# ── healthchecks.io ─────────────────────────────────────────────────────────────
+# A dead-man's switch: every scan pings, so a schedule that silently stops
+# running (a Homebrew upgrade deleting the pinned interpreter, an unmounted
+# volume, a sleeping machine) shows up as a *missing* ping — something an
+# email-on-problems design can never report, because no scan means no email.
+#
+# Each (directory, scan type) gets its own check, addressed by slug under the
+# project's ping key and auto-created on first ping (``?create=1``), so a dead
+# nightly full scan isn't masked by healthy hourly quick scans and each check
+# can carry its own period / grace time. Works with self-hosted Healthchecks
+# instances via a configurable ping endpoint.
+
+_HC_DEFAULT_ENDPOINT = "https://hc-ping.com"
+_HC_SETUP_TEST_SLUG = "rotbyte-setup-test"
+_HC_TIMEOUT = 10            # seconds per attempt (healthchecks docs use curl -m 10)
+_HC_ATTEMPTS = 3            # bounded so a dead network can't stall a scheduled scan
+_HC_RETRY_DELAY = 2.0       # seconds, multiplied by the attempt number
+_HC_BODY_LIMIT = 100_000    # bytes healthchecks.io stores per ping
+_HC_USER_AGENT = "rotbyte"
+
+
+def _healthchecks_keychain_account(endpoint: str) -> str:
+    """Keychain account label for the ping key of a given ping endpoint.
+
+    Shares the ``rotbyte-notify`` keychain service with the SMTP password;
+    the ``healthchecks@`` prefix keeps the two apart, and keying on the
+    endpoint lets hosted and self-hosted instances hold different keys.
+    """
+    parts = urllib.parse.urlsplit(endpoint)
+    return f"healthchecks@{parts.netloc}{parts.path.rstrip('/')}"
+
+
+def _load_healthchecks_config() -> Dict[str, str]:
+    """Load the ``[healthchecks]`` section, or exit with an error.
+
+    Returns ``{"endpoint": ..., "ping_key": ...}``. Mirrors
+    :func:`_load_notify_config`: the ping key normally lives in the platform
+    credential store (``ping_key_backend``) and is fetched here; a plaintext
+    ``ping_key`` is used when no store was available at setup time.
+    """
+    path = _notify_config_path()
+    hint = "  Run `rotbyte --notify-setup healthchecks` to configure."
+    if not os.path.isfile(path):
+        print(f"Error: No notification config found at {path}", file=sys.stderr)
+        print(hint, file=sys.stderr)
+        sys.exit(1)
+    try:
+        config = _read_notify_file()
+    except configparser.Error as e:
+        print(f"Error: Could not parse {path}: {e}", file=sys.stderr)
+        print(hint, file=sys.stderr)
+        sys.exit(1)
+    if "healthchecks" not in config:
+        print(f"Error: No [healthchecks] section in {path}", file=sys.stderr)
+        print(hint, file=sys.stderr)
+        sys.exit(1)
+
+    section = config["healthchecks"]
+    endpoint = (section.get("ping_endpoint", "").strip().rstrip("/")
+                or _HC_DEFAULT_ENDPOINT)
+    ping_key = section.get("ping_key", "").strip()
+    if not ping_key:
+        backend = section.get("ping_key_backend", "")
+        if backend in ("keychain", "credential-manager", "secret-service"):
+            account = _healthchecks_keychain_account(endpoint)
+            secret = _keychain_get(account)
+            if not secret:
+                print(f"Error: Could not read the healthchecks.io ping key from "
+                      f"{backend} for {account}", file=sys.stderr)
+                print(hint, file=sys.stderr)
+                sys.exit(1)
+            ping_key = secret
+        else:
+            print(f"Error: Missing 'ping_key' in [healthchecks] section of {path}",
+                  file=sys.stderr)
+            print(hint, file=sys.stderr)
+            sys.exit(1)
+    return {"endpoint": endpoint, "ping_key": ping_key}
+
+
+def _healthchecks_slug(target_dir: str, scan_type: str) -> str:
+    """The check slug for one directory's quick or full scan.
+
+    ``rotbyte-<name>-<scan_type>-<dirhash>``, e.g.
+    ``rotbyte-torrents-quick-5f1efe79``. ``<name>`` is the directory's
+    basename folded to the slug alphabet healthchecks.io accepts
+    (``a-z 0-9 - _``); ``<dirhash>`` is the same 8-char hash that names the
+    directory's launchd/systemd/Task Scheduler jobs, so two directories with
+    the same basename still get distinct checks and a check can be matched
+    to its schedule at a glance.
+    """
+    # Lazy import: the scheduler package imports this module.
+    from .scheduler import _dir_hash
+    name = os.path.basename(os.path.normpath(target_dir))
+    # Fold accents to ASCII ("Été" → "ete") before dropping what's left.
+    name = (unicodedata.normalize("NFKD", name)
+            .encode("ascii", "ignore").decode("ascii").lower())
+    name = _re.sub(r"[^a-z0-9_-]+", "-", name).strip("-_")[:40].strip("-_")
+    return f"rotbyte-{name or 'dir'}-{scan_type}-{_dir_hash(target_dir)}"
+
+
+def _healthchecks_url(config: Dict[str, str], slug: str, signal: str = "",
+                      rid: Optional[str] = None) -> str:
+    """Build a slug ping URL: ``<endpoint>/<ping_key>/<slug>[/<signal>]``.
+
+    ``signal`` is ``""`` (success), ``"start"``, ``"log"``, or an exit status
+    (``"0"`` success, ``"1"``–``"255"`` failure). ``create=1`` auto-creates
+    the check on its first ping; ``rid`` pairs a start ping with its result
+    so healthchecks.io measures the run duration correctly.
+    """
+    key = urllib.parse.quote(config["ping_key"], safe="")
+    url = f"{config['endpoint'].rstrip('/')}/{key}/{slug}"
+    if signal:
+        url += f"/{signal}"
+    query = {"create": "1"}
+    if rid:
+        query["rid"] = rid
+    return f"{url}?{urllib.parse.urlencode(query)}"
+
+
+def _hc_http_error_hint(code: int) -> str:
+    """Readable explanation for a non-retryable healthchecks.io HTTP status."""
+    if code == 404:
+        return ("HTTP 404 — the ping key was not recognized (or this server "
+                "does not support auto-created checks). Re-run "
+                "`rotbyte --notify-setup healthchecks`.")
+    if code == 409:
+        return "HTTP 409 — more than one check in the project uses this slug."
+    if code == 400:
+        # healthchecks.io answers a malformed key (e.g. truncated when
+        # copied) with 400 rather than 404.
+        return ("HTTP 400 — the server rejected the ping URL: the ping key "
+                "looks malformed (copy it again), or the ping endpoint is "
+                "wrong.")
+    return f"HTTP {code}"
+
+
+def _hc_post(url: str, body: str = "") -> Tuple[bool, str]:
+    """POST ``body`` to a healthchecks.io ping URL with bounded retries.
+
+    Returns ``(ok, error)``. Retries network failures, timeouts, 429, and
+    5xx (transient); gives up immediately on other 4xx (a retry won't fix a
+    bad key). Never raises. The error text never includes the URL, which
+    embeds the secret ping key.
+    """
+    data = body.encode("utf-8")
+    if len(data) > _HC_BODY_LIMIT:
+        # healthchecks.io keeps only the first 100 kB; trim on a character
+        # boundary so the stored log stays valid UTF-8.
+        data = data[:_HC_BODY_LIMIT].decode("utf-8", "ignore").encode("utf-8")
+    error = ""
+    for attempt in range(_HC_ATTEMPTS):
+        if attempt:
+            time.sleep(_HC_RETRY_DELAY * attempt)
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"User-Agent": _HC_USER_AGENT,
+                     "Content-Type": "text/plain; charset=utf-8"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_HC_TIMEOUT) as resp:
+                resp.read()
+            return True, ""
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                error = f"HTTP {e.code}"
+                continue
+            return False, _hc_http_error_hint(e.code)
+        except urllib.error.URLError as e:
+            error = str(e.reason)
+        except (OSError, ValueError) as e:
+            # OSError covers timeouts and resets raised mid-response;
+            # ValueError a malformed endpoint (e.g. "unknown url type").
+            error = str(e) or type(e).__name__
+            if isinstance(e, ValueError):
+                break
+    return False, error
+
+
+def _healthchecks_ping(target_dir: str, scan_type: str, signal: str = "",
+                       *, body: str = "", rid: Optional[str] = None,
+                       config: Optional[Dict[str, str]] = None) -> bool:
+    """Ping the check for ``target_dir``'s ``scan_type`` ("quick"/"full").
+
+    ``signal`` is ``""``/``"0"`` (success), ``"start"``, or a non-zero exit
+    status (failure). Pass ``config`` to reuse an already-loaded config
+    across the start and result pings of one run. Best-effort, like email:
+    any failure becomes a stderr warning and never changes the scan's exit
+    code. Returns True when the ping was accepted.
+    """
+    if config is None:
+        try:
+            config = _load_healthchecks_config()
+        except SystemExit:
+            print("  Warning: could not load healthchecks.io config — "
+                  "skipping ping.", file=sys.stderr)
+            return False
+    slug = _healthchecks_slug(target_dir, scan_type)
+    ok, error = _hc_post(_healthchecks_url(config, slug, signal, rid), body)
+    if not ok:
+        where = f"{slug}/{signal}" if signal else slug
+        print(f"\n  Warning: healthchecks.io ping failed ({where}): {error}",
+              file=sys.stderr)
+    return ok
+
+
+def _send_healthchecks_result(target_dir: str, scan_type: str, exit_code: int,
+                              failed: int, count_missing: int,
+                              freshness: Optional[tuple] = None, *,
+                              rid: Optional[str] = None,
+                              config: Optional[Dict[str, str]] = None,
+                              **report) -> bool:
+    """Report a finished scan: ping ``/<exit_code>`` with the scan report.
+
+    Exit status 0 marks the check up; anything else (missing files,
+    bit rot, interrupted) marks it down — the same "alert on non-zero" rule
+    rotbyte's documented exit codes were designed for. The body is the
+    email's path-free plain-text report, so the check's event log shows
+    what the scan found. ``report`` takes :func:`_compose_report`'s keyword
+    arguments.
+    """
+    subject, text, _html_body = _compose_report(
+        target_dir, failed, count_missing, freshness, **report)
+    return _healthchecks_ping(target_dir, scan_type, str(exit_code),
+                              body=f"{subject}\n\n{text}\n", rid=rid,
+                              config=config)
+
+
+def _hc_span(seconds: int) -> str:
+    """Duration phrased the way healthchecks.io's period/grace UI reads."""
+    def unit(n: int, word: str) -> str:
+        return f"{n} {word}{'s' if n != 1 else ''}"
+    if seconds % 86400 == 0:
+        return unit(seconds // 86400, "day")
+    if seconds % 3600 == 0:
+        return unit(seconds // 3600, "hour")
+    if seconds < 3600:
+        return unit(max(seconds // 60, 1), "minute")
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+def _healthchecks_track_hint(target_dir: str, every_seconds: int,
+                             full_at: Optional[List[Tuple[int, int]]],
+                             budget_seconds: Optional[int]) -> List[str]:
+    """Lines printed by ``--track`` naming each check and suggested timings.
+
+    Auto-created checks start with healthchecks.io's defaults (period 1 day,
+    grace 1 hour), which fit neither an hourly quick scan nor a long
+    budgeted full scan: rotbyte sends a start signal, so a scan still
+    running when grace expires is reported down. Suggest values that match
+    the schedule being installed.
+    """
+    lines = ["  healthchecks.io checks (created on first ping — then set these "
+             "in the dashboard):"]
+    lines.append(f"    {_healthchecks_slug(target_dir, 'quick')}")
+    lines.append(f"      Period {_hc_span(every_seconds)} · Grace 1 hour "
+                 f"(more if quick scans hash many new files)")
+    if full_at:
+        minutes = sorted({h * 60 + m for h, m in full_at})
+        # Shortest gap between consecutive daily runs, wrapping past midnight.
+        gaps = [b - a for a, b in zip(minutes, minutes[1:])]
+        gaps.append(1440 - minutes[-1] + minutes[0])
+        period = _hc_span(min(gaps) * 60)
+        if budget_seconds:
+            # Budget caps hashing only; the walk and missing-file pass add
+            # time, so leave an hour of headroom.
+            grace = _hc_span(budget_seconds + 3600)
+        else:
+            grace = "longer than your longest full scan"
+        lines.append(f"    {_healthchecks_slug(target_dir, 'full')}")
+        lines.append(f"      Period {period} · Grace {grace}")
+    return lines
+
+
+def _run_healthchecks_setup():
+    """Interactive setup for healthchecks.io pings."""
+    print("═" * 60)
+    print("  rotbyte — healthchecks.io setup")
+    print("═" * 60)
+    print()
+    print("  rotbyte pings one check per directory and scan type (e.g.")
+    print("  rotbyte-media-quick-1a2b3c4d) and creates each check on its")
+    print("  first ping. You need your project's Ping key, from the project's")
+    print("  Settings page on healthchecks.io.")
+    print()
+    print("  Self-hosted? Enter your instance's ping endpoint — its")
+    print("  PING_ENDPOINT setting, usually https://<your-server>/ping.")
+    print()
+
+    endpoint = input(f"  Ping endpoint [{_HC_DEFAULT_ENDPOINT}]: ").strip()
+    endpoint = (endpoint or _HC_DEFAULT_ENDPOINT).rstrip("/")
+    parts = urllib.parse.urlsplit(endpoint)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        print(f"Error: '{endpoint}' is not an http(s) URL.", file=sys.stderr)
+        sys.exit(1)
+    if parts.scheme == "http":
+        print("  Warning: plain http — the ping key will cross the network "
+              "unencrypted.", file=sys.stderr)
+
+    ping_key = getpass.getpass("  Ping key: ").strip()
+    if not ping_key:
+        print("Error: Ping key is required.", file=sys.stderr)
+        sys.exit(1)
+    if "/" in ping_key or any(c.isspace() for c in ping_key):
+        print("Error: that doesn't look like a ping key — paste only the key, "
+              "not a ping URL.", file=sys.stderr)
+        sys.exit(1)
+
+    # Verify the key with a /log ping to a dedicated test check. With
+    # create=1 the only 404 is an unknown ping key, so this genuinely
+    # validates it; a log ping never changes a check's status, so the test
+    # check stays "new" and can never alert.
+    print()
+    print("  Testing ping key...", end="", flush=True)
+    config = {"endpoint": endpoint, "ping_key": ping_key}
+    ok, error = _hc_post(
+        _healthchecks_url(config, _HC_SETUP_TEST_SLUG, "log"),
+        f"rotbyte setup test from {_hostname()}\n",
+    )
+    if not ok:
+        print(f" failed.\n\n  Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(" ok.")
+
+    account = _healthchecks_keychain_account(endpoint)
+    stored, backend = _keychain_set(account, ping_key,
+                                    label="rotbyte healthchecks.io")
+    section: Dict[str, str] = {"ping_endpoint": endpoint}
+    if stored:
+        section["ping_key_backend"] = backend
+    else:
+        section["ping_key"] = ping_key
+        section["ping_key_backend"] = "plaintext"
+    # Replaces only [healthchecks]; an [email] section survives.
+    config_path = _write_notify_section("healthchecks", section)
+
+    print(f"  Config saved to {config_path}")
+    if stored:
+        print(f"  Ping key stored in {backend} (account: {account})")
+    else:
+        print(f"  Warning: no platform credential store available — ping key "
+              f"saved plaintext at {config_path} (chmod 0600).",
+              file=sys.stderr)
+    print(f"  A '{_HC_SETUP_TEST_SLUG}' check was created to verify the key.")
+    print("  It never alerts; delete it from the dashboard whenever you like.")
+    print()
+    print("  Usage:")
+    print("    rotbyte --check --notify healthchecks /Volumes/Media")
+    print("    rotbyte --track --every 1h --full-at 2h "
+          "--notify email,healthchecks /Volumes/Media")
+    print()
+    print("  New checks start at healthchecks.io's defaults (period 1 day,")
+    print("  grace 1 hour); `rotbyte --track` prints values that match your")
+    print("  schedule. See `rotbyte --docs healthchecks`.")

@@ -4129,10 +4129,13 @@ class TestTrackSetup:
     _run_track() with the expected arguments. _run_track itself is mocked so
     the tests don't touch launchd/systemd."""
 
-    def _run_wizard(self, tmp, inputs, notify_cfg_exists=False):
+    def _run_wizard(self, tmp, inputs, notify_cfg_exists=False, configured=None):
         """Feed `inputs` (a list of strings, one per input() call) to the
         wizard and return the kwargs-equivalent tuple captured from the
-        mocked _run_track call, or None if _run_track wasn't called."""
+        mocked _run_track call, or None if _run_track wasn't called.
+
+        ``configured`` is the set of notify backends whose notify.conf
+        section exists; ``notify_cfg_exists=True`` is shorthand for email."""
         captured = {}
 
         def fake_run_track(target_dir, every_seconds, full_at,
@@ -4148,21 +4151,18 @@ class TestTrackSetup:
                 notify=notify,
             )
 
-        # os.path.exists is patched only for the notify-config check. The
-        # wizard's os.path.isdir / os.path.realpath calls are unaffected.
-        real_exists = os.path.exists
-        notify_cfg = rotbyte._notify_config_path()
-
-        def fake_exists(p):
-            if p == notify_cfg:
-                return notify_cfg_exists
-            return real_exists(p)
+        # The notify.conf file is shared by every backend, so the wizard asks
+        # per section. Patch that query rather than the filesystem so the
+        # real user's notify.conf can never leak into the test.
+        if configured is None:
+            configured = {"email"} if notify_cfg_exists else set()
 
         with unittest.mock.patch.object(rotbyte, "_run_track",
                                         side_effect=fake_run_track) as m, \
              unittest.mock.patch.object(rotbyte, "_find_rotbyte_executable",
                                         return_value="rotbyte"), \
-             unittest.mock.patch("os.path.exists", side_effect=fake_exists), \
+             unittest.mock.patch.object(rotbyte, "_notify_backend_configured",
+                                        side_effect=lambda b: b in configured), \
              unittest.mock.patch("builtins.input", side_effect=inputs):
             rotbyte._run_track_setup(str(tmp))
 
@@ -4176,6 +4176,7 @@ class TestTrackSetup:
             "",     # full-at (none)
             "",     # due (none)
             "",     # notify (no)
+            "",     # healthchecks (no)
             "",     # install confirm (Y default)
         ]
         captured = self._run_wizard(tmp, inputs)
@@ -4196,6 +4197,7 @@ class TestTrackSetup:
             "2h",       # budget
             "30d",      # due
             "n",        # notify
+            "",     # healthchecks (no)
             "",         # install confirm
         ]
         captured = self._run_wizard(tmp, inputs)
@@ -4214,6 +4216,7 @@ class TestTrackSetup:
             "",         # full-at
             "",         # due
             "",         # notify
+            "",     # healthchecks (no)
             "",         # install
         ]
         captured = self._run_wizard(tmp, inputs)
@@ -4227,6 +4230,7 @@ class TestTrackSetup:
             "",         # full-at
             "",         # due
             "",         # notify
+            "",     # healthchecks (no)
             "n",        # install → abort
         ]
         captured = self._run_wizard(tmp, inputs)
@@ -4241,6 +4245,7 @@ class TestTrackSetup:
             "",     # full-at
             "",     # due
             "y",    # notify yes
+            "",     # healthchecks (no)
             "",     # install
         ]
         captured = self._run_wizard(tmp, inputs, notify_cfg_exists=False)
@@ -4255,6 +4260,7 @@ class TestTrackSetup:
             "",     # full-at
             "",     # due
             "y",    # notify yes
+            "",     # healthchecks (no)
             "",     # install
         ]
         captured = self._run_wizard(tmp, inputs, notify_cfg_exists=True)
@@ -4262,7 +4268,7 @@ class TestTrackSetup:
 
     def test_budget_prompt_skipped_without_full_at(self, tmp):
         """No full-at means the wizard never asks for a budget."""
-        # Only 6 inputs — if the wizard asked for budget, input() would raise
+        # Only 7 inputs — if the wizard asked for budget, input() would raise
         # StopIteration and the test would fail.
         inputs = [
             "",     # target dir
@@ -4270,6 +4276,7 @@ class TestTrackSetup:
             "",     # full-at (none → skip budget)
             "",     # due
             "",     # notify
+            "",     # healthchecks (no)
             "",     # install
         ]
         captured = self._run_wizard(tmp, inputs)
@@ -5514,6 +5521,823 @@ class TestTrackBudgetOverlapWarning:
                            f"{sys.executable} rotbyte.py")
         out = capsys.readouterr().out
         assert "Installing scheduled scans" in out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# healthchecks.io notification backend
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HC_CFG = {"endpoint": "https://hc-ping.com", "ping_key": "k3y-abc_123"}
+
+
+class _HcRecorder:
+    """Stand-in for _rotbyte.notify._hc_post that records every ping."""
+
+    def __init__(self, ok=True, error=""):
+        self.calls = []
+        self.ok = ok
+        self.error = error
+
+    def __call__(self, url, body=""):
+        self.calls.append((url, body))
+        return self.ok, self.error
+
+    @staticmethod
+    def parts(url):
+        """(path-after-ping-key, query dict) for a recorded ping URL."""
+        import urllib.parse as up
+        split = up.urlsplit(url)
+        # /<ping_key>/<slug>[/<signal>]
+        segments = split.path.strip("/").split("/")
+        return segments[1:], dict(up.parse_qsl(split.query))
+
+    def signals(self):
+        """[(slug, signal)] in send order; signal "" means plain success."""
+        out = []
+        for url, _ in self.calls:
+            segs, _q = self.parts(url)
+            out.append((segs[0], segs[1] if len(segs) > 1 else ""))
+        return out
+
+
+class TestNotifyBackendParsing:
+    def test_single_backend(self):
+        assert rotbyte._parse_notify_backends("email") == ["email"]
+        assert rotbyte._parse_notify_backends("healthchecks") == ["healthchecks"]
+
+    def test_comma_list_preserves_order(self):
+        assert rotbyte._parse_notify_backends("healthchecks,email") == \
+            ["healthchecks", "email"]
+
+    def test_whitespace_case_and_duplicates_normalized(self):
+        assert rotbyte._parse_notify_backends(" Email , healthchecks,email,") == \
+            ["email", "healthchecks"]
+
+    def test_unknown_backend_names_supported_ones(self):
+        with pytest.raises(ValueError) as e:
+            rotbyte._parse_notify_backends("email,pager")
+        assert "'pager'" in str(e.value)
+        assert "email, healthchecks" in str(e.value)
+
+    def test_empty_value_rejected(self):
+        with pytest.raises(ValueError):
+            rotbyte._parse_notify_backends(" , ")
+
+    def test_cli_rejects_unknown_backend(self, tmp):
+        rc, _out, err = _run_cli("--notify", "pager", str(tmp))
+        assert rc == 1
+        assert "Unknown notification backend 'pager'" in err
+        assert "email, healthchecks" in err
+
+    def test_cli_notify_setup_rejects_unknown_backend(self):
+        rc, _out, err = _run_cli("--notify-setup", "pager")
+        assert rc == 1
+        assert "Supported: email, healthchecks" in err
+
+    def test_track_receives_canonical_notify_value(self, tmp):
+        """--notify is canonicalized before --track bakes it into schedules."""
+        captured = {}
+
+        def fake_track(*a, **kw):
+            captured.update(kw)
+
+        argv = ["rotbyte", "--track", "--notify", "Healthchecks, email,email",
+                str(tmp)]
+        with unittest.mock.patch.object(sys, "argv", argv), \
+             unittest.mock.patch.object(rotbyte, "_run_track", side_effect=fake_track), \
+             unittest.mock.patch.object(rotbyte, "_load_notify_config"), \
+             unittest.mock.patch.object(rotbyte, "_load_healthchecks_config",
+                                        return_value=dict(_HC_CFG)), \
+             unittest.mock.patch.object(rotbyte, "_find_rotbyte_executable",
+                                        return_value=["rotbyte"]):
+            rotbyte.main()
+        assert captured["notify"] == "healthchecks,email"
+
+    def test_parse_cmd_flags_round_trips_comma_list(self):
+        cmd = ["rotbyte", "--notify", "email,healthchecks", "--scheduled", "/d"]
+        assert rotbyte._parse_cmd_flags(cmd)["notify"] == "email,healthchecks"
+
+
+class TestHealthchecksSlug:
+    def test_format_and_hash_match_scheduler_jobs(self):
+        d = "/Volumes/internalExpansion/Torrents"
+        h = rotbyte._dir_hash(d)
+        assert rotbyte._healthchecks_slug(d, "quick") == f"rotbyte-torrents-quick-{h}"
+        assert rotbyte._healthchecks_slug(d, "full") == f"rotbyte-torrents-full-{h}"
+
+    def test_same_basename_different_dirs_get_distinct_slugs(self):
+        a = rotbyte._healthchecks_slug("/Volumes/A/Photos", "quick")
+        b = rotbyte._healthchecks_slug("/Volumes/B/Photos", "quick")
+        assert a != b
+        assert a.startswith("rotbyte-photos-quick-")
+
+    def test_accents_and_punctuation_folded(self):
+        slug = rotbyte._healthchecks_slug("/x/Été Photos (2024)", "full")
+        assert slug.startswith("rotbyte-ete-photos-2024-full-")
+
+    def test_unrepresentable_name_falls_back(self):
+        assert rotbyte._healthchecks_slug("/写真", "quick").startswith("rotbyte-dir-quick-")
+        assert rotbyte._healthchecks_slug("/", "quick").startswith("rotbyte-dir-quick-")
+
+    def test_long_name_truncated_and_slug_alphabet_only(self):
+        import re
+        slug = rotbyte._healthchecks_slug("/x/" + "a" * 200, "quick")
+        name = slug[len("rotbyte-"):].split("-quick-")[0]
+        assert len(name) <= 40
+        for d in ("/x/Mixed_Case-Name.v2", "/x/--odd--", "/x/a b\tc"):
+            assert re.fullmatch(r"[a-z0-9_-]+", rotbyte._healthchecks_slug(d, "full"))
+
+
+class TestHealthchecksUrl:
+    def test_success_url_has_create(self):
+        url = _rotbyte_pkg.notify._healthchecks_url(_HC_CFG, "rotbyte-x-quick-1")
+        assert url == "https://hc-ping.com/k3y-abc_123/rotbyte-x-quick-1?create=1"
+
+    def test_signal_and_rid(self):
+        url = _rotbyte_pkg.notify._healthchecks_url(
+            _HC_CFG, "s", "start", rid="123e4567-e89b-12d3-a456-426614174000")
+        segs, q = _HcRecorder.parts(url)
+        assert segs == ["s", "start"]
+        assert q == {"create": "1", "rid": "123e4567-e89b-12d3-a456-426614174000"}
+
+    def test_self_hosted_endpoint_with_trailing_slash(self):
+        cfg = {"endpoint": "https://hc.example.com/ping/", "ping_key": "k"}
+        url = _rotbyte_pkg.notify._healthchecks_url(cfg, "s", "2")
+        assert url == "https://hc.example.com/ping/k/s/2?create=1"
+
+
+class _FakeResp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, *a):
+        return b"OK"
+
+
+class TestHealthchecksPost:
+    def _http_error(self, code):
+        import urllib.error
+        return urllib.error.HTTPError("https://x", code, "err", {}, None)
+
+    def test_posts_body_with_user_agent(self, monkeypatch):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append((req, timeout))
+            return _FakeResp()
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", fake_urlopen)
+        ok, err = _rotbyte_pkg.notify._hc_post("https://hc-ping.com/k/s?create=1", "héllo")
+        assert (ok, err) == (True, "")
+        req, timeout = seen[0]
+        assert req.get_method() == "POST"
+        assert req.data == "héllo".encode("utf-8")
+        assert req.get_header("User-agent") == "rotbyte"
+        assert timeout == _rotbyte_pkg.notify._HC_TIMEOUT
+
+    def test_retries_transient_failures_then_succeeds(self, monkeypatch):
+        import urllib.error
+        attempts = []
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise urllib.error.URLError("temporary failure in name resolution")
+            if len(attempts) == 2:
+                raise self._http_error(503)
+            return _FakeResp()
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(_rotbyte_pkg.notify.time, "sleep", lambda s: None)
+        assert _rotbyte_pkg.notify._hc_post("https://x/k/s", "") == (True, "")
+        assert len(attempts) == 3
+
+    def test_gives_up_after_bounded_attempts(self, monkeypatch):
+        import urllib.error
+        attempts = []
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(1)
+            raise urllib.error.URLError("timed out")
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(_rotbyte_pkg.notify.time, "sleep", lambda s: None)
+        ok, err = _rotbyte_pkg.notify._hc_post("https://x/k/s", "")
+        assert not ok and "timed out" in err
+        assert len(attempts) == _rotbyte_pkg.notify._HC_ATTEMPTS
+
+    def test_404_is_not_retried_and_explained(self, monkeypatch):
+        attempts = []
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(1)
+            raise self._http_error(404)
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", fake_urlopen)
+        ok, err = _rotbyte_pkg.notify._hc_post("https://x/k/s", "")
+        assert not ok
+        assert len(attempts) == 1
+        assert "ping key was not recognized" in err
+
+    def test_body_truncated_on_character_boundary(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen",
+                            lambda req, timeout=None: seen.append(req) or _FakeResp())
+        limit = _rotbyte_pkg.notify._HC_BODY_LIMIT
+        _rotbyte_pkg.notify._hc_post("https://x/k/s", "é" * limit)
+        data = seen[0].data
+        assert len(data) <= limit
+        data.decode("utf-8")  # still valid UTF-8
+
+    def test_ping_failure_warning_never_leaks_ping_key(self, monkeypatch, capsys):
+        import urllib.error
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(_rotbyte_pkg.notify.time, "sleep", lambda s: None)
+        ok = rotbyte._healthchecks_ping("/data/media", "quick", "0", config=_HC_CFG)
+        assert ok is False
+        err = capsys.readouterr().err
+        assert "healthchecks.io ping failed" in err
+        assert "rotbyte-media-quick-" in err
+        assert _HC_CFG["ping_key"] not in err
+
+
+class TestHcSpan:
+    def test_units(self):
+        span = _rotbyte_pkg.notify._hc_span
+        assert span(86400) == "1 day"
+        assert span(2 * 86400) == "2 days"
+        assert span(3600) == "1 hour"
+        assert span(4 * 3600) == "4 hours"
+        assert span(1800) == "30 minutes"
+        assert span(5400) == "1h 30m"
+
+
+class TestHealthchecksConfig:
+    @pytest.fixture
+    def conf(self, tmp_path, monkeypatch):
+        path = tmp_path / "notify.conf"
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path", lambda: str(path))
+        return path
+
+    def test_plaintext_key(self, conf):
+        conf.write_text("[healthchecks]\nping_endpoint = https://hc.example.com/ping/\n"
+                        "ping_key = abc\nping_key_backend = plaintext\n")
+        cfg = rotbyte._load_healthchecks_config()
+        assert cfg == {"endpoint": "https://hc.example.com/ping", "ping_key": "abc"}
+
+    def test_keychain_key(self, conf, monkeypatch):
+        conf.write_text("[healthchecks]\nping_endpoint = https://hc-ping.com\n"
+                        "ping_key_backend = keychain\n")
+        asked = []
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_keychain_get",
+                            lambda account: asked.append(account) or "secret-key")
+        cfg = rotbyte._load_healthchecks_config()
+        assert cfg["ping_key"] == "secret-key"
+        assert asked == ["healthchecks@hc-ping.com"]
+
+    def test_keychain_read_failure_exits(self, conf, monkeypatch, capsys):
+        conf.write_text("[healthchecks]\nping_key_backend = keychain\n")
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_keychain_get", lambda a: None)
+        with pytest.raises(SystemExit):
+            rotbyte._load_healthchecks_config()
+        assert "--notify-setup healthchecks" in capsys.readouterr().err
+
+    def test_missing_section_exits_even_if_email_configured(self, conf, capsys):
+        conf.write_text("[email]\nsmtp_host = s\nsmtp_port = 587\nusername = u\n"
+                        "to = u\npassword = p\n")
+        with pytest.raises(SystemExit):
+            rotbyte._load_healthchecks_config()
+        assert "No [healthchecks] section" in capsys.readouterr().err
+
+    def test_missing_file_exits(self, conf, capsys):
+        with pytest.raises(SystemExit):
+            rotbyte._load_healthchecks_config()
+        assert "No notification config found" in capsys.readouterr().err
+
+    def test_email_loader_ignores_healthchecks_section(self, conf):
+        conf.write_text("[healthchecks]\nping_key = abc\n\n[email]\nsmtp_host = s\n"
+                        "smtp_port = 587\nusername = u\nto = u\npassword = p\n")
+        assert rotbyte._load_notify_config()["email"]["smtp_host"] == "s"
+
+    def test_backend_configured_checks_sections(self, conf):
+        conf.write_text("[email]\nsmtp_host = s\n")
+        assert rotbyte._notify_backend_configured("email")
+        assert not rotbyte._notify_backend_configured("healthchecks")
+
+    def test_write_section_preserves_others_and_is_private(self, conf):
+        conf.write_text("[email]\nsmtp_host = s\npassword = 100%secret\n")
+        _rotbyte_pkg.notify._write_notify_section("healthchecks", {"ping_key": "k"})
+        _rotbyte_pkg.notify._write_notify_section(
+            "healthchecks", {"ping_endpoint": "https://e", "ping_key_backend": "keychain"})
+        cfg = _rotbyte_pkg.notify._read_notify_file()
+        assert cfg["email"]["password"] == "100%secret"
+        # Rewritten wholesale: the stale plaintext key is gone.
+        assert dict(cfg["healthchecks"]) == {"ping_endpoint": "https://e",
+                                             "ping_key_backend": "keychain"}
+        if not sys.platform.startswith("win"):
+            assert (conf.stat().st_mode & 0o777) == 0o600
+
+
+class TestHealthchecksSetup:
+    @pytest.fixture
+    def conf(self, tmp_path, monkeypatch):
+        path = tmp_path / "rotbyte" / "notify.conf"
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path", lambda: str(path))
+        return path
+
+    def _run(self, monkeypatch, inputs, key="abc123", stored=(True, "keychain"),
+             post=(True, "")):
+        posts = []
+        stores = []
+        monkeypatch.setattr("builtins.input", lambda prompt="": inputs.pop(0))
+        monkeypatch.setattr(_rotbyte_pkg.notify.getpass, "getpass", lambda prompt="": key)
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_hc_post",
+                            lambda url, body="": posts.append(url) or post)
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_keychain_set",
+                            lambda account, secret, label="": stores.append(
+                                (account, secret, label)) or stored)
+        rotbyte._run_healthchecks_setup()
+        return posts, stores
+
+    def test_default_endpoint_stores_key_in_keychain(self, conf, monkeypatch):
+        conf.parent.mkdir()
+        conf.write_text("[email]\nsmtp_host = s\n")
+        posts, stores = self._run(monkeypatch, [""])
+        segs, q = _HcRecorder.parts(posts[0])
+        assert posts[0].startswith("https://hc-ping.com/abc123/")
+        assert segs == ["rotbyte-setup-test", "log"] and q["create"] == "1"
+        assert stores == [("healthchecks@hc-ping.com", "abc123", "rotbyte healthchecks.io")]
+        cfg = _rotbyte_pkg.notify._read_notify_file()
+        assert dict(cfg["healthchecks"]) == {"ping_endpoint": "https://hc-ping.com",
+                                             "ping_key_backend": "keychain"}
+        assert cfg["email"]["smtp_host"] == "s"  # untouched
+
+    def test_self_hosted_endpoint_plaintext_fallback(self, conf, monkeypatch, capsys):
+        posts, stores = self._run(monkeypatch, ["https://hc.example.com/ping/"],
+                                  stored=(False, "plaintext"))
+        assert posts[0].startswith("https://hc.example.com/ping/abc123/rotbyte-setup-test/log")
+        assert stores[0][0] == "healthchecks@hc.example.com/ping"
+        cfg = _rotbyte_pkg.notify._read_notify_file()
+        assert cfg["healthchecks"]["ping_key"] == "abc123"
+        assert cfg["healthchecks"]["ping_endpoint"] == "https://hc.example.com/ping"
+        assert "plaintext" in capsys.readouterr().err
+
+    def test_failed_test_ping_writes_nothing(self, conf, monkeypatch, capsys):
+        with pytest.raises(SystemExit):
+            self._run(monkeypatch, [""], post=(False, "HTTP 404 — nope"))
+        assert not conf.exists()
+        assert "HTTP 404" in capsys.readouterr().err
+
+    def test_rejects_non_http_endpoint(self, conf, monkeypatch):
+        with pytest.raises(SystemExit):
+            self._run(monkeypatch, ["hc-ping.com"])
+
+    def test_rejects_pasted_ping_url_as_key(self, conf, monkeypatch, capsys):
+        with pytest.raises(SystemExit):
+            self._run(monkeypatch, [""], key="https://hc-ping.com/abc/slug")
+        assert "paste only the key" in capsys.readouterr().err
+
+
+class TestEmailSetupPreservesHealthchecks:
+    def test_email_setup_keeps_healthchecks_section(self, tmp_path, monkeypatch):
+        path = tmp_path / "notify.conf"
+        path.write_text("[healthchecks]\nping_endpoint = https://hc-ping.com\n"
+                        "ping_key_backend = keychain\n")
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path", lambda: str(path))
+        answers = ["smtp.example.com", "587", "me@example.com", "", ""]
+        monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0))
+        monkeypatch.setattr(_rotbyte_pkg.notify.getpass, "getpass", lambda prompt="": "pw")
+
+        class FakeServer:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def login(self, *a): pass
+            def sendmail(self, *a): pass
+
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_smtp_connect",
+                            lambda *a, **k: FakeServer())
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_keychain_set",
+                            lambda *a, **k: (True, "keychain"))
+        rotbyte._run_notify_setup()
+        cfg = _rotbyte_pkg.notify._read_notify_file()
+        assert cfg["email"]["smtp_host"] == "smtp.example.com"
+        assert cfg["healthchecks"]["ping_key_backend"] == "keychain"
+
+
+class TestHealthchecksScanPings:
+    """_run_phases pings on every run: /start, then /<exit code>."""
+
+    def _args(self, notify="healthchecks", check=False, scheduled=True,
+              hc_config=True):
+        import argparse
+        args = argparse.Namespace(
+            notify=notify, budget=None, due=None, budget_seconds=None,
+            due_days=None, scheduled=scheduled, full_at=None, quiet=True,
+            json_output=False, check=check, workers=1, include_hidden=False,
+            exclude_dirs=[], skip_missing=False,
+        )
+        if hc_config:
+            args.healthchecks_config = dict(_HC_CFG)
+        return args
+
+    def _phases(self, tmp_path, args):
+        db_name = "." + tmp_path.name + rotbyte.DB_FILENAME_SUFFIX
+        db = rotbyte.ChecksumDB(str(tmp_path / db_name))
+        try:
+            with pytest.raises(SystemExit) as e:
+                rotbyte._run_phases(db, str(tmp_path), args, [False])
+        finally:
+            db.close()
+        return e.value.code
+
+    def _index(self, tmp_path):
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec):
+            self._phases(tmp_path, self._args(notify=None))
+        assert rec.calls == []
+
+    def test_clean_scheduled_quick_scan_pings_but_email_stays_quiet(self, tmp):
+        self._index(tmp)
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec), \
+             unittest.mock.patch("rotbyte._send_email_notification") as email:
+            code = self._phases(tmp, self._args(notify="email,healthchecks"))
+        assert code == 0
+        assert email.call_count == 0  # email rule unchanged
+        slug = rotbyte._healthchecks_slug(str(tmp), "quick")
+        assert rec.signals() == [(slug, "start"), (slug, "0")]
+        _segs, q_start = _HcRecorder.parts(rec.calls[0][0])
+        _segs, q_end = _HcRecorder.parts(rec.calls[1][0])
+        assert q_start["rid"] == q_end["rid"]
+        import uuid as _uuid
+        _uuid.UUID(q_start["rid"])
+        assert "rotbyte: PASS" in rec.calls[1][1]
+
+    def test_first_scan_skips_start_signal(self, tmp):
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec):
+            code = self._phases(tmp, self._args())
+        assert code == 0
+        slug = rotbyte._healthchecks_slug(str(tmp), "quick")
+        assert rec.signals() == [(slug, "0")]
+
+    def test_bit_rot_pings_full_check_with_exit_2_and_no_paths(self, tmp):
+        self._index(tmp)
+        _corrupt_file(tmp / "a.txt")
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec):
+            code = self._phases(tmp, self._args(check=True))
+        assert code == rotbyte.EXIT_BIT_ROT
+        slug = rotbyte._healthchecks_slug(str(tmp), "full")
+        assert rec.signals()[-1] == (slug, "2")
+        body = rec.calls[-1][1]
+        assert "DETECTED" in body and "bit rot in 1 file" in body
+        assert "a.txt" not in body  # file paths never leave the machine
+        assert f"rotbyte --report {tmp}" in body
+
+    def test_missing_file_pings_exit_1(self, tmp):
+        self._index(tmp)
+        (tmp / "b.txt").unlink()
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec):
+            code = self._phases(tmp, self._args())
+        assert code == rotbyte.EXIT_MISSING
+        assert rec.signals()[-1][1] == "1"
+
+    def test_hashing_crash_pings_exit_7(self, tmp):
+        self._index(tmp)
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec), \
+             unittest.mock.patch("rotbyte.run_hashing", side_effect=RuntimeError("pool died")):
+            code = self._phases(tmp, self._args())
+        assert code == rotbyte.EXIT_INTERNAL
+        assert [s for _slug, s in rec.signals()] == ["start", "7"]
+        assert "pool died" in rec.calls[-1][1]
+
+    def test_email_only_never_pings(self, tmp):
+        rec = _HcRecorder()
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec), \
+             unittest.mock.patch("rotbyte._send_email_notification") as email:
+            self._phases(tmp, self._args(notify="email", scheduled=False))
+        assert rec.calls == []
+        assert email.call_count == 1
+
+    def test_failed_ping_does_not_change_exit_code(self, tmp, capsys):
+        self._index(tmp)
+        rec = _HcRecorder(ok=False, error="connection refused")
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec):
+            code = self._phases(tmp, self._args())
+        assert code == 0
+        assert "healthchecks.io ping failed" in capsys.readouterr().err
+
+    def test_unloadable_config_warns_and_scans(self, tmp, capsys):
+        rec = _HcRecorder()
+
+        def no_config():
+            raise SystemExit(1)
+
+        with unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec), \
+             unittest.mock.patch("rotbyte._load_healthchecks_config", side_effect=no_config):
+            code = self._phases(tmp, self._args(hc_config=False))
+        assert code == 0
+        assert rec.calls == []
+        assert "skipping pings" in capsys.readouterr().err
+
+
+class TestHealthchecksEarlyExit:
+    """Runs that end before scanning still report to their check."""
+
+    def _main(self, argv, rec, extra_patches=()):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(sys, "argv", ["rotbyte", *argv]))
+            stack.enter_context(unittest.mock.patch.object(
+                rotbyte, "_load_healthchecks_config", return_value=dict(_HC_CFG)))
+            stack.enter_context(unittest.mock.patch.object(_rotbyte_pkg.notify, "_hc_post", rec))
+            for p in extra_patches:
+                stack.enter_context(p)
+            with pytest.raises(SystemExit) as e:
+                rotbyte.main()
+        return e.value.code
+
+    def test_unreachable_directory_pings_exit_6(self, tmp_path):
+        missing = str(tmp_path / "unmounted-volume")
+        rec = _HcRecorder()
+        code = self._main(["--scheduled", "--quiet", "--notify", "healthchecks",
+                           missing], rec)
+        assert code == rotbyte.EXIT_IO
+        slug = rotbyte._healthchecks_slug(rotbyte._resolve(missing), "quick")
+        assert rec.signals() == [(slug, "6")]
+        assert "not reachable" in rec.calls[0][1]
+
+    def test_unreachable_directory_full_scan_uses_full_check(self, tmp_path):
+        missing = str(tmp_path / "gone")
+        rec = _HcRecorder()
+        self._main(["--scheduled", "--quiet", "--due", "30d", "--notify",
+                    "healthchecks", missing], rec)
+        assert rec.signals()[0][0].startswith("rotbyte-gone-full-")
+
+    def test_non_scan_modes_never_ping(self, tmp_path):
+        missing = str(tmp_path / "gone")
+        rec = _HcRecorder()
+        self._main(["--report", "--notify", "healthchecks", missing], rec)
+        self._main(["--track", "--notify", "healthchecks", missing], rec)
+        assert rec.calls == []
+
+    def test_lock_contention_pings_success_with_skip_note(self, tmp):
+        db_name = "." + tmp.name + rotbyte.DB_FILENAME_SUFFIX
+        holder = rotbyte.FileLock(str(tmp / db_name) + ".lock")
+        assert holder.acquire()
+        try:
+            rec = _HcRecorder()
+            code = self._main(["--scheduled", "--quiet", "--notify", "healthchecks",
+                               str(tmp)], rec)
+        finally:
+            holder.release()
+        assert code == rotbyte.EXIT_DB_LOCKED
+        slug = rotbyte._healthchecks_slug(rotbyte._resolve(str(tmp)), "quick")
+        assert rec.signals() == [(slug, "")]
+        assert "SKIPPED" in rec.calls[0][1]
+
+    def test_lock_contention_on_full_scan_only_logs(self, tmp):
+        """A full scan that can't run must not reset its check: a /log ping
+        records the skip without marking the check up."""
+        db_name = "." + tmp.name + rotbyte.DB_FILENAME_SUFFIX
+        holder = rotbyte.FileLock(str(tmp / db_name) + ".lock")
+        assert holder.acquire()
+        try:
+            rec = _HcRecorder()
+            code = self._main(["--scheduled", "--quiet", "--due", "30d",
+                               "--notify", "healthchecks", str(tmp)], rec)
+        finally:
+            holder.release()
+        assert code == rotbyte.EXIT_DB_LOCKED
+        slug = rotbyte._healthchecks_slug(rotbyte._resolve(str(tmp)), "full")
+        assert rec.signals() == [(slug, "log")]
+        assert "SKIPPED" in rec.calls[0][1]
+
+    def test_unopenable_lock_file_pings_exit_5(self, tmp):
+        class BrokenLock:
+            def __init__(self, path):
+                self.error = PermissionError(13, "Permission denied")
+
+            def acquire(self):
+                return False
+
+        rec = _HcRecorder()
+        code = self._main(["--scheduled", "--quiet", "--notify", "healthchecks",
+                           str(tmp)], rec,
+                          [unittest.mock.patch.object(rotbyte, "FileLock", BrokenLock)])
+        assert code == rotbyte.EXIT_DB_LOCKED
+        assert rec.signals()[0][1] == "5"
+        assert "Permission denied" in rec.calls[0][1]
+
+    def test_corrupt_database_pings_exit_4(self, tmp):
+        db_name = "." + tmp.name + rotbyte.DB_FILENAME_SUFFIX
+        (tmp / db_name).write_bytes(b"this is not a sqlite database")
+        rec = _HcRecorder()
+        code = self._main(["--scheduled", "--quiet", "--notify", "healthchecks",
+                           str(tmp)], rec)
+        assert code == rotbyte.EXIT_DB_CORRUPT
+        assert rec.signals()[0][1] == "4"
+
+
+class TestFileLockError:
+    def test_records_open_error_but_not_contention(self, tmp_path):
+        bad = rotbyte.FileLock(str(tmp_path / "no-such-dir" / "x.lock"))
+        assert bad.acquire() is False
+        assert isinstance(bad.error, OSError)
+
+        path = str(tmp_path / "x.lock")
+        holder = rotbyte.FileLock(path)
+        assert holder.acquire()
+        try:
+            other = rotbyte.FileLock(path)
+            assert other.acquire() is False
+            assert other.error is None
+        finally:
+            holder.release()
+
+
+class TestScheduledHealthchecksMissingConfig:
+    """Like email: a missing healthchecks.io config must never stop a
+    scheduled scan, but a manual run fails fast."""
+
+    def _env(self, tmp_path):
+        env = os.environ.copy()
+        home = tmp_path / "isolated_home"
+        home.mkdir()
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        return env
+
+    def test_scheduled_scan_warns_once_and_scans(self, tmp, tmp_path):
+        rc, _out, err = _run_cli("--scheduled", "--notify", "healthchecks",
+                                 "--quiet", "--workers", "1", str(tmp),
+                                 env=self._env(tmp_path))
+        assert rc == 0, err
+        assert err.count("healthchecks.io config is unavailable") == 1
+        assert "no healthchecks.io pings will be sent" in err
+        assert "ping failed" not in err
+
+    def test_manual_scan_aborts(self, tmp, tmp_path):
+        rc, _out, err = _run_cli("--notify", "email,healthchecks", "--quiet",
+                                 str(tmp), env=self._env(tmp_path))
+        assert rc == 1
+        assert "No notification config found" in err
+
+
+class TestTrackHealthchecksHint:
+    def _mock_installers(self, monkeypatch, captured):
+        def record(target_dir, dhash, quick_cmd, every, full_cmd, full_at, **kw):
+            captured["quick"] = quick_cmd
+            captured["full"] = full_cmd
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.launchd, "_install_launchd", record)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.systemd, "_install_systemd", record)
+        monkeypatch.setattr(_rotbyte_pkg.scheduler.schtasks, "_install_schtasks", record)
+
+    def test_hint_names_checks_and_suggests_timings(self, tmp_path, capsys, monkeypatch):
+        captured = {}
+        self._mock_installers(monkeypatch, captured)
+        target = str(tmp_path)
+        rotbyte._run_track(target, 3600, [(2, 0), (14, 0)], 7200,
+                           [sys.executable, "rotbyte.py"], notify="email,healthchecks")
+        out = capsys.readouterr().out
+        assert rotbyte._healthchecks_slug(target, "quick") in out
+        assert rotbyte._healthchecks_slug(target, "full") in out
+        assert "Period 1 hour · Grace 1 hour" in out
+        assert "Period 12 hours · Grace 3 hours" in out
+        for cmd in (captured["quick"], captured["full"]):
+            assert rotbyte._parse_cmd_flags(cmd)["notify"] == "email,healthchecks"
+
+    def test_no_hint_for_email_only(self, tmp_path, capsys, monkeypatch):
+        self._mock_installers(monkeypatch, {})
+        rotbyte._run_track(str(tmp_path), 3600, [(2, 0)], None,
+                           [sys.executable, "rotbyte.py"], notify="email")
+        assert "healthchecks.io checks" not in capsys.readouterr().out
+
+    def test_full_period_wraps_midnight_and_unbudgeted_grace(self):
+        lines = _rotbyte_pkg.notify._healthchecks_track_hint(
+            "/d", 1800, [(23, 0), (1, 0)], None)
+        text = "\n".join(lines)
+        assert "Period 30 minutes" in text
+        assert "Period 2 hours · Grace longer than your longest full scan" in text
+
+    def test_quick_only_schedule_omits_full_check(self):
+        lines = _rotbyte_pkg.notify._healthchecks_track_hint("/d", 14400, None, None)
+        text = "\n".join(lines)
+        assert "-quick-" in text and "-full-" not in text
+        assert "Period 4 hours" in text
+
+
+class TestTrackSetupHealthchecks:
+    """The wizard asks about healthchecks.io after email."""
+
+    def _wizard(self, tmp, email_ans, hc_ans, configured):
+        inputs = ["", "", "", "", email_ans, hc_ans, ""]
+        return TestTrackSetup()._run_wizard(tmp, inputs, configured=configured)
+
+    def test_healthchecks_only(self, tmp):
+        assert self._wizard(tmp, "", "y", {"healthchecks"})["notify"] == "healthchecks"
+
+    def test_both_backends(self, tmp):
+        captured = self._wizard(tmp, "y", "y", {"email", "healthchecks"})
+        assert captured["notify"] == "email,healthchecks"
+
+    def test_unconfigured_healthchecks_skipped(self, tmp, capsys):
+        captured = self._wizard(tmp, "y", "y", {"email"})
+        assert captured["notify"] == "email"
+        assert "--notify-setup healthchecks" in capsys.readouterr().out
+
+
+class TestStatusShowsHealthchecksChecks:
+    def test_status_lists_check_slugs(self, tmp_path):
+        target = str(tmp_path)
+        tracked = {target: {
+            "quick": {"interval": 3600, "active": True, "notify": "email,healthchecks"},
+            "full": {"times": [(2, 0)], "active": True, "notify": "email,healthchecks"},
+        }}
+        out = TestStatusFreshness()._capture_status(tracked)
+        assert "Notify: email,healthchecks" in out
+        assert (f"checks: {rotbyte._healthchecks_slug(target, 'quick')}, "
+                f"{rotbyte._healthchecks_slug(target, 'full')}") in out
+
+
+class TestHealthchecksDocsTopic:
+    def test_topic_and_aliases_resolve(self, capsys):
+        for name in ("healthchecks", "hc", "healthchecks.io"):
+            assert _rotbyte_pkg.guides._resolve(name) == "healthchecks"
+        assert "healthchecks" in "\n".join(_rotbyte_pkg.guides._topic_lines())
+        body = _rotbyte_pkg.guides._read_topic("healthchecks")
+        assert "rotbyte --notify-setup healthchecks" in body
+
+    def test_man_page_is_packaged(self):
+        root = Path(__file__).parent
+        assert (root / "man" / "rotbyte-healthchecks.7").is_file()
+        assert "man/rotbyte-healthchecks.7" in (root / "pyproject.toml").read_text()
+
+
+
+class TestCompletionsInSync:
+    """bash/zsh/fish completions must track the CLI: every option, and the
+    value lists for --notify, --notify-setup and --docs. (They have drifted
+    before — see the 1.3.0 changelog.)"""
+
+    ROOT = Path(__file__).parent / "completions"
+    FILES = {"bash": "rotbyte_completions.bash", "zsh": "_rotbyte",
+             "fish": "rotbyte_completions.fish"}
+
+    def _text(self, shell):
+        return (self.ROOT / self.FILES[shell]).read_text()
+
+    def _cli_options(self, capsys):
+        with unittest.mock.patch.object(sys, "argv", ["rotbyte", "--help-all"]):
+            with pytest.raises(SystemExit):
+                rotbyte.main()
+        import re
+        opts = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", capsys.readouterr().out))
+        opts.discard("--scheduled")  # internal: set by --track, never typed
+        return opts
+
+    def _completed_options(self, shell):
+        import re
+        text = self._text(shell)
+        if shell == "fish":
+            return {"--" + o for o in re.findall(r"-l ([a-z][a-z-]*)", text)}
+        return set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", text))
+
+    def _values(self, shell, flag):
+        import re
+        text = self._text(shell)
+        if shell == "bash":
+            m = re.search(re.escape(flag) + r'\)\s*\n\s*COMPREPLY=\(\$\(compgen -W "([^"]*)"', text)
+        elif shell == "zsh":
+            m = re.search(r"'" + re.escape(flag) + r"\[[^\]]*\]:[^:]*:\(([^)]*)\)'", text)
+        else:
+            m = re.search(r"-l " + re.escape(flag[2:]) + r" .*?-x?a '([^']*)'", text)
+        assert m, f"{shell}: no value completion for {flag}"
+        return m.group(1).split()
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+    def test_every_cli_option_is_completed(self, shell, capsys):
+        cli = self._cli_options(capsys)
+        completed = self._completed_options(shell)
+        assert cli - completed == set(), f"{shell} is missing {sorted(cli - completed)}"
+        assert completed - cli == set(), f"{shell} offers unknown {sorted(completed - cli)}"
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+    def test_backend_and_topic_values(self, shell):
+        backends = list(rotbyte.NOTIFY_BACKENDS)
+        assert self._values(shell, "--notify-setup") == backends
+        assert self._values(shell, "--notify") == backends + [",".join(backends)]
+        assert self._values(shell, "--docs") == list(_rotbyte_pkg.guides._TOPICS)
 
 
 if __name__ == "__main__":

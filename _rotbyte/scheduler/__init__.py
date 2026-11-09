@@ -17,6 +17,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 from ..helpers import _format_clock_time, _format_duration
+from ..notify import _healthchecks_track_hint
 from ..platform import _IS_LINUX, _IS_MACOS, _IS_WINDOWS
 
 
@@ -574,6 +575,11 @@ def _run_track(target_dir: str, every_seconds: int,
         if full_at:
             print(f"    {os.path.join(log_dir, f'full-{dhash}.log')}")
         print("    (also visible in Task Scheduler → Task History)")
+    if notify and "healthchecks" in notify.split(","):
+        print()
+        for line in _healthchecks_track_hint(target_dir, every_seconds,
+                                             full_at, budget_seconds):
+            print(line)
     print("═" * 60)
 
 

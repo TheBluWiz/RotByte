@@ -58,7 +58,7 @@ It scales from a single directory or a handful of files up to multi-terabyte lib
 - **Cross-platform** — the same tool on macOS, Linux, and Windows.
 - **No third-party dependencies** — rotbyte's code is pure Python standard library, so there's nothing extra to audit, trust, or break (see [Requirements](#requirements)).
 - **Never modifies your data** — it only reads your files; the only thing it writes is its own checksum database.
-- **Detect + schedule + notify in one tool** — native scheduled scans and email alerts are built in, not bolted on with cron and shell glue.
+- **Detect + schedule + notify in one tool** — native scheduled scans, email alerts, and healthchecks.io monitoring are built in, not bolted on with cron and shell glue.
 - **Built to run unattended at scale** — parallel hashing, interrupt-safe resume, time-budgeted incremental verification, and JSON output for monitoring.
 
 ## Install
@@ -142,6 +142,7 @@ Reach for rotbyte when you want a cross-platform "did anything change that shoul
 - **Scheduled scanning** — `--track` installs native launchd (macOS), systemd (Linux), or Task Scheduler (Windows) timers with configurable quick and full scan schedules.
 - **Due-based verification** — `--due 30d` targets only files not checked recently, combining naturally with `--budget`.
 - **Email notifications** — `--notify email` sends a health report after every full re-verify and an alert when problems are found on quick scans. Works standalone or with `--track`.
+- **healthchecks.io monitoring** — `--notify healthchecks` pings [healthchecks.io](https://healthchecks.io) (or a self-hosted Healthchecks) on every scan, with one auto-created check per directory and scan type, so you're alerted when scans find problems *and* when they stop running. Combine with email as `--notify email,healthchecks`.
 - **JSON output** — `--json` produces machine-readable results for scripts and monitoring pipelines.
 - **Export** — `--export` writes a b2sum-compatible manifest as an independent backup of your checksums outside the database. Use `--auto-export` to refresh the manifest automatically after every full `--check`.
 - **Directory exclusion** — `--exclude` skips directories you don't want tracked.
@@ -233,11 +234,24 @@ rotbyte --track --every 1h --full-at 2h --notify email /Volumes/Media
 <!-- IMAGE: docs/img/email.png — the HTML email health report; see NEEDED_IMAGES.md -->
 ![PLACEHOLDER — the rotbyte email health report (PASS/DETECTED banner + counts table) in a mail client. See NEEDED_IMAGES.md](docs/img/email.png)
 
-Full scans (`--check`) always send a health report — whether everything checks out or something needs attention. Quick scans only notify when there's a problem, so your inbox stays clean.
+Full scans (`--check`) always send a health report — whether everything checks out or something needs attention. Scheduled quick scans only email when there's a problem, so your inbox stays clean.
 
 Your SMTP password is stored in the OS credential store — macOS Keychain, Windows Credential Manager, or libsecret on Linux — never in the config file or on a command line. If no credential store is available it falls back to a `chmod 600` config file with a warning (use an app-specific password there, never your primary one).
 
 For provider-specific setup (Gmail, iCloud, Outlook) see [Email Notification Setup](docs/email-notification-setup.md) (or run `rotbyte --docs notify`).
+
+### healthchecks.io
+
+Email can only speak up when a scan runs. [healthchecks.io](https://healthchecks.io) is a dead-man's switch: every scan pings it, so it also alerts you when scans **stop running** — a Mac that's asleep, an unmounted volume, a schedule broken by an upgrade. Works with self-hosted [Healthchecks](https://github.com/healthchecks/healthchecks) too.
+
+```bash
+rotbyte --notify-setup healthchecks     # asks for your project's ping key; stored in the OS credential store
+
+# Ping on every scheduled scan — alongside email, or on its own
+rotbyte --track --every 1h --full-at 2h --notify email,healthchecks /Volumes/Media
+```
+
+Each directory's quick and full scans report to their own check (e.g. `rotbyte-media-quick-1a2b3c4d`), created automatically on first ping. A scan sends a start signal, then its [exit code](#exit-codes): `0` marks the check up, anything else down — including a scan that can't start because its volume isn't mounted. The ping body carries the same path-free report as the email. `--track` prints a suggested period and grace time for each check; see [healthchecks.io Setup](docs/healthchecks-setup.md) (or run `rotbyte --docs healthchecks`).
 
 ## Monitoring and automation
 
@@ -247,7 +261,7 @@ For provider-specific setup (Gmail, iCloud, Outlook) see [Email Notification Set
 rotbyte --check --json /Volumes/Media | jq '{failed, missing, verified_ok}'
 ```
 
-Wire scheduled runs into whatever you already run: ping [healthchecks.io](https://healthchecks.io), write a Prometheus textfile-exporter metric, feed Uptime Kuma, or drive a Grafana panel. The [exit code](#exit-codes) is the simplest signal of all — alert on anything non-zero.
+Wire scheduled runs into whatever you already run: write a Prometheus textfile-exporter metric, feed Uptime Kuma, or drive a Grafana panel ([healthchecks.io](#healthchecksio) is built in). The [exit code](#exit-codes) is the simplest signal of all — alert on anything non-zero.
 
 ## Incremental verification
 

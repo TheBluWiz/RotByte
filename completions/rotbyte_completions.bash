@@ -31,8 +31,16 @@ _rotbyte() {
             COMPREPLY=($(compgen -W "7d 14d 30d 60d 90d" -- "$cur"))
             return 0
             ;;
-        --notify|--notify-setup)
-            COMPREPLY=($(compgen -W "email" -- "$cur"))
+        --notify)
+            COMPREPLY=($(compgen -W "email healthchecks email,healthchecks" -- "$cur"))
+            return 0
+            ;;
+        --notify-setup)
+            COMPREPLY=($(compgen -W "email healthchecks" -- "$cur"))
+            return 0
+            ;;
+        --docs)
+            COMPREPLY=($(compgen -W "notify healthchecks permissions scheduler" -- "$cur"))
             return 0
             ;;
     esac

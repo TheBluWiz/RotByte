@@ -47,6 +47,7 @@ import signal
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime
 from typing import List, Optional, Set
 
@@ -91,13 +92,22 @@ from _rotbyte.helpers import (
     parse_duration,
 )
 from _rotbyte.notify import (
+    NOTIFY_BACKENDS,
+    _healthchecks_ping,
+    _healthchecks_slug,
+    _hostname,
     _keychain_account,
     _keychain_get,
     _keychain_set,
+    _load_healthchecks_config,
     _load_notify_config,
+    _notify_backend_configured,
     _notify_config_path,
+    _parse_notify_backends,
+    _run_healthchecks_setup,
     _run_notify_setup,
     _send_email_notification,
+    _send_healthchecks_result,
     _windows_credential_get,
 )
 from _rotbyte.platform import (
@@ -205,6 +215,76 @@ def _conflicting_mode_flags(args: argparse.Namespace) -> List[str]:
     if args.export:              flags.append("--export")
     if args.notify_setup:        flags.append("--notify-setup")
     return flags
+
+
+# ── Notification helpers ───────────────────────────────────────────────────────
+
+def _notify_backends(args: argparse.Namespace) -> List[str]:
+    """The ``--notify`` backends for this run (``[]`` when not given).
+
+    main() validates ``--notify`` into ``args.notify_backends``; a Namespace
+    built elsewhere (tests, internal callers) may carry only ``args.notify``,
+    so fall back to parsing that leniently.
+    """
+    backends = getattr(args, "notify_backends", None)
+    if backends is not None:
+        return backends
+    value = getattr(args, "notify", None)
+    if not value:
+        return []
+    try:
+        return _parse_notify_backends(value)
+    except ValueError:
+        return []
+
+
+def _scan_type(args: argparse.Namespace) -> str:
+    """"full" for a re-verify (--check / --due), else "quick".
+
+    Selects which healthchecks.io check a run reports to. Keys on
+    ``args.check`` for the same reason the email gate does: ``--full-at`` is
+    an install-time flag that never reaches the scheduled command.
+    """
+    return "full" if getattr(args, "check", False) else "quick"
+
+
+def _is_scan_invocation(args: argparse.Namespace) -> bool:
+    """True when this run scans (not --report, --accept, --track, ...)."""
+    return not any(getattr(args, flag, None) for flag in (
+        "report", "export", "accept", "accept_all", "import_hashes",
+        "verify_file", "track"))
+
+
+def _healthchecks_early_exit(args: argparse.Namespace, target_dir: str,
+                             signal: str, reason: str) -> None:
+    """Ping healthchecks.io for a scan that ended before it could scan.
+
+    ``signal`` is the exit status (``"4"``, ``"6"``, ...) for a failure, or
+    ``""`` (success) / ``"log"`` (recorded, status unchanged) for a skip —
+    another rotbyte already holds this directory's lock. Without these pings
+    a volume that's unmounted or a database that's corrupt would surface
+    only as a missing ping, once the check's period and grace time run out.
+    """
+    if ("healthchecks" not in _notify_backends(args)
+            or not _is_scan_invocation(args)):
+        return
+    outcome = "SKIPPED" if signal in ("", "log") else "ERROR"
+    body = f"rotbyte: {outcome} — {target_dir}  ·  {_hostname()}\n\n{reason}\n"
+    _healthchecks_ping(target_dir, _scan_type(args), signal, body=body,
+                       config=getattr(args, "healthchecks_config", None))
+
+
+def _scan_exit_code(failed: int, interrupted: bool, missing: int) -> int:
+    """A completed scan's process exit code (bit rot outranks interruption,
+    which outranks missing files). Also the status pinged to healthchecks.io,
+    so the two can never disagree."""
+    if failed > 0:
+        return EXIT_BIT_ROT
+    if interrupted:
+        return EXIT_INTERRUPTED
+    if missing > 0:
+        return EXIT_MISSING
+    return EXIT_OK
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
@@ -374,10 +454,12 @@ _SHORT_HELP_LINES = [
     ("Set up automated scanning:", "heading"),
     ("  rotbyte --track-setup          Interactive wizard: schedule + budget", "--track-setup"),
     ("  rotbyte --notify-setup email   Interactive wizard: email alerts", "--notify-setup"),
+    ("  rotbyte --notify-setup healthchecks", "--notify-setup"),
+    ("                                 Interactive wizard: healthchecks.io pings", None),
     ("", None),
     ("More help:", "heading"),
     ("  rotbyte --help-all             Full option list and exit codes", "--help-all"),
-    ("  rotbyte --docs                 List setup guides (notify, permissions, scheduler)", "--docs"),
+    ("  rotbyte --docs                 List setup guides (notify, healthchecks, ...)", "--docs"),
     ("  man rotbyte                    Full manual (Homebrew installs)", None),
 ]
 
@@ -585,15 +667,20 @@ Exit codes:
                              "where the logs live (journald / Task Scheduler history).")
     parser.add_argument("--docs", nargs="?", const="", default=None, metavar="TOPIC",
                         help="Show a setup guide in the terminal (topics: notify, "
-                             "permissions, scheduler). Run with no TOPIC to list them.")
+                             "healthchecks, permissions, scheduler). Run with no TOPIC "
+                             "to list them.")
     parser.add_argument("--every", metavar="INTERVAL", default="60m",
                         help="Quick scan frequency for --track (e.g. 30m, 2h). Default: 60m")
     parser.add_argument("--full-at", nargs="+", metavar="TIME", dest="full_at",
                         help="Daily clock times for full --check scans (e.g. 2h 2h30m 14h)")
     parser.add_argument("--notify", metavar="BACKEND",
-                        help="Send a notification when problems are detected (e.g. email)")
+                        help="Notify about scan results: 'email' (report after full "
+                             "scans, alert on problems), 'healthchecks' (ping "
+                             "healthchecks.io after every scan), or both as "
+                             "'email,healthchecks'")
     parser.add_argument("--notify-setup", metavar="BACKEND", dest="notify_setup",
-                        help="Interactive setup for notifications (e.g. email)")
+                        help="Interactive setup for a notification backend "
+                             "(email or healthchecks)")
     parser.add_argument("--scheduled", action="store_true",
                         help="Internal: set by --track to identify scheduled runs")
 
@@ -681,11 +768,15 @@ Exit codes:
 
     # --notify-setup is a standalone command
     if args.notify_setup:
-        if args.notify_setup != "email":
+        backend = args.notify_setup.strip().lower()
+        if backend == "email":
+            _run_notify_setup()
+        elif backend == "healthchecks":
+            _run_healthchecks_setup()
+        else:
             print(f"Error: Unknown notification backend '{args.notify_setup}'. "
-                  "Supported: email", file=sys.stderr)
+                  f"Supported: {', '.join(NOTIFY_BACKENDS)}", file=sys.stderr)
             sys.exit(1)
-        _run_notify_setup()
         return
 
     # --track-setup is a standalone command — runs the interactive wizard
@@ -694,29 +785,46 @@ Exit codes:
         _run_track_setup(args.path)
         return
 
-    # Validate --notify
+    # Validate --notify ("email", "healthchecks", or "email,healthchecks")
     if args.notify:
-        if args.notify != "email":
-            print(f"Error: Unknown notification backend '{args.notify}'. "
-                  "Supported: email", file=sys.stderr)
+        try:
+            args.notify_backends = _parse_notify_backends(args.notify)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
+        # Canonical spelling — this is what --track bakes into schedules.
+        args.notify = ",".join(args.notify_backends)
         # Verify config exists early so the user doesn't wait through a full
         # scan only to discover notifications aren't configured. On scheduled
-        # runs, degrade to a warning: a broken email config must never
-        # disable the integrity scanning itself (the send path already
-        # warns-and-continues on failure, this check would otherwise abort
+        # runs, degrade to a warning: a broken notify config must never
+        # disable the integrity scanning itself (the send paths already
+        # warn-and-continue on failure, this check would otherwise abort
         # the whole run before a single file is hashed).
-        if getattr(args, "scheduled", False):
-            try:
-                _load_notify_config()
-            except SystemExit:
-                print("Warning: email notification config is unavailable — "
-                      "the scheduled scan will run, but no email will be sent.",
-                      file=sys.stderr)
-                print("  Run `rotbyte --notify-setup email` to fix notifications.",
-                      file=sys.stderr)
-        else:
-            _load_notify_config()
+        for backend in list(args.notify_backends):
+            if backend == "email":
+                loader, what = _load_notify_config, "no email will be sent"
+            else:
+                loader, what = _load_healthchecks_config, "no healthchecks.io pings will be sent"
+            if getattr(args, "scheduled", False):
+                try:
+                    loaded = loader()
+                except SystemExit:
+                    label = "email notification" if backend == "email" else "healthchecks.io"
+                    print(f"Warning: {label} config is unavailable — "
+                          f"the scheduled scan will run, but {what}.",
+                          file=sys.stderr)
+                    print(f"  Run `rotbyte --notify-setup {backend}` to fix notifications.",
+                          file=sys.stderr)
+                    if backend == "healthchecks":
+                        # Already warned once; don't retry (and re-warn) on
+                        # every ping this run would have sent.
+                        args.notify_backends.remove(backend)
+                    continue
+            else:
+                loaded = loader()
+            if backend == "healthchecks":
+                # Reused by every ping this run sends (one keychain read).
+                args.healthchecks_config = loaded
 
     # --status doesn't need a target directory or any other validation
     if args.status:
@@ -813,6 +921,10 @@ Exit codes:
     target_dir = _resolve(args.path)
     if not os.path.isdir(target_dir):
         print(f"Error: '{target_dir}' is not a directory.", file=sys.stderr)
+        _healthchecks_early_exit(
+            args, target_dir, str(EXIT_IO),
+            f"Target directory {target_dir} is not reachable (unmounted, "
+            "moved, or not a directory). Nothing was scanned.")
         sys.exit(EXIT_IO)
 
     # Resolve --exclude paths relative to the target directory
@@ -868,6 +980,26 @@ Exit codes:
     if not lock.acquire():
         print("Error: Another instance is already running against this database.", file=sys.stderr)
         print(f"  If this is a mistake, remove: {lock_path}", file=sys.stderr)
+        lock_error = getattr(lock, "error", None)
+        if lock_error is not None:
+            # The lock file couldn't even be opened — a real fault that
+            # would otherwise repeat silently on every scheduled run.
+            _healthchecks_early_exit(
+                args, target_dir, str(EXIT_DB_LOCKED),
+                f"Could not open the database lock file ({lock_error}). "
+                "Nothing was scanned.")
+        else:
+            # Collision with another rotbyte run. A quick scan firing during
+            # a long full scan is benign: count it as a run (success) so the
+            # quick-scan check doesn't go "down" — a hung full scan still
+            # trips its own check's grace time. A *full* scan that can't run
+            # is different: a success ping would let it keep skipping while
+            # its check stays green, so only log the skip (status and timer
+            # unchanged) — a full scan that keeps missing its slot goes down.
+            _healthchecks_early_exit(
+                args, target_dir, "" if _scan_type(args) == "quick" else "log",
+                "Skipped: another rotbyte run holds this directory's database "
+                "lock, so this run did not scan. That run reports its own result.")
         sys.exit(EXIT_DB_LOCKED)
 
     try:
@@ -907,10 +1039,18 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         print(f"  Path: {db_path}", file=sys.stderr)
         print("  This database was created by a newer version of rotbyte.", file=sys.stderr)
         print("  Upgrade rotbyte to the latest version and try again.", file=sys.stderr)
+        _healthchecks_early_exit(
+            args, target_dir, str(EXIT_DB_CORRUPT),
+            f"Could not open the database ({e}). It was created by a newer "
+            "rotbyte — upgrade rotbyte on this machine. Nothing was scanned.")
         sys.exit(EXIT_DB_CORRUPT)
     except sqlite3.DatabaseError as e:
         print(f"Error: Could not open database — {e}", file=sys.stderr)
         _print_db_corrupt_help(db_path, "The database file appears corrupt.")
+        _healthchecks_early_exit(
+            args, target_dir, str(EXIT_DB_CORRUPT),
+            f"Could not open the database ({e}) — the file appears corrupt. "
+            "Restore it from backup. Nothing was scanned.")
         sys.exit(EXIT_DB_CORRUPT)
 
     # Catch subtler corruption that doesn't prevent opening. Runs on every
@@ -919,6 +1059,10 @@ def _run(args: argparse.Namespace, target_dir: str, db_path: str):
         print("Error: Database failed integrity check.", file=sys.stderr)
         _print_db_corrupt_help(db_path, "The database is internally inconsistent.")
         db.close()
+        _healthchecks_early_exit(
+            args, target_dir, str(EXIT_DB_CORRUPT),
+            "The database failed its integrity check (PRAGMA quick_check). "
+            "Restore it from backup. Nothing was scanned.")
         sys.exit(EXIT_DB_CORRUPT)
 
     # Informational one-liner when the DB lives on a different volume than
@@ -1463,17 +1607,28 @@ def _run_track_setup_wizard(path_arg: str):
         except ValueError as e:
             print(f"  Invalid --due value: {e}")
 
-    # 6. Email notifications (optional)
-    notify: Optional[str] = None
+    # 6. Notifications (optional) — email, healthchecks.io, or both. The
+    # config file is shared, so check for each backend's own section.
+    backends: List[str] = []
+    cfg_path = _notify_config_path()
     raw = input("  Send email on problems? [y/N]: ").strip().lower()
     if raw in ("y", "yes"):
-        cfg_path = _notify_config_path()
-        if not os.path.exists(cfg_path):
-            print(f"  Email isn't configured yet ({cfg_path} not found).")
+        if not _notify_backend_configured("email"):
+            print(f"  Email isn't configured yet (no [email] section in {cfg_path}).")
             print("  Run 'rotbyte --notify-setup email' first, then re-run --track-setup.")
             print("  Continuing without email notifications.")
         else:
-            notify = "email"
+            backends.append("email")
+    raw = input("  Ping healthchecks.io on every scan? [y/N]: ").strip().lower()
+    if raw in ("y", "yes"):
+        if not _notify_backend_configured("healthchecks"):
+            print(f"  healthchecks.io isn't configured yet "
+                  f"(no [healthchecks] section in {cfg_path}).")
+            print("  Run 'rotbyte --notify-setup healthchecks' first, then re-run --track-setup.")
+            print("  Continuing without healthchecks.io pings.")
+        else:
+            backends.append("healthchecks")
+    notify: Optional[str] = ",".join(backends) or None
 
     # 7. Confirmation summary
     rotbyte_exe = _find_rotbyte_executable()
@@ -1607,8 +1762,13 @@ def _run_status():
                       or (info.get("quick") or {}).get("notify"))
         if notify_val:
             print(f"    Notify: {notify_val}")
+            if "healthchecks" in notify_val.split(","):
+                slugs = [_healthchecks_slug(target_dir, kind)
+                         for kind in ("quick", "full") if info.get(kind)]
+                print(f"            checks: {', '.join(slugs)}")
         else:
-            print("    Notify: (off — re-run --track with --notify email to enable)")
+            print("    Notify: (off — re-run --track with --notify email "
+                  "and/or healthchecks)")
 
         # A schedule whose command no longer exists fails at exec on every
         # run — say so loudly, with the remedy.
@@ -1746,6 +1906,38 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         print("═" * 60)
         print()
 
+    # ── healthchecks.io start signal ───────────────────────────────────
+    # Every scan pings (it's a dead-man's switch), so this is independent of
+    # the email gate below. The start signal lets healthchecks.io show run
+    # duration and flag a scan that hangs past the check's grace time; the
+    # run ID pairs it with this run's result ping.
+    backends = _notify_backends(args)
+    scan_type = _scan_type(args)
+    hc_config = None
+    hc_rid = None
+    if "healthchecks" in backends:
+        hc_config = getattr(args, "healthchecks_config", None)
+        if hc_config is None:
+            try:
+                hc_config = _load_healthchecks_config()
+            except SystemExit:
+                print("  Warning: could not load healthchecks.io config — "
+                      "skipping pings.", file=sys.stderr)
+        if hc_config is not None:
+            hc_rid = str(uuid.uuid4())
+            # Skip the start signal on a database's very first scan: the
+            # initial index hashes everything and can run for hours — far past
+            # a freshly created check's 1-hour grace, which would report a
+            # healthy first run as "down". The result ping still creates the
+            # check and records the outcome.
+            if db.status_counts():
+                _healthchecks_ping(
+                    target_dir, scan_type, "start",
+                    body=(f"rotbyte {scan_type} scan started\n"
+                          f"Host      : {_hostname()}\n"
+                          f"Directory : {target_dir}\n"),
+                    rid=hc_rid, config=hc_config)
+
     # ── Phase 1: Scan filesystem and compare against database ──────────
     # scan_files stats every file to classify it; capture those stats so the
     # prescan phase can reuse them instead of stat()-ing the whole tree twice.
@@ -1809,6 +2001,12 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         # dedicated internal-error code so automation can distinguish it
         # from normal scan findings.
         print(f"\nError: hashing phase failed unexpectedly: {e}", file=sys.stderr)
+        if hc_config is not None:
+            _healthchecks_ping(
+                target_dir, scan_type, str(EXIT_INTERNAL),
+                body=(f"rotbyte: ERROR — {target_dir}  ·  {_hostname()}\n\n"
+                      f"Hashing phase failed unexpectedly: {e}\n"),
+                rid=hc_rid, config=hc_config)
         db.close()
         sys.exit(EXIT_INTERNAL)
 
@@ -1833,11 +2031,13 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
     elapsed = time.monotonic() - start_time
     has_problems = result.failed > 0 or count_missing > 0 or interrupted[0]
 
-    # ── Email notification (if configured) ─────────────────────────────
-    if args.notify == "email":
-        # Full re-verifies always notify; scheduled quick scans only notify
-        # when problems are found. --full-at is an install-time flag and is
-        # not passed to scheduled commands, so check args.check instead.
+    # ── Notifications (if configured) ──────────────────────────────────
+    # Email: full re-verifies always notify; scheduled quick scans only
+    # notify when problems are found. --full-at is an install-time flag and
+    # is not passed to scheduled commands, so check args.check instead.
+    # healthchecks.io: every run reports (below, once the exit code is known).
+    send_email = False
+    if "email" in backends:
         suppress = (
             getattr(args, "scheduled", False)
             and not args.check
@@ -1847,33 +2047,44 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
             if not quiet:
                 print("  Skipping email notification (scheduled quick scan, no problems)")
         else:
-            failed_details = db.failed_files() if result.failed > 0 else []
-            freshness = db.freshness_stats(target_dir, due_days) if due_days else None
-            due_progress = None
-            if due_days and due_start_count > 0:
-                due_end_count = len(db.due_file_paths(target_dir, due_days))
-                due_done = max(due_start_count - due_end_count, 0)
-                due_progress = (due_done, due_start_count)
-            scan_stats = {
-                "ok": result.ok,
-                "new": result.new,
-                "updated": result.updated,
-                "skipped": skip_count,
-                "bytes_hashed": result.bytes_hashed,
-            }
-            _send_email_notification(
-                target_dir, result.failed, count_missing,
-                failed_details,
-                freshness=freshness,
-                elapsed_seconds=elapsed,
-                due_progress=due_progress,
-                interrupted=interrupted[0],
-                budget_exceeded=result.budget_exceeded,
-                errors=result.errors,
-                stats=scan_stats,
-                scan_time=time.strftime("%Y-%m-%d %H:%M %Z", time.localtime()),
-                previous_counts=previous_counts,
-            )
+            send_email = True
+
+    # One report, shared by both backends so they always agree.
+    freshness = None
+    report: dict = {}
+    if send_email or hc_config is not None:
+        freshness = db.freshness_stats(target_dir, due_days) if due_days else None
+        due_progress = None
+        if due_days and due_start_count > 0:
+            due_end_count = len(db.due_file_paths(target_dir, due_days))
+            due_done = max(due_start_count - due_end_count, 0)
+            due_progress = (due_done, due_start_count)
+        scan_stats = {
+            "ok": result.ok,
+            "new": result.new,
+            "updated": result.updated,
+            "skipped": skip_count,
+            "bytes_hashed": result.bytes_hashed,
+        }
+        report = dict(
+            elapsed_seconds=elapsed,
+            due_progress=due_progress,
+            interrupted=interrupted[0],
+            budget_exceeded=result.budget_exceeded,
+            errors=result.errors,
+            stats=scan_stats,
+            scan_time=time.strftime("%Y-%m-%d %H:%M %Z", time.localtime()),
+            previous_counts=previous_counts,
+        )
+
+    if send_email:
+        failed_details = db.failed_files() if result.failed > 0 else []
+        _send_email_notification(
+            target_dir, result.failed, count_missing,
+            failed_details,
+            freshness=freshness,
+            **report,
+        )
 
     if args.json_output:
         likely_moves = 0
@@ -1952,17 +2163,23 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
         except (OSError, UnicodeError) as e:
             print(f"  ! auto-export failed: {e}", file=sys.stderr)
 
-    if result.failed > 0:
+    exit_code = _scan_exit_code(result.failed, interrupted[0], count_missing)
+
+    # healthchecks.io result: /<exit code> — 0 marks the check up, anything
+    # else (missing, bit rot, interrupted) marks it down. Sent last so the
+    # measured duration covers the whole run, including the auto-export.
+    if hc_config is not None:
+        _send_healthchecks_result(
+            target_dir, scan_type, exit_code, result.failed, count_missing,
+            freshness, rid=hc_rid, config=hc_config, **report)
+
+    if exit_code == EXIT_BIT_ROT:
         print()
         print("⚠  BIT ROT DETECTED — run with --report for details.")
-        sys.exit(EXIT_BIT_ROT)
-    if interrupted[0]:
+    elif exit_code == EXIT_INTERRUPTED:
         print()
         print("  Run again to resume where you left off.")
-        sys.exit(EXIT_INTERRUPTED)
-    if count_missing > 0:
-        sys.exit(EXIT_MISSING)
-    sys.exit(EXIT_OK)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

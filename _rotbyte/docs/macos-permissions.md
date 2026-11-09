@@ -19,6 +19,7 @@ This guide covers the one-time setup to let rotbyte run unattended.
 `~/media`).
 
 **Yes** if you're scanning any of these with `--track`:
+
 - `~/Desktop`, `~/Documents`, `~/Downloads`
 - External drives (`/Volumes/...`)
 - Time Machine backups

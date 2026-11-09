@@ -58,7 +58,8 @@ packages = ["_rotbyte", "_rotbyte.scheduler"]
 # Packagers should install these manually for the best user experience.
 [tool.setuptools.data-files]
 "share/man/man1" = ["man/rotbyte.1"]
-"share/man/man7" = ["man/rotbyte-notify.7", "man/rotbyte-permissions.7"]
+"share/man/man7" = ["man/rotbyte-notify.7", "man/rotbyte-healthchecks.7",
+                    "man/rotbyte-permissions.7"]
 "share/bash-completion/completions" = ["completions/rotbyte_completions.bash"]
 "share/zsh/site-functions" = ["completions/_rotbyte"]
 "share/fish/vendor_completions.d" = ["completions/rotbyte_completions.fish"]

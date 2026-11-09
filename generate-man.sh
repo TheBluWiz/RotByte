@@ -4,15 +4,16 @@
 # truth in docs/.  Run this after editing anything in docs/*.md.
 #
 # Source of truth (human-edited):
-#   docs/email-notification-setup.md, docs/macos-permissions.md,
-#   docs/windows-task-scheduler.md
+#   docs/email-notification-setup.md, docs/healthchecks-setup.md,
+#   docs/macos-permissions.md, docs/windows-task-scheduler.md
 #
 # Derived (never hand-edit — this script overwrites them):
 #   _rotbyte/docs/*.md   byte-identical copies bundled into the package so
 #                        `rotbyte --docs` works on Homebrew, pipx, and pip
-#   man/rotbyte-*.7      section-7 man pages (pandoc) for the notify and
-#                        permissions guides; the Windows scheduler guide has
-#                        no man page since man(1) does not exist on Windows
+#   man/rotbyte-*.7      section-7 man pages (pandoc) for the notify,
+#                        healthchecks, and permissions guides; the Windows
+#                        scheduler guide has no man page since man(1) does
+#                        not exist on Windows
 #
 # A test (test_bundled_copies_match_source_of_truth) asserts docs/ and
 # _rotbyte/docs/ stay byte-identical, so drift fails the suite.
@@ -69,5 +70,6 @@ gen_man() {
 }
 
 mkdir -p man
-gen_man notify      email-notification-setup "configure email notifications for rotbyte"
-gen_man permissions macos-permissions        "grant macOS Full Disk Access for rotbyte scans"
+gen_man notify       email-notification-setup "configure email notifications for rotbyte"
+gen_man healthchecks healthchecks-setup       "monitor rotbyte scans with healthchecks.io"
+gen_man permissions  macos-permissions        "grant macOS Full Disk Access for rotbyte scans"

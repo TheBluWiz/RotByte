@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Tuple
 _TOPICS: Dict[str, Tuple[str, str]] = {
     "notify": ("email-notification-setup",
                "Set up email notifications (Gmail, iCloud, Outlook)"),
+    "healthchecks": ("healthchecks-setup",
+                     "Set up healthchecks.io monitoring (hosted or self-hosted)"),
     "permissions": ("macos-permissions",
                     "Grant macOS Full Disk Access for scanning protected folders"),
     "scheduler": ("windows-task-scheduler",
@@ -30,6 +32,9 @@ _TOPICS: Dict[str, Tuple[str, str]] = {
 _ALIASES: Dict[str, str] = {
     "email": "notify",
     "notifications": "notify",
+    "healthchecks.io": "healthchecks",
+    "hc": "healthchecks",
+    "ping": "healthchecks",
     "macos": "permissions",
     "fda": "permissions",
     "windows": "scheduler",

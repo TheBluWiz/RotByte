@@ -162,16 +162,16 @@ time budget per full scan
 .RB ( \-\-budget ),
 due threshold
 .RB ( \-\-due ),
-and whether to enable email notifications
-.RB ( \-\-notify " " email ).
+and whether to enable email notifications and healthchecks.io pings
+.RB ( \-\-notify " " email,healthchecks ).
 Each value is validated with the same parser used by the corresponding flag
 and the user is re-prompted on invalid input. Before installing, prints the
 equivalent
 .B \-\-track
 command line so the user can learn the flag form for future use.
-Email notifications require prior configuration via
+Each notification backend requires prior configuration via
 .BR \-\-notify\-setup ;
-if the config is absent, the wizard continues without email rather than
+if a backend is not configured, the wizard continues without it rather than
 installing a broken schedule.
 .TP
 .B \-\-status
@@ -179,7 +179,8 @@ Show the status of all installed scheduled scans. For each tracked
 directory, displays: the quick and full scan schedule and whether each
 timer is active; the next scheduled full-scan time with a countdown (for
 active calendar schedules); any extra flags baked into the schedule (such as
-.BR \-\-budget ", " \-\-due ", " \-\-notify );
+.BR \-\-budget ", " \-\-due ", " \-\-notify ,
+plus the healthchecks.io check names when that backend is on);
 the finish time of the most recent run converted to local time (a run that
 started but never completed is shown as in progress or interrupted); and a
 count of files by health status (OK, NEW, FAILED, MISSING) with the paths of
@@ -257,7 +258,8 @@ even when there is nothing to clear.
 .TP
 .BI \-\-docs " [TOPIC]"
 Print a bundled setup guide in the terminal and exit. Available topics are
-.IR notify " (email notifications), " permissions " (macOS Full Disk Access),"
+.IR notify " (email notifications), " healthchecks " (healthchecks.io monitoring),"
+.IR permissions " (macOS Full Disk Access),"
 and
 .I scheduler
 (Windows Task Scheduler). Run
@@ -265,9 +267,10 @@ and
 with no
 .I TOPIC
 to list them. Output is paged when stdout is a terminal. The
-.IR notify " and " permissions
+.IR notify ", " healthchecks ", and " permissions
 guides are also installed as
-.BR rotbyte-notify (7)
+.BR rotbyte-notify (7),
+.BR rotbyte-healthchecks (7),
 and
 .BR rotbyte-permissions (7).
 .TP
@@ -291,59 +294,102 @@ Accepts clock times like
 Requires
 .BR \-\-track .
 .TP
-.BI \-\-notify " BACKEND"
-Send a notification on scan completion.
-Currently supported backends:
-.IR email .
-Requires prior configuration via
+.BI \-\-notify " BACKEND\fR[\fP,BACKEND\fR]\fP"
+Send notifications about scan results.
+.I BACKEND
+is
+.IR email ,
+.IR healthchecks ,
+or both as a comma-separated list
+.RI ( email,healthchecks ).
+Each backend requires prior configuration via
 .BR \-\-notify\-setup .
 .PP
-When used with
-.BR \-\-check ,
-a notification is always sent. The subject line reflects one of four states:
+With
+.I healthchecks
+every scan \(em quick or full, clean or not \(em pings healthchecks.io or a
+self-hosted Healthchecks instance: a start signal when the scan begins and
+its exit status when it ends (0 marks the check up; any other status marks
+it down). A scan that cannot start (unreachable directory, corrupt database)
+pings its exit status too, and one that never runs is reported by the
+missing ping itself. Each directory's quick and full scans report to their
+own check, created automatically on first ping and named
+.IR rotbyte\-NAME\-quick\-HASH " and " rotbyte\-NAME\-full\-HASH ,
+where
+.I HASH
+matches the directory's scheduler job names. File paths are never sent.
+See
+.BR rotbyte-healthchecks (7).
+.PP
+With
+.IR email ,
+a full re-verify
+.RB ( \-\-check ", or " \-\-due )
+always sends a health report, and so does a quick scan run by hand. A
+scheduled quick scan sends one only when it finds bit rot or missing files,
+or is interrupted. The subject names the outcome, the directory, and the
+sending host:
 .RS
 .TP
-.B pass
-Full re-verify completed with no problems and no read errors.
-Subject:
-.RI \(lq "rotbyte \(u2713 /path \(em all files OK" \(rq.
+.B PASS
+No bit rot and no missing files, e.g.
+.RI \(lq "rotbyte: PASS \(em /Volumes/Media  \(md  mac-mini" \(rq.
 .TP
-.B warning
-Full re-verify completed, checksums clean, but one or more files could not
-be read (hardware error, permissions, or file in use).
-Subject:
-.RI \(lq "rotbyte \(u26a0 /path \(em N read errors" \(rq.
-.TP
-.B fail
-Bit rot or missing files detected.
-Subject:
-.RI \(lq "rotbyte \(u2717 /path \(em N failed, N missing" \(rq.
-.TP
-.B interrupted
-Scan was cut short by SIGINT or SIGTERM before all files were verified.
-Subject:
-.RI \(lq "rotbyte \(u26a0 /path \(em scan interrupted" \(rq.
+.B DETECTED
+Problems found, e.g.
+.RI \(lq "rotbyte: DETECTED \(em bit rot in 3 files, 1 file missing \(em /Volumes/Media  \(md  mac-mini" \(rq.
 .RE
-.PP
-Without
-.BR \-\-check
-(quick scan), a notification is only sent in the fail state.
+.IP
+A
+.B \-\-due
+scan adds its progress through the due files after the outcome (e.g.
+.IR "PASS 64% (30/47 due)" ),
+and an interrupted scan adds
+.IR (interrupted) .
+The message is sent as plain text plus HTML. Its body carries the scan
+summary counts, the change since the previous run, due-file progress and
+freshness (with
+.BR \-\-due ),
+and the scan duration. File paths are never included; when problems are
+found, the body names the
+.B rotbyte \-\-report
+command that lists them on the scanning machine. See
+.BR rotbyte-notify (7).
 .PP
 Can be used standalone or with
 .BR \-\-track ,
 which persists the flag into the scheduled commands.
 .TP
 .BI \-\-notify\-setup " BACKEND"
-Interactive setup for notifications. Prompts in order: username,
-password, SMTP host, SMTP port, recipient address (Send alerts to),
-and sender address (Send alerts from). All fields default to the username
-except Send alerts from, which also defaults to the username but can be
-set to an alias (useful for iCloud alias addresses). Stores credentials in
-.IR ~/.config/rotbyte/notify.conf
-(Linux) or
-.IR "~/Library/Application Support/rotbyte/notify.conf"
-(macOS) with 0600 permissions, and sends a test email to confirm
-the configuration works.
+Interactive setup for a notification backend,
+.I email
+or
+.IR healthchecks .
+Each backend has its own section in the shared config file; setting up one
+never alters the other.
+.IP
+For
+.IR email ,
+prompts in order: SMTP host, SMTP port (default 587; 465 uses implicit
+TLS, anything else STARTTLS), username, password (an app password), recipient
+address (Send alerts to), and sender address (Send alerts from). Both
+addresses default to the username; Send alerts from can be set to an alias
+(useful for iCloud alias addresses). Sends a test email, stores the password
+in the platform credential store (Keychain, Credential Manager, or
+libsecret; falling back to the config file with 0600 permissions), and
+writes the rest to the config file (see
+.BR FILES ).
+.IP
+For
+.IR healthchecks ,
+prompts for the ping endpoint (default
+.IR https://hc-ping.com ;
+for a self-hosted instance, its
+.B PING_ENDPOINT
+URL) and the project's ping key, verifies the key with a test ping, and
+stores the key in the platform credential store (Keychain, Credential
+Manager, or libsecret), falling back to the config file with 0600
+permissions.
 .TP
 .B \-\-version
 Print the version number and exit.
@@ -446,6 +492,15 @@ Scheduled scans with email alerts:
 .B rotbyte \-\-track \-\-every 1h \-\-full\-at 2h \-\-notify email /Volumes/Media
 .RE
 .PP
+Set up healthchecks.io monitoring, then schedule scans that both email and
+ping:
+.PP
+.RS
+.B rotbyte \-\-notify\-setup healthchecks
+.br
+.B rotbyte \-\-track \-\-every 1h \-\-full\-at 2h \-\-notify email,healthchecks /Volumes/Media
+.RE
+.PP
 Remove scheduled scans for a directory:
 .PP
 .RS
@@ -458,6 +513,22 @@ Remove all scheduled scans:
 .B rotbyte \-\-untrack\-all
 .RE
 .SH FILES
+.TP
+.I notify.conf
+Notification config written by
+.BR \-\-notify\-setup ,
+with an
+.B [email]
+and/or
+.B [healthchecks]
+section, mode 0600. Located at
+.I "~/Library/Application Support/rotbyte/notify.conf"
+on macOS and
+.I ~/.config/rotbyte/notify.conf
+elsewhere (see
+.BR XDG_CONFIG_HOME ).
+Secrets live in the platform credential store unless none was available at
+setup time.
 .TP
 .BI . dirname _rotbyte.db
 SQLite database storing checksums and metadata, created inside the
@@ -510,6 +581,7 @@ Jamey Wicklund
 .UE
 .SH SEE ALSO
 .BR rotbyte-notify (7),
+.BR rotbyte-healthchecks (7),
 .BR rotbyte-permissions (7),
 .BR b2sum (1),
 .BR sha256sum (1),
@@ -517,4 +589,4 @@ Jamey Wicklund
 .PP
 The same guides are available in the terminal via
 .B rotbyte \-\-docs
-.RB ( notify ", " permissions ", " scheduler ).
+.RB ( notify ", " healthchecks ", " permissions ", " scheduler ).
