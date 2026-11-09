@@ -26,6 +26,14 @@
 - **Bash completion now completes `--docs` topics**, as zsh and fish already did. A new test checks that all three completion files offer every CLI option and the current `--notify` / `--notify-setup` / `--docs` values, so they can't drift silently again
 - **`notify.conf` is now shared by every notification backend.** `--notify-setup email` rewrites only the file's `[email]` section (it used to rewrite the whole file), so it never erases healthchecks.io settings, and vice versa. `--track-setup` decides whether a backend is configured by checking for its section, not for the file's existence
 
+### Fixed
+- **`--json` stdout is now exactly one JSON document, even when problems are found.** Bit rot and missing files, the cases a monitoring script most needs to see, broke the output. Per-file `✗ FAILED` / `? MISSING` lines came before the JSON, and a `⚠ BIT ROT DETECTED` banner came after it. The interrupted-run note and the legacy-database rename notice could also land on stdout. So the README's own `rotbyte --check --json … | jq` example failed exactly when there was bit rot. Details:
+  - **stderr redirect.** For `--json` scans, all human-readable output now goes to stderr. The exit status is unchanged, and scheduled-scan logs already capture both streams.
+  - **New `missing_files` key.** Since the `? MISSING` lines moved to stderr, the JSON gains a `missing_files` list alongside `failed_files`.
+  - **Other verbs unchanged.** Verbs that ignore `--json`, such as `--report`, keep printing to stdout as before.
+  - **Strict tests.** The test helper that pulled the JSON out of noisy stdout now parses strictly, so any regression fails the suite.
+- **A malformed `notify.conf` no longer stops scheduled scans.** A hand-edit typo (such as a line with no `=`) or a file that isn't valid UTF-8 made `--notify email` scheduled scans die with a `configparser` / `UnicodeDecodeError` traceback before hashing a single file. That broke the rule that a broken notification config only costs you the notification. Scheduled runs now print the same warning as for a missing config and scan anyway; manual runs fail fast with a readable "Could not parse" error. `notify.conf` is also now written to a temporary file and swapped into place, so a crash mid-write can't truncate it and lose every backend's settings
+
 ## 1.3.0 — 2026-07-11
 
 ### Added

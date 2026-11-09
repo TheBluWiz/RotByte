@@ -41,6 +41,7 @@ progress, platform). Symbols are re-exported here so the historical
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -272,6 +273,20 @@ def _healthchecks_early_exit(args: argparse.Namespace, target_dir: str,
     body = f"rotbyte: {outcome} — {target_dir}  ·  {_hostname()}\n\n{reason}\n"
     _healthchecks_ping(target_dir, _scan_type(args), signal, body=body,
                        config=getattr(args, "healthchecks_config", None))
+
+
+def _json_scan_requested(args: argparse.Namespace) -> bool:
+    """True when this run is a scan that will print the ``--json`` summary.
+
+    Only the scan path emits JSON. Other verbs (``--report``, ``--track``,
+    ...) ignore ``--json`` and keep their human output on stdout exactly as
+    before, so their behavior doesn't change. ``--check`` is a scan, so it
+    doesn't count against this.
+    """
+    if not getattr(args, "json_output", False):
+        return False
+    other_modes = [f for f in _conflicting_mode_flags(args) if f != "--check"]
+    return not other_modes and not args.untrack and not args.untrack_all
 
 
 def _scan_exit_code(failed: int, interrupted: bool, missing: int) -> int:
@@ -686,6 +701,22 @@ Exit codes:
 
     args = parser.parse_args()
 
+    # With --json, stdout carries exactly one JSON document — the scan
+    # summary — so `rotbyte --json ... | jq` works even when bit rot is found.
+    # Every human-readable line (✗ FAILED / ? MISSING progress, the
+    # interrupted-run note, the BIT ROT banner, ...) goes to stderr instead.
+    # Redirecting once here, rather than threading file=sys.stderr through
+    # every print, also covers lines added later.
+    args.json_stream = sys.stdout
+    if _json_scan_requested(args):
+        with contextlib.redirect_stdout(sys.stderr):
+            _main(args)
+    else:
+        _main(args)
+
+
+def _main(args: argparse.Namespace) -> None:
+    """Validate the parsed command line and dispatch to the requested mode."""
     # Validate --untrack / --untrack-all up front so a conflicting
     # combination can't be silently won by another mode flag's earlier
     # dispatch branch (e.g. --status). The actual untrack work happens
@@ -2108,7 +2139,16 @@ def _run_phases(db: ChecksumDB, target_dir: str, args: argparse.Namespace,
             summary["failed_files"] = [
                 f["file_path"] for f in db.failed_files()
             ]
-        print(json.dumps(summary, indent=2))
+        if count_missing > 0:
+            # The "? MISSING" lines now go to stderr in --json mode, so
+            # carry the paths in the document itself, like failed_files.
+            summary["missing_files"] = [
+                m["file_path"] for m in db.missing_files()
+            ]
+        # args.json_stream is the real stdout (main() points sys.stdout at
+        # stderr for --json scans); fall back for directly-built Namespaces.
+        print(json.dumps(summary, indent=2),
+              file=getattr(args, "json_stream", None) or sys.stdout)
     elif not quiet or has_problems:
         if not quiet:
             print()

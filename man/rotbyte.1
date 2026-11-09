@@ -84,7 +84,10 @@ baseline checksum followed by the file path. Missing files are excluded.
 .TP
 .B \-\-json
 Output results as a JSON object instead of human-readable text. Suppresses
-progress bars and spinners. Suitable for scripts and monitoring pipelines.
+progress bars and spinners. Suitable for scripts and monitoring pipelines:
+stdout carries only the JSON object, even when problems are found, and any
+human-readable lines (per-file FAILED/MISSING notices, the bit-rot banner,
+warnings) go to stderr. The exit status is unchanged.
 .PP
 The JSON object contains the following keys:
 .RS
@@ -108,6 +111,12 @@ Integer counters for each outcome category.
 Array of file paths for all FAILED files.
 Present only when
 .B failed
+is greater than zero.
+.TP
+.B missing_files
+Array of file paths for all MISSING files.
+Present only when
+.B missing
 is greater than zero.
 .RE
 .TP

@@ -255,7 +255,7 @@ Each directory's quick and full scans report to their own check (e.g. `rotbyte-m
 
 ## Monitoring and automation
 
-`--json` emits machine-readable results — counts by state, failed paths, duration, and bytes hashed — for scripts and dashboards:
+`--json` emits machine-readable results — counts by state, failed and missing paths, duration, and bytes hashed — for scripts and dashboards. stdout carries only the JSON document, even when problems are found; human-readable messages go to stderr:
 
 ```bash
 rotbyte --check --json /Volumes/Media | jq '{failed, missing, verified_ok}'

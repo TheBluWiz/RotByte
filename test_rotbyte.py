@@ -128,32 +128,20 @@ def _run_cli_ok(*args, cwd=None):
 
 
 def _extract_json(text: str) -> dict:
-    """Extract the JSON object from output that may contain non-JSON lines.
+    """Parse rotbyte's ``--json`` stdout, which must be exactly one JSON
+    document.
 
-    Use this instead of json.loads() whenever rotbyte's exit code is non-zero,
-    because warning lines (MISSING, FAILED) are printed to stdout before the
-    JSON blob.  For exit-code-0 cases, json.loads(out) is fine but this
-    function also works — so it's safe to use unconditionally.
+    Strict on purpose: with --json every human-readable line (✗ FAILED,
+    ? MISSING, the BIT ROT banner, ...) goes to stderr, so anything else on
+    stdout is a regression that would break `rotbyte --json | jq`.
     """
     try:
-        start = text.index("{")
-    except ValueError:
-        raise ValueError(
-            f"No JSON object found in rotbyte output.\n"
+        return json.loads(text)
+    except ValueError as e:
+        raise AssertionError(
+            f"--json stdout is not a single JSON document ({e}).\n"
             f"--- stdout was ---\n{text}\n--- end ---"
-        )
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start:i + 1])
-    raise ValueError(
-        f"Unterminated JSON object in rotbyte output.\n"
-        f"--- stdout was ---\n{text}\n--- end ---"
-    )
+        ) from None
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -5538,7 +5526,7 @@ class _HcRecorder:
         self.ok = ok
         self.error = error
 
-    def __call__(self, url, body=""):
+    def __call__(self, url, body="", secret=""):
         self.calls.append((url, body))
         return self.ok, self.error
 
@@ -5859,7 +5847,7 @@ class TestHealthchecksSetup:
         monkeypatch.setattr("builtins.input", lambda prompt="": inputs.pop(0))
         monkeypatch.setattr(_rotbyte_pkg.notify.getpass, "getpass", lambda prompt="": key)
         monkeypatch.setattr(_rotbyte_pkg.notify, "_hc_post",
-                            lambda url, body="": posts.append(url) or post)
+                            lambda url, body="", secret="": posts.append(url) or post)
         monkeypatch.setattr(_rotbyte_pkg.notify, "_keychain_set",
                             lambda account, secret, label="": stores.append(
                                 (account, secret, label)) or stored)
@@ -6283,6 +6271,194 @@ class TestHealthchecksDocsTopic:
         assert (root / "man" / "rotbyte-healthchecks.7").is_file()
         assert "man/rotbyte-healthchecks.7" in (root / "pyproject.toml").read_text()
 
+
+
+
+class TestNotifyRobustnessAudit:
+    """Regression tests from the post-implementation audit: a ping must never
+    raise or leak the ping key, and a malformed notify.conf must never stop a
+    scheduled scan."""
+
+    KEY = "SECRETKEY1234567890abc"
+
+    def _post(self, endpoint, monkeypatch):
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_HC_ATTEMPTS", 1)
+        cfg = {"endpoint": endpoint, "ping_key": self.KEY}
+        url = _rotbyte_pkg.notify._healthchecks_url(cfg, "rotbyte-x-quick-1", "0")
+        return _rotbyte_pkg.notify._hc_post(url, "", secret=self.KEY)
+
+    def test_url_without_scheme_returns_error_without_key(self, monkeypatch):
+        ok, err = self._post("hc-ping.com", monkeypatch)
+        assert not ok and "invalid ping URL" in err
+        assert self.KEY not in err
+
+    def test_non_numeric_port_returns_error(self, monkeypatch):
+        ok, err = self._post("https://hc.example.com:abc/ping", monkeypatch)
+        assert not ok and "nonnumeric port" in err
+
+    def test_non_http_server_returns_error(self, monkeypatch):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def reply_garbage():
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"220 smtp.example.com ESMTP ready\r\n")
+            conn.close()
+
+        threading.Thread(target=reply_garbage, daemon=True).start()
+        try:
+            ok, err = self._post(f"http://127.0.0.1:{srv.getsockname()[1]}/ping",
+                                 monkeypatch)
+        finally:
+            srv.close()
+        assert not ok and "bad HTTP response" in err
+
+    def test_unexpected_exception_is_contained(self, monkeypatch):
+        def boom(req, timeout=None):
+            raise RuntimeError(f"weird failure for {req.full_url}")
+
+        monkeypatch.setattr(_rotbyte_pkg.notify.urllib.request, "urlopen", boom)
+        ok, err = self._post("https://hc-ping.com", monkeypatch)
+        assert not ok and "RuntimeError" in err
+        assert self.KEY not in err
+
+    @pytest.mark.parametrize("endpoint, ok", [
+        ("https://hc-ping.com", True),
+        ("http://10.0.0.5:8000/ping", True),
+        ("hc-ping.com", False),
+        ("ftp://hc.example.com/ping", False),
+        ("https://", False),
+        ("https://hc.example.com:abc/ping", False),
+        ("https://hc.example.com:99999/ping", False),
+        ("https://hc.example.com/ping?x=1", False),
+        ("https://hc.example.com/ping#frag", False),
+        ("https://hc.example.com/my ping", False),
+    ])
+    def test_endpoint_validation(self, endpoint, ok):
+        assert (_rotbyte_pkg.notify._hc_endpoint_problem(endpoint) is None) == ok
+
+    def test_loader_rejects_bad_endpoint(self, tmp_path, monkeypatch, capsys):
+        conf = tmp_path / "notify.conf"
+        conf.write_text("[healthchecks]\nping_endpoint = hc-ping.com\nping_key = k\n")
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path", lambda: str(conf))
+        with pytest.raises(SystemExit):
+            rotbyte._load_healthchecks_config()
+        assert "Invalid ping_endpoint" in capsys.readouterr().err
+
+    def test_setup_rejects_bad_port_before_any_ping(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path",
+                            lambda: str(tmp_path / "notify.conf"))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "https://hc.example.com:abc/ping")
+        posted = []
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_hc_post",
+                            lambda *a, **k: posted.append(a) or (True, ""))
+        with pytest.raises(SystemExit):
+            rotbyte._run_healthchecks_setup()
+        assert posted == []
+
+    @pytest.mark.parametrize("content", [
+        b"[email]\nsmtp_host = s\nthis line has no equals sign\n",
+        b"[email]\nsmtp_host = \xff\xfe\n",
+    ])
+    def test_malformed_conf_exits_cleanly_for_both_loaders(self, tmp_path, monkeypatch,
+                                                           capsys, content):
+        conf = tmp_path / "notify.conf"
+        conf.write_bytes(content)
+        monkeypatch.setattr(_rotbyte_pkg.notify, "_notify_config_path", lambda: str(conf))
+        for loader in (rotbyte._load_notify_config, rotbyte._load_healthchecks_config):
+            with pytest.raises(SystemExit):
+                loader()
+            assert "Could not parse" in capsys.readouterr().err
+        assert rotbyte._notify_backend_configured("email") is False
+
+    def test_scheduled_scan_survives_malformed_conf(self, tmp, tmp_path):
+        home = tmp_path / "isolated_home"
+        conf_dir = (home / "Library" / "Application Support" / "rotbyte"
+                    if sys.platform == "darwin" else home / ".config" / "rotbyte")
+        conf_dir.mkdir(parents=True)
+        (conf_dir / "notify.conf").write_text("[email]\nsmtp_host = s\noops\n")
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        rc, _out, err = _run_cli("--scheduled", "--notify", "email,healthchecks",
+                                 "--quiet", "--workers", "1", str(tmp), env=env)
+        assert rc == 0, err
+        assert "Traceback" not in err
+        assert "no email will be sent" in err
+        assert "no healthchecks.io pings will be sent" in err
+
+
+
+class TestJsonStdoutIsPure:
+    """With --json, stdout is exactly one JSON document — even when bit rot
+    or missing files are found — and the human lines move to stderr."""
+
+    def _db_name(self, tmp):
+        return "." + tmp.name + rotbyte.DB_FILENAME_SUFFIX
+
+    def test_bit_rot(self, tmp):
+        _run_cli_ok("--workers", "1", "--quiet", str(tmp))
+        _corrupt_file(tmp / "a.txt")
+        rc, out, err = _run_cli("--check", "--json", "--workers", "1", str(tmp))
+        assert rc == rotbyte.EXIT_BIT_ROT
+        data = json.loads(out)
+        assert data["failed"] == 1
+        assert data["failed_files"] == [str(rotbyte._resolve(str(tmp / "a.txt")))]
+        assert "✗ FAILED" in err and "BIT ROT DETECTED" in err
+
+    def test_missing_files_listed_in_document(self, tmp):
+        _run_cli_ok("--workers", "1", "--quiet", str(tmp))
+        (tmp / "b.txt").unlink()
+        rc, out, err = _run_cli("--json", "--workers", "1", str(tmp))
+        assert rc == rotbyte.EXIT_MISSING
+        data = json.loads(out)
+        assert data["missing"] == 1
+        assert data["missing_files"] == [str(rotbyte._resolve(str(tmp / "b.txt")))]
+        assert "? MISSING" in err
+
+    def test_clean_scan_has_no_problem_lists(self, tmp):
+        rc, out, _err = _run_cli("--json", "--workers", "1", str(tmp))
+        assert rc == 0
+        data = json.loads(out)
+        assert "failed_files" not in data and "missing_files" not in data
+
+    def test_interrupted_run_note_goes_to_stderr(self, tmp):
+        _run_cli_ok("--workers", "1", "--quiet", str(tmp))
+        db = rotbyte.ChecksumDB(str(tmp / self._db_name(tmp)))
+        db.start_run(str(tmp))  # never finished: looks like a killed run
+        db.close()
+        rc, out, err = _run_cli("--json", "--workers", "1", str(tmp))
+        assert rc == 0
+        json.loads(out)
+        assert "was interrupted" in err
+
+    def test_legacy_rename_notice_goes_to_stderr(self, tmp):
+        legacy = tmp / ("." + tmp.name + rotbyte.LEGACY_DB_FILENAME_SUFFIX)
+        rotbyte.ChecksumDB(str(legacy)).close()
+        rc, out, err = _run_cli("--json", "--workers", "1", str(tmp))
+        assert rc == 0, err
+        json.loads(out)
+        assert "Renamed legacy database" in err
+        assert (tmp / self._db_name(tmp)).exists()
+
+    def test_non_scan_verbs_keep_stdout(self, tmp):
+        _run_cli_ok("--workers", "1", "--quiet", str(tmp))
+        rc, out, _err = _run_cli("--report", "--json", str(tmp))
+        assert rc == 0
+        assert "Integrity Report" in out
+
+    def test_stdout_restored_after_in_process_run(self, tmp, capsys):
+        before = sys.stdout
+        with unittest.mock.patch.object(sys, "argv", ["rotbyte", "--json", "--workers",
+                                                      "1", str(tmp)]):
+            with pytest.raises(SystemExit):
+                rotbyte.main()
+        assert sys.stdout is before
+        json.loads(capsys.readouterr().out)
 
 
 class TestCompletionsInSync:

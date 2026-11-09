@@ -16,6 +16,7 @@ import email.mime.multipart
 import email.mime.text
 import getpass
 import html as _html
+import http.client
 import os
 import re as _re
 import shutil
@@ -314,12 +315,16 @@ def _read_notify_file() -> configparser.ConfigParser:
     ``interpolation=None``: values are opaque strings, and SMTP passwords may
     legitimately contain '%' — with the default BasicInterpolation a lone '%'
     raises InterpolationSyntaxError at *read* time, long after setup appeared
-    to succeed. A malformed file raises ``configparser.Error``.
+    to succeed. A malformed file — bad syntax or not valid text — raises
+    ``configparser.Error``, so callers handle one exception type.
     """
     config = configparser.ConfigParser(interpolation=None)
     path = _notify_config_path()
     if os.path.isfile(path):
-        config.read(path)
+        try:
+            config.read(path)
+        except UnicodeDecodeError as e:
+            raise configparser.Error(f"File is not valid text: {e}") from e
     return config
 
 
@@ -354,16 +359,24 @@ def _write_notify_section(name: str, values: Dict[str, str]) -> str:
     if config.has_section(name):
         config.remove_section(name)
     config[name] = values
-    # Create the file restricted from the start (0600) rather than writing
-    # under the umask and chmod'ing afterwards — otherwise a plaintext
-    # secret is briefly world-readable between write and chmod. On Windows
-    # the mode bits are best-effort, which is fine here.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        config.write(f)
-    # Belt-and-suspenders: tighten an already-existing file, whose perms
-    # O_CREAT would not have changed.
-    os.chmod(path, 0o600)
+    # Write a sibling temp file and swap it in, so a crash or full disk
+    # mid-write can't truncate the file and take *every* backend's settings
+    # with it. The temp file is created restricted from the start (0600)
+    # rather than chmod'ed afterwards — otherwise a plaintext secret is
+    # briefly world-readable. On Windows the mode bits are best-effort.
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            config.write(f)
+        os.chmod(tmp_path, 0o600)  # O_CREAT can't tighten a leftover temp file
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -382,7 +395,16 @@ def _load_notify_config() -> configparser.ConfigParser:
         print(f"Error: No notification config found at {path}", file=sys.stderr)
         print("  Run `rotbyte --notify-setup email` to configure.", file=sys.stderr)
         sys.exit(1)
-    config = _read_notify_file()
+    try:
+        config = _read_notify_file()
+    except configparser.Error as e:
+        # Exit (rather than raise) so callers' SystemExit handling applies —
+        # a hand-edit typo must degrade a scheduled scan to a warning, not
+        # kill it with a traceback before a single file is hashed.
+        print(f"Error: Could not parse {path}: {e}", file=sys.stderr)
+        print("  Fix the file, or run `rotbyte --notify-setup email` to rewrite it.",
+              file=sys.stderr)
+        sys.exit(1)
     if "email" not in config:
         print(f"Error: No [email] section in {path}", file=sys.stderr)
         print("  Run `rotbyte --notify-setup email` to reconfigure.", file=sys.stderr)
@@ -977,6 +999,25 @@ def _healthchecks_keychain_account(endpoint: str) -> str:
     return f"healthchecks@{parts.netloc}{parts.path.rstrip('/')}"
 
 
+def _hc_endpoint_problem(endpoint: str) -> Optional[str]:
+    """Why ``endpoint`` can't be used as a ping endpoint, or None if it can.
+
+    Checked at setup and again at load time (notify.conf may be hand-edited),
+    so a bad value surfaces as a config error — which scheduled scans turn
+    into a warning — instead of an exception mid-scan.
+    """
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        parts.port  # raises ValueError for a non-numeric / out-of-range port
+    except ValueError as e:
+        return f"'{endpoint}' is not a valid URL ({e})."
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return f"'{endpoint}' is not an http(s) URL."
+    if parts.query or parts.fragment or any(c.isspace() for c in endpoint):
+        return f"'{endpoint}' must not contain spaces, '?' or '#'."
+    return None
+
+
 def _load_healthchecks_config() -> Dict[str, str]:
     """Load the ``[healthchecks]`` section, or exit with an error.
 
@@ -1005,6 +1046,12 @@ def _load_healthchecks_config() -> Dict[str, str]:
     section = config["healthchecks"]
     endpoint = (section.get("ping_endpoint", "").strip().rstrip("/")
                 or _HC_DEFAULT_ENDPOINT)
+    problem = _hc_endpoint_problem(endpoint)
+    if problem:
+        print(f"Error: Invalid ping_endpoint in [healthchecks] section of {path}: "
+              f"{problem}", file=sys.stderr)
+        print(hint, file=sys.stderr)
+        sys.exit(1)
     ping_key = section.get("ping_key", "").strip()
     if not ping_key:
         backend = section.get("ping_key_backend", "")
@@ -1082,13 +1129,14 @@ def _hc_http_error_hint(code: int) -> str:
     return f"HTTP {code}"
 
 
-def _hc_post(url: str, body: str = "") -> Tuple[bool, str]:
+def _hc_post(url: str, body: str = "", secret: str = "") -> Tuple[bool, str]:
     """POST ``body`` to a healthchecks.io ping URL with bounded retries.
 
     Returns ``(ok, error)``. Retries network failures, timeouts, 429, and
     5xx (transient); gives up immediately on other 4xx (a retry won't fix a
-    bad key). Never raises. The error text never includes the URL, which
-    embeds the secret ping key.
+    bad key) and on a malformed URL. Never raises — a ping must not be able
+    to crash or skip a scan. The error text is scrubbed of the URL and of
+    ``secret`` (the ping key), because some urllib errors quote the full URL.
     """
     data = body.encode("utf-8")
     if len(data) > _HC_BODY_LIMIT:
@@ -1099,28 +1147,42 @@ def _hc_post(url: str, body: str = "") -> Tuple[bool, str]:
     for attempt in range(_HC_ATTEMPTS):
         if attempt:
             time.sleep(_HC_RETRY_DELAY * attempt)
-        req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={"User-Agent": _HC_USER_AGENT,
-                     "Content-Type": "text/plain; charset=utf-8"},
-        )
         try:
+            # Inside the try: Request() itself raises ValueError for a URL
+            # with no usable scheme.
+            req = urllib.request.Request(
+                url, data=data, method="POST",
+                headers={"User-Agent": _HC_USER_AGENT,
+                         "Content-Type": "text/plain; charset=utf-8"},
+            )
             with urllib.request.urlopen(req, timeout=_HC_TIMEOUT) as resp:
                 resp.read()
             return True, ""
         except urllib.error.HTTPError as e:
+            e.close()
             if e.code == 429 or e.code >= 500:
                 error = f"HTTP {e.code}"
                 continue
             return False, _hc_http_error_hint(e.code)
         except urllib.error.URLError as e:
             error = str(e.reason)
-        except (OSError, ValueError) as e:
-            # OSError covers timeouts and resets raised mid-response;
-            # ValueError a malformed endpoint (e.g. "unknown url type").
+        except (ValueError, http.client.InvalidURL) as e:
+            # Malformed URL (unknown scheme, non-numeric port): permanent.
+            error = f"invalid ping URL ({e})"
+            break
+        except OSError as e:
+            # Timeouts and connection resets raised mid-response.
             error = str(e) or type(e).__name__
-            if isinstance(e, ValueError):
-                break
+        except http.client.HTTPException as e:
+            # A peer that isn't speaking HTTP, or hangs up mid-reply
+            # (BadStatusLine, IncompleteRead). Possibly transient, so retry.
+            error = f"bad HTTP response ({type(e).__name__}: {str(e).strip()})"
+        except Exception as e:  # noqa: BLE001 — a ping must never raise
+            error = f"{type(e).__name__}: {e}"
+            break
+    for needle in (url, secret, urllib.parse.quote(secret, safe="")):
+        if needle:
+            error = error.replace(needle, "<redacted>")
     return False, error
 
 
@@ -1143,7 +1205,8 @@ def _healthchecks_ping(target_dir: str, scan_type: str, signal: str = "",
                   "skipping ping.", file=sys.stderr)
             return False
     slug = _healthchecks_slug(target_dir, scan_type)
-    ok, error = _hc_post(_healthchecks_url(config, slug, signal, rid), body)
+    ok, error = _hc_post(_healthchecks_url(config, slug, signal, rid), body,
+                         secret=config["ping_key"])
     if not ok:
         where = f"{slug}/{signal}" if signal else slug
         print(f"\n  Warning: healthchecks.io ping failed ({where}): {error}",
@@ -1236,11 +1299,11 @@ def _run_healthchecks_setup():
 
     endpoint = input(f"  Ping endpoint [{_HC_DEFAULT_ENDPOINT}]: ").strip()
     endpoint = (endpoint or _HC_DEFAULT_ENDPOINT).rstrip("/")
-    parts = urllib.parse.urlsplit(endpoint)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        print(f"Error: '{endpoint}' is not an http(s) URL.", file=sys.stderr)
+    problem = _hc_endpoint_problem(endpoint)
+    if problem:
+        print(f"Error: {problem}", file=sys.stderr)
         sys.exit(1)
-    if parts.scheme == "http":
+    if urllib.parse.urlsplit(endpoint).scheme == "http":
         print("  Warning: plain http — the ping key will cross the network "
               "unencrypted.", file=sys.stderr)
 
@@ -1263,6 +1326,7 @@ def _run_healthchecks_setup():
     ok, error = _hc_post(
         _healthchecks_url(config, _HC_SETUP_TEST_SLUG, "log"),
         f"rotbyte setup test from {_hostname()}\n",
+        secret=ping_key,
     )
     if not ok:
         print(f" failed.\n\n  Error: {error}", file=sys.stderr)
